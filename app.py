@@ -311,15 +311,31 @@ HTTP = HttpClient()
 HRR_TERMS = (
     "hits + runs + rbis",
     "hits+runs+rbis",
+    "hits+runs+rbis o/u",
     "hits runs rbis",
+    "hits runs and rbis",
+    "hits, runs, and rbis",
+    "hits runs rbi",
     "hits + runs + rbi",
     "hits+runs+rbi",
+    "hits+runs+rbi o/u",
+    "batter hits + runs + rbis",
+    "batter hits+runs+rbis",
     "h+r+rbi",
     "h + r + rbi",
+    "h + r + rbi o/u",
     "h+r+r",
     "h + r + r",
 )
-HR_TERMS = ("home runs", "home run o/u", "home runs o/u", "batter home runs")
+HR_TERMS = (
+    "home runs",
+    "home run",
+    "home run o/u",
+    "home runs o/u",
+    "batter home runs",
+    "batter home run",
+    "homeruns",
+)
 NON_BATTER_TERMS = (
     "pitcher",
     "strikeouts allowed",
@@ -451,8 +467,16 @@ def _ud_blob(*objects: Optional[Mapping[str, Any]]) -> str:
         "stat",
         "stat_type",
         "appearance_stat",
+        "appearance_stat_type",
         "market",
         "market_name",
+        "market_display_name",
+        "stat_name",
+        "display_stat",
+        "display_stat_name",
+        "stat_type",
+        "stat_type_name",
+        "over_under_title",
         "label",
         "description",
         "sport",
@@ -473,9 +497,14 @@ def _ud_market(blob: str) -> Optional[str]:
     low = blob.lower()
     if any(term in low for term in NON_BATTER_TERMS):
         return None
-    if any(term in low for term in HRR_TERMS):
+    compact = re.sub(r"[^a-z0-9]+", "", low)
+    if any(term in low for term in HRR_TERMS) or any(
+        token in compact for token in ("hitsrunsrbis", "hitsrunsrbi", "hrbi", "hrrbi", "hrr")
+    ):
         return "HRR"
-    if any(term in low for term in HR_TERMS):
+    if any(term in low for term in HR_TERMS) or any(
+        token in compact for token in ("homeruns", "homerun", "batterhomeruns", "batterhomerun")
+    ):
         return "HR"
     return None
 
@@ -483,12 +512,20 @@ def _ud_market(blob: str) -> Optional[str]:
 def _ud_line_value(*objects: Optional[Mapping[str, Any]]) -> Optional[float]:
     strict_keys = (
         "stat_value",
+        "statValue",
         "line",
         "over_under_line",
-        "target_value",
-        "line_score",
         "overUnderLine",
+        "over_under_value",
+        "overUnderValue",
+        "target_value",
+        "targetValue",
+        "line_score",
+        "lineScore",
         "display_stat_value",
+        "displayStatValue",
+        "value",
+        "points",
     )
     for obj in objects:
         attrs = _ud_attrs(obj)
@@ -3003,6 +3040,78 @@ def compact_board(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[[c for c in columns if c in frame.columns]].copy()
 
 
+def market_board(frame: pd.DataFrame, market: str) -> pd.DataFrame:
+    base_columns = [
+        "Player",
+        "Matchup",
+        "Line",
+        "Pick",
+        "Projection",
+        "Edge",
+        "Win Probability %",
+        "Grade",
+        "Official_Status",
+    ]
+    if market == "HRR":
+        projection_columns = [
+            "Hits_Projection",
+            "Runs_Projection",
+            "RBI_Projection",
+            "HR_Projection",
+            "P10_HRR",
+            "P50_HRR",
+            "P90_HRR",
+        ]
+    else:
+        projection_columns = [
+            "HR_Projection",
+            "HR_Probability",
+            "Hits_Projection",
+            "Runs_Projection",
+            "RBI_Projection",
+        ]
+    context_columns = [
+        "Projected PA",
+        "Lineup_Slot",
+        "Lineup_Confirmed",
+        "Pitcher",
+        "Pitcher Target Score",
+        "Data Quality %",
+        "Confidence / 10",
+    ]
+    out = frame[[c for c in base_columns + projection_columns + context_columns if c in frame.columns]].copy()
+    rename = {
+        "Hits_Projection": "Proj Hits",
+        "Runs_Projection": "Proj Runs",
+        "RBI_Projection": "Proj RBI",
+        "HR_Projection": "Proj HR",
+        "HR_Probability": "HR Prob",
+        "P10_HRR": "H+R+RBI P10",
+        "P50_HRR": "H+R+RBI Median",
+        "P90_HRR": "H+R+RBI P90",
+    }
+    out = out.rename(columns=rename)
+    for col in ("HR Prob",):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").mul(100).round(1).astype("Float64").astype(str) + "%"
+            out[col] = out[col].replace("<NA>%", "—")
+    numeric_cols = [
+        "Projection",
+        "Edge",
+        "Proj Hits",
+        "Proj Runs",
+        "Proj RBI",
+        "Proj HR",
+        "H+R+RBI P10",
+        "H+R+RBI Median",
+        "H+R+RBI P90",
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(3)
+    return out
+
+
 def render_player_card(row: Mapping[str, Any]) -> None:
     pick = str(row.get("Pick", "PASS"))
     pick_class = "ow-over" if pick == "OVER" else "ow-under" if pick == "UNDER" else "ow-pass"
@@ -3032,7 +3141,7 @@ def render_player_card(row: Mapping[str, Any]) -> None:
         c1.metric("Hits", format_value(row.get("Hits_Projection"), 2))
         c2.metric("Runs", format_value(row.get("Runs_Projection"), 2))
         c3.metric("RBI", format_value(row.get("RBI_Projection"), 2))
-        c4.metric("HR probability", f"{format_value((safe_float(row.get('HR_Probability'), 0) or 0)*100,1)}%")
+        c4.metric("HR", f"{format_value(row.get('HR_Projection'),2)} · {format_value((safe_float(row.get('HR_Probability'), 0) or 0)*100,1)}%")
         st.markdown("#### Plate-appearance distribution")
         pa_df = pd.DataFrame(
             {
@@ -3087,7 +3196,7 @@ def render_market_tab(frame: pd.DataFrame, market: str) -> None:
         st.warning(f"No active Underdog {label} rows were matched. The app will not create fake lines.")
         return
     data = data.sort_values(["Official_Status", "Win Probability %", "Data Quality %"], ascending=[True, False, False])
-    st.dataframe(compact_board(data), hide_index=True, use_container_width=True)
+    st.dataframe(market_board(data, market), hide_index=True, use_container_width=True)
     st.markdown("### Player cards")
     for row in data.head(35).to_dict("records"):
         render_player_card(row)
