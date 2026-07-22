@@ -24920,9 +24920,22 @@ def render_v3_batter_research_tab(market="FS"):
     else:
         df, meta = result, {}
     if not isinstance(df, pd.DataFrame) or df.empty:
-        st.warning("No active Underdog posted players matched to loaded batter logs for this market.")
+        st.warning("Projection rows did not match loaded batter logs yet. Showing pulled Underdog lines below.")
+        raw_rows = []
+        try:
+            raw_rows = fetch_underdog_batter_prop_rows() if stat_col == "HRR" else []
+        except Exception:
+            raw_rows = []
+        if raw_rows:
+            raw_df = pd.DataFrame(raw_rows)
+            show = [c for c in ["Player", "Market Label", "Line", "Source", "Evidence"] if c in raw_df.columns]
+            st.dataframe(raw_df[show], use_container_width=True, hide_index=True)
         with st.expander("Debug / why empty", expanded=True):
             st.write(meta)
+            try:
+                st.write("Underdog parser:", st.session_state.get("hrr_ud_debug", {}))
+            except Exception:
+                pass
             st.write("Expected batter log columns:", ["Date","Player","Team","Opponent","Home/Away","Lineup Slot","PA","AB","H","R","RBI","Fantasy Score"])
         return
     c1,c2,c3,c4 = st.columns(4)
@@ -25259,8 +25272,21 @@ def render_v3_home_run_tab():
     st.caption("HR model uses Opening Day logs, recent HR form, projected PA, opponent probable pitcher hand/basic stats, pitcher HR/9, park proxy, and xHR-vs-actual due/overperformance check. HR props are volatile; use A/A+ spots only.")
     df, meta = build_v3_home_run_table()
     if not isinstance(df, pd.DataFrame) or df.empty:
-        st.warning("No HR candidates loaded.")
+        st.warning("Projection rows did not match loaded batter logs yet. Showing pulled Underdog HR lines below.")
+        raw_rows = []
+        try:
+            raw_rows = _v3_fetch_ud_home_run_rows()
+        except Exception:
+            raw_rows = []
+        if raw_rows:
+            raw_df = pd.DataFrame(raw_rows)
+            show = [c for c in ["Player", "Market Label", "Line", "Source", "Evidence"] if c in raw_df.columns]
+            st.dataframe(raw_df[show], use_container_width=True, hide_index=True)
         st.write(meta)
+        try:
+            st.write("Underdog parser:", st.session_state.get("hr_ud_debug", {}))
+        except Exception:
+            pass
         return
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("HR Rows", len(df))
@@ -26652,10 +26678,10 @@ def build_v3_batter_upside_board_final():
 
     out = []
     for d in rows.values():
-        # Strict: must have at least one active posted line.
-        if not any(_v3_is_live_ud_line(d.get(k)) for k in ["FS Line", "HRR Line", "HR Line"]):
+        # Strict: must have an active H+R+RBI or Home Runs posted line. Batter FS is hidden.
+        if not any(_v3_is_live_ud_line(d.get(k)) for k in ["HRR Line", "HR Line"]):
             continue
-        fs = _v3_final_num(d.get("FS Projection"), 0) or 0
+        fs = 0
         hrr = _v3_final_num(d.get("HRR Projection"), 0) or 0
         hrp = _v3_final_num(d.get("HR Probability"), 0) or 0
         pa = _v3_final_num(d.get("Projected PA"), 4.0) or 4.0
@@ -26683,13 +26709,13 @@ def build_v3_batter_upside_board_final():
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
     df = df.sort_values(["Upside Score", "Best Hit Rate %"], ascending=[False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
-    cols = ["Player", "Team", "Opponent", "Projected PA", "FS Projection", "FS Line", "FS Pick", "FS Edge", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Upside Score"]
+    cols = ["Player", "Team", "Opponent", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Upside Score"]
     return df[[c for c in cols if c in df.columns]]
 
 
 def render_v3_top_batter_plays_board():
     st.markdown('<div class="section-title-pro">🔥 Batter Upside Board — Underdog Lines Only</div>', unsafe_allow_html=True)
-    st.caption("Clean V3 board: only batters with active Underdog lines are shown. Sorted by Upside Score, hit rate, edge, PA, and HR probability.")
+    st.caption("Clean V3 board: only batters with active H+R+RBI or Home Runs lines are shown. Sorted by Upside Score, hit rate, edge, PA, and HR probability.")
     df = build_v3_batter_upside_board_final()
     if not isinstance(df, pd.DataFrame) or df.empty:
         st.info("No active Underdog batter lines matched yet. Refresh after the board posts.")
@@ -26708,11 +26734,11 @@ def render_v3_top_batter_plays_board():
         with st.expander(f"{selected} — Batter Upside Card", expanded=True):
             a,b,c,d,e = st.columns(5)
             a.metric("Projected PA", rr.get("Projected PA", "—"))
-            b.metric("FS", f"{rr.get('FS Projection','—')} / Line {rr.get('FS Line','—')}")
-            c.metric("HRR", f"{rr.get('HRR Projection','—')} / Line {rr.get('HRR Line','—')}")
-            d.metric("HR", f"{rr.get('HR Probability','—')} / Line {rr.get('HR Line','—')}")
+            b.metric("HRR", f"{rr.get('HRR Projection','—')} / Line {rr.get('HRR Line','—')}")
+            c.metric("HR", f"{rr.get('HR Probability','—')} / Line {rr.get('HR Line','—')}")
+            d.metric("Best Hit Rate", rr.get("Best Hit Rate %", "—"))
             e.metric("Upside Score", rr.get("Upside Score", "—"))
-            st.info("Only active Underdog-line players appear here. Use FS, H+R+RBI, and HR tabs for full cards.")
+            st.info("Only active Underdog-line players appear here. Use H+R+RBI and Home Runs tabs for full cards.")
 
 
 def _v3_load_batter_grade_history():
@@ -26794,13 +26820,13 @@ def render_v3_settings_tab():
     c1.metric("App", "Batter V3")
     c2.metric("Brand", "ONE WAY PICKZ")
     c3.metric("Mode", "UD Lines Only")
-    st.info("Visible tabs: Batter Upside, Batter FS, H+R+RBI, Home Runs, Batter Learning Lab, Official Plays, Calibration Audit.")
+    st.info("Visible tabs: Batter Upside, H+R+RBI, Home Runs, Batter Learning Lab, Official Plays, Calibration Audit.")
     st.write({
         "K engine visible in V3": "No",
         "Pitcher FS visible in V3": "No",
         "Research Hub visible in V3": "No",
         "Moneyline visible in V3": "No",
-        "Batter FS line source": "Underdog only",
+        "Batter FS visible": "Removed",
         "H+R+RBI line source": "Underdog only",
         "Home Runs": "Underdog line required to display",
         "Cleanup version": V3_CLEAN_UD_LEARNING_VERSION,
@@ -27047,6 +27073,53 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             continue
         debug["endpoint"] = url
         debug["status"] = "RESPONSE_RECEIVED"
+
+        # Current Underdog v6 shape: top-level over_under_lines + appearances + players.
+        # This direct path is intentionally first so active MLB batter lines do not depend
+        # on JSON:API-style relationships being present.
+        if isinstance(payload, dict) and isinstance(payload.get("over_under_lines"), list):
+            appearances = {str(a.get("id")): a for a in payload.get("appearances", []) if isinstance(a, dict)}
+            players = {str(pl.get("id")): pl for pl in payload.get("players", []) if isinstance(pl, dict)}
+            for line_obj in payload.get("over_under_lines", []):
+                if not isinstance(line_obj, dict):
+                    continue
+                ou_obj = line_obj.get("over_under") if isinstance(line_obj.get("over_under"), dict) else {}
+                app_stat = ou_obj.get("appearance_stat") if isinstance(ou_obj.get("appearance_stat"), dict) else {}
+                app_obj = appearances.get(str(app_stat.get("appearance_id") or ""), {})
+                player_obj = players.get(str(app_obj.get("player_id") or ""), {})
+                option_blob = " | ".join(
+                    str(opt.get(k, ""))
+                    for opt in (line_obj.get("options") or []) if isinstance(opt, dict)
+                    for k in ("selection_header", "selection_subheader", "status")
+                )
+                blob = " | ".join(x for x in [_ow_ud_blob(line_obj, ou_obj, app_stat, app_obj, player_obj), option_blob] if x)
+                if len(debug["sample_market_text"]) < 12 and any(x in blob.lower() for x in ("hits", "rbi", "home run")):
+                    debug["sample_market_text"].append(blob[:260])
+                market = _ow_ud_market(blob)
+                if market is None or not _ow_ud_active(line_obj):
+                    continue
+                if str(player_obj.get("sport_id") or "").upper() not in {"MLB", ""}:
+                    continue
+                line = _ow_ud_line_value(line_obj)
+                if line is None:
+                    continue
+                if market == "HR" and not (0.5 <= line <= 2.5):
+                    continue
+                if market == "HRR" and not (0.5 <= line <= 6.5):
+                    continue
+                player = _ow_ud_player_name(player_obj) or _ow_ud_player_name(line_obj, ou_obj)
+                if not player:
+                    continue
+                rows.append({
+                    "Source": "Underdog",
+                    "Player": player,
+                    "Market": "HRR" if market == "HRR" else "Home Runs",
+                    "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+                    "Line": float(line),
+                    "Evidence": blob[:350],
+                    "Line ID": str(line_obj.get("id", "")),
+                })
+
         objects = _ow_ud_collect(payload)
         debug["objects"] = len(objects)
         by_key, by_id = _ow_ud_object_maps(objects)
@@ -27172,12 +27245,11 @@ def _v3_fetch_ud_home_run_rows():
     return hr
 
 
-# Clean V3 batter-only tab layout. Removed visible Pitcher K, Pitcher FS, Research Hub, and Moneyline tabs.
-tab_top, tab_batter_fs, tab_hrr, tab_hr, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
+# Clean V3 batter-only tab layout. Removed visible Pitcher K, Batter FS, Pitcher FS, Research Hub, and Moneyline tabs.
+tab_top, tab_hrr, tab_hr, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
-    "1️⃣ BATTER FS",
-    "2️⃣ H+R+RBI",
-    "3️⃣ HOME RUNS",
+    "1️⃣ H+R+RBI",
+    "2️⃣ HOME RUNS",
     "🧠 BATTER LEARNING",
     "✅ OFFICIAL PLAYS",
     "CALIBRATION AUDIT",
@@ -27186,9 +27258,6 @@ tab_top, tab_batter_fs, tab_hrr, tab_hr, tab_learning, tab_official, tab_calibra
 
 with tab_top:
     render_v3_top_batter_plays_board()
-
-with tab_batter_fs:
-    render_v3_batter_research_tab("FS")
 
 with tab_hrr:
     render_v3_batter_research_tab("HRR")
