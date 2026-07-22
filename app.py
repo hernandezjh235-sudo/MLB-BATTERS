@@ -5038,7 +5038,7 @@ def get_open_meteo_hourly(lat, lon, date_str):
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,wind_speed_10m",
+            "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,wind_speed_10m,wind_direction_10m",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
             "timezone": "America/Los_Angeles",
@@ -5080,6 +5080,7 @@ def weather_k_factor(venue_name, game_time, enabled=True):
             idx = min(range(len(times)), key=lambda i: abs(i - len(times)//2))
         temp = safe_float((hourly.get("temperature_2m") or [None])[idx])
         wind = safe_float((hourly.get("wind_speed_10m") or [None])[idx])
+        wind_dir = safe_float((hourly.get("wind_direction_10m") or [None])[idx])
         humidity = safe_float((hourly.get("relative_humidity_2m") or [None])[idx])
         precip = safe_float((hourly.get("precipitation_probability") or [None])[idx])
 
@@ -5112,8 +5113,8 @@ def weather_k_factor(venue_name, game_time, enabled=True):
             da_note = f"DA x{da_factor:.3f}"
 
         factor = float(clamp(factor * da_factor, min(WEATHER_FACTOR_MIN, DA_K_FACTOR_MIN), max(WEATHER_FACTOR_MAX, DA_K_FACTOR_MAX)))
-        details = {"temp_f": temp, "wind_mph": wind, "humidity": humidity, "precip_prob": precip, "indoor": False, "density_altitude_factor": round(da_factor, 3)}
-        note = f"Weather x{factor:.3f} ({da_note}): {temp if temp is not None else 'NA'}F, wind {wind if wind is not None else 'NA'} mph, humidity {humidity if humidity is not None else 'NA'}%, precip {precip if precip is not None else 'NA'}%"
+        details = {"temp_f": temp, "wind_mph": wind, "wind_direction": wind_dir, "humidity": humidity, "precip_prob": precip, "indoor": False, "density_altitude_factor": round(da_factor, 3)}
+        note = f"Weather x{factor:.3f} ({da_note}): {temp if temp is not None else 'NA'}F, wind {wind if wind is not None else 'NA'} mph dir {wind_dir if wind_dir is not None else 'NA'}°, humidity {humidity if humidity is not None else 'NA'}%, precip {precip if precip is not None else 'NA'}%"
         return factor, note, details
     except Exception as e:
         return 1.0, f"Weather error; neutral: {e}", {}
@@ -27252,7 +27253,7 @@ def _v3_fetch_ud_home_run_rows():
 # Underdog supplies the playable line. MLB Stats API game logs supply projections
 # when local Opening Day batter logs do not match posted players.
 # =========================
-OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_LINES_WITH_MLB_PROJECTIONS_2026_07_21"
+OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_LINES_FULL_CONTEXT_2026_07_21"
 OW_FINAL_MAX_PROJECTED_LINES = 40
 
 OW_FINAL_PARK_FACTORS = {
@@ -27291,6 +27292,48 @@ OW_FINAL_PARK_FACTORS = {
     "Tropicana Field": {"HRR": 0.97, "HR": 0.96},
 }
 
+OW_FINAL_PARK_CF_BEARING = {
+    "Angel Stadium": 55,
+    "Busch Stadium": 65,
+    "Chase Field": 25,
+    "Citi Field": 55,
+    "Citizens Bank Park": 35,
+    "Comerica Park": 0,
+    "Coors Field": 20,
+    "Daikin Park": 5,
+    "Minute Maid Park": 5,
+    "Dodger Stadium": 55,
+    "Fenway Park": 35,
+    "Globe Life Field": 25,
+    "Great American Ball Park": 20,
+    "Kauffman Stadium": 45,
+    "loanDepot park": 95,
+    "Nationals Park": 50,
+    "Oracle Park": 70,
+    "Oriole Park at Camden Yards": 35,
+    "Petco Park": 25,
+    "PNC Park": 70,
+    "Progressive Field": 15,
+    "Rogers Centre": 45,
+    "Sutter Health Park": 35,
+    "Target Field": 55,
+    "T-Mobile Park": 70,
+    "Truist Park": 35,
+    "Wrigley Field": 40,
+    "Yankee Stadium": 75,
+}
+
+OW_FINAL_ROOF_NEUTRAL_VENUES = {
+    "Chase Field",
+    "Daikin Park",
+    "Globe Life Field",
+    "loanDepot park",
+    "Minute Maid Park",
+    "Rogers Centre",
+    "T-Mobile Park",
+    "Tropicana Field",
+}
+
 
 def _ow_projection_seasons():
     year = datetime.utcnow().year
@@ -27320,14 +27363,21 @@ def _ow_weather_hitter_context(team, market):
         "Weather Note": "Weather neutral",
         "Weather Temp F": None,
         "Weather Wind MPH": None,
+        "Weather Wind Direction": None,
+        "Wind Carry Label": "UNKNOWN",
         "Weather Humidity %": None,
         "Weather Precip %": None,
     }
     try:
         ctx = _ow_team_context(team)
         venue = str(ctx.get("Venue") or "")
+        roof_status = str(ctx.get("Roof") or ctx.get("roof") or ctx.get("Roof Status") or "").upper()
         game_time = ctx.get("Game Time") or ctx.get("game_time") or ctx.get("Date") or california_now().strftime("%Y-%m-%d")
         if "weather_k_factor" not in globals() or not venue or venue == "—":
+            return out
+        if venue in OW_FINAL_ROOF_NEUTRAL_VENUES and "OPEN" not in roof_status:
+            out["Weather Note"] = "Roof/dome venue; weather neutral until roof confirmed open"
+            out["Wind Carry Label"] = "ROOF_NEUTRAL"
             return out
         _kf, note, details = weather_k_factor(venue, game_time, enabled=True)
         if not isinstance(details, dict) or not details:
@@ -27335,13 +27385,16 @@ def _ow_weather_hitter_context(team, market):
             return out
         if details.get("indoor"):
             out["Weather Note"] = "Indoor/retractable venue; hitter weather neutral"
+            out["Wind Carry Label"] = "ROOF_NEUTRAL"
             return out
         temp = _v3_safe_num(details.get("temp_f"), None)
         wind = _v3_safe_num(details.get("wind_mph"), None)
+        wind_dir = _v3_safe_num(details.get("wind_direction"), None)
         humidity = _v3_safe_num(details.get("humidity"), None)
         precip = _v3_safe_num(details.get("precip_prob"), None)
         factor = 1.0
         notes = []
+        wind_label = "UNKNOWN"
         if temp is not None:
             if temp >= 88:
                 factor *= 1.025 if market == "HRR" else 1.045
@@ -27350,10 +27403,26 @@ def _ow_weather_hitter_context(team, market):
                 factor *= 0.980 if market == "HRR" else 0.955
                 notes.append(f"cold air {temp:.0f}F")
         if wind is not None:
-            # Direction is unavailable from this feed in the current app, so keep this modest.
+            venue_bearing = OW_FINAL_PARK_CF_BEARING.get(venue)
+            if wind_dir is not None and venue_bearing is not None:
+                blowing_to = (float(wind_dir) + 180.0) % 360.0
+                diff = abs((blowing_to - float(venue_bearing) + 180.0) % 360.0 - 180.0)
+                if diff <= 40:
+                    wind_label = "OUT_TO_FIELD"
+                    if wind >= 10:
+                        factor *= 1.020 if market == "HRR" else 1.055
+                        notes.append(f"wind out {wind:.0f} mph")
+                elif diff >= 140:
+                    wind_label = "IN_FROM_FIELD"
+                    if wind >= 10:
+                        factor *= 0.985 if market == "HRR" else 0.940
+                        notes.append(f"wind in {wind:.0f} mph")
+                else:
+                    wind_label = "CROSSWIND"
             if wind >= 16:
                 factor *= 1.012 if market == "HRR" else 1.025
-                notes.append(f"strong wind {wind:.0f} mph")
+                if wind_label in {"UNKNOWN", "CROSSWIND"}:
+                    notes.append(f"strong wind {wind:.0f} mph")
             elif wind <= 4 and market == "HR":
                 factor *= 0.990
         if humidity is not None and humidity >= 78:
@@ -27367,6 +27436,8 @@ def _ow_weather_hitter_context(team, market):
             "Weather Note": ", ".join(notes) if notes else "Weather hitter neutral",
             "Weather Temp F": temp,
             "Weather Wind MPH": wind,
+            "Weather Wind Direction": wind_dir,
+            "Wind Carry Label": wind_label,
             "Weather Humidity %": humidity,
             "Weather Precip %": precip,
         })
@@ -27434,6 +27505,39 @@ def _ow_live_boxscore_players(game_pk):
     return out
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _ow_lineup_rows_for_team(team, pitcher_hand=None):
+    team_abbr = _ow_team_abbr(team)
+    ctx = _ow_team_context(team_abbr)
+    rows = []
+    live_rows = _ow_live_boxscore_players(ctx.get("GamePk"))
+    for row in live_rows:
+        if row.get("team") == team_abbr and row.get("slot"):
+            rows.append({
+                "Order": row.get("slot"),
+                "Batter": row.get("name"),
+                "Lineup Source": "MLB_CONFIRMED_LINEUP",
+                "Confirmed": True,
+            })
+    if len(rows) >= 5:
+        return sorted(rows, key=lambda r: r.get("Order") or 99)[:9], "MLB_CONFIRMED_LINEUP", True
+    try:
+        rw = get_rotowire_expected_lineups() if "get_rotowire_expected_lineups" in globals() else {}
+        rrows = (rw or {}).get(team_abbr) or []
+        if len(rrows) >= 5:
+            confirmed = any("CONFIRMED" in str(r.get("Lineup Source", "")).upper() for r in rrows)
+            return rrows[:9], "ROTOWIRE_CONFIRMED_LINEUP" if confirmed else "ROTOWIRE_EXPECTED_LINEUP", confirmed
+    except Exception:
+        pass
+    try:
+        frows = get_fangraphs_rosterresource_lineup(team_abbr, pitcher_hand=pitcher_hand) if "get_fangraphs_rosterresource_lineup" in globals() else []
+        if len(frows or []) >= 5:
+            return frows[:9], "FANGRAPHS_PROJECTED_LINEUP", False
+    except Exception:
+        pass
+    return [], "LINEUP_SOURCE_UNAVAILABLE", False
+
+
 def _ow_lineup_context(player, team):
     team_abbr = _ow_team_abbr(team)
     ctx = _ow_team_context(team_abbr)
@@ -27446,16 +27550,372 @@ def _ow_lineup_context(player, team):
                 return {
                     "Lineup Slot": slot,
                     "Lineup Status": f"CONFIRMED SLOT {slot}",
+                    "Lineup Source": "MLB_CONFIRMED_LINEUP",
                     "Lineup Confirmed": True,
+                    "Projected PA": _v3_pa_from_slot(slot, None),
+                }
+    ext_rows, ext_source, ext_confirmed = _ow_lineup_rows_for_team(team_abbr, None)
+    for row in ext_rows:
+        if name_score(player, row.get("Batter")) >= 0.88:
+            slot = row.get("Order")
+            if slot:
+                return {
+                    "Lineup Slot": slot,
+                    "Lineup Status": f"{'CONFIRMED' if ext_confirmed else 'PROJECTED'} SLOT {slot} — {ext_source}",
+                    "Lineup Source": ext_source,
+                    "Lineup Confirmed": bool(ext_confirmed),
                     "Projected PA": _v3_pa_from_slot(slot, None),
                 }
     slot, status = _v3_latest_lineup_slot_for_player(player)
     return {
         "Lineup Slot": slot if slot is not None else "—",
         "Lineup Status": status,
+        "Lineup Source": "RECENT_LOG_FALLBACK",
         "Lineup Confirmed": False,
         "Projected PA": _v3_pa_from_slot(slot, None) if slot is not None else None,
     }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_season_obp_slg_for_player(name):
+    try:
+        pid = _mlb_search_player_id_by_name(name)
+        if not pid:
+            return None
+        data = safe_get_json(
+            f"{MLB_BASE}/people/{pid}/stats",
+            params={"stats": "season", "group": "hitting", "season": datetime.utcnow().year},
+            timeout=10,
+        ) or {}
+        stat = None
+        for block in data.get("stats") or []:
+            for split in block.get("splits") or []:
+                stat = split.get("stat") or {}
+                break
+        if not stat:
+            return None
+        return {
+            "OBP": _v3_safe_num(stat.get("obp"), None),
+            "SLG": _v3_safe_num(stat.get("slg"), None),
+            "OPS": _v3_safe_num(stat.get("ops"), None),
+        }
+    except Exception:
+        return None
+
+
+def _ow_lineup_protection_context(player, team, pitcher_hand=None):
+    out = {
+        "Lineup Protection Factor": 1.0,
+        "Lineup Protection Note": "Lineup protection unavailable",
+        "Ahead OBP": None,
+        "Behind SLG": None,
+        "Protection Source": "—",
+    }
+    try:
+        rows, source, _confirmed = _ow_lineup_rows_for_team(team, pitcher_hand)
+        if len(rows) < 5:
+            return out
+        idx = None
+        for i, row in enumerate(rows):
+            if name_score(player, row.get("Batter")) >= 0.88:
+                idx = i
+                break
+        if idx is None:
+            return out
+        ahead_names = [r.get("Batter") for r in rows[max(0, idx - 2):idx]]
+        behind_names = [r.get("Batter") for r in rows[idx + 1:idx + 3]]
+        ahead_obps = []
+        behind_slgs = []
+        for nm in ahead_names:
+            prof = _ow_season_obp_slg_for_player(nm)
+            if prof and prof.get("OBP") is not None:
+                ahead_obps.append(prof.get("OBP"))
+        for nm in behind_names:
+            prof = _ow_season_obp_slg_for_player(nm)
+            if prof and prof.get("SLG") is not None:
+                behind_slgs.append(prof.get("SLG"))
+        ahead_obp = float(np.mean(ahead_obps)) if ahead_obps else None
+        behind_slg = float(np.mean(behind_slgs)) if behind_slgs else None
+        factor = 1.0
+        notes = []
+        if ahead_obp is not None:
+            if ahead_obp >= 0.345:
+                factor *= 1.025
+                notes.append(f"OBP ahead {ahead_obp:.3f}")
+            elif ahead_obp <= 0.295:
+                factor *= 0.985
+                notes.append(f"low OBP ahead {ahead_obp:.3f}")
+        if behind_slg is not None:
+            if behind_slg >= 0.460:
+                factor *= 1.018
+                notes.append(f"protection SLG {behind_slg:.3f}")
+            elif behind_slg <= 0.360:
+                factor *= 0.990
+                notes.append(f"thin protection {behind_slg:.3f}")
+        out.update({
+            "Lineup Protection Factor": round(float(clamp(factor, 0.96, 1.05)), 3),
+            "Lineup Protection Note": ", ".join(notes) if notes else "Lineup neighbor neutral",
+            "Ahead OBP": None if ahead_obp is None else round(ahead_obp, 3),
+            "Behind SLG": None if behind_slg is None else round(behind_slg, 3),
+            "Protection Source": source,
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_umpire_hitter_context(team, market="HRR"):
+    out = {
+        "Umpire Hitter Factor": 1.0,
+        "Umpire Name": "Unknown",
+        "Umpire Note": "Umpire unavailable",
+    }
+    try:
+        ctx = _ow_team_context(team)
+        game_pk = ctx.get("GamePk")
+        if not game_pk or "umpire_factor" not in globals():
+            return out
+        k_factor, name, note = umpire_factor(game_pk, enabled=True)
+        k_factor = _v3_safe_num(k_factor, 1.0) or 1.0
+        width = 0.70 if str(market).upper() == "HR" else 0.55
+        hitter_factor = 1.0 - ((k_factor - 1.0) * width)
+        hitter_factor = clamp(hitter_factor, 0.980 if str(market).upper() == "HR" else 0.985, 1.020 if str(market).upper() == "HR" else 1.015)
+        out.update({
+            "Umpire Hitter Factor": round(float(hitter_factor), 3),
+            "Umpire Name": name or "Unknown",
+            "Umpire Note": f"{note}; hitter factor {hitter_factor:.3f}",
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_defense_framing_context(opponent, market="HRR"):
+    out = {
+        "Defense/Framing Factor": 1.0,
+        "Opponent Defense Score": None,
+        "Opponent Framing Score": None,
+        "Defense/Framing Note": "Defense/framing unavailable",
+    }
+    try:
+        opp = _ow_team_abbr(opponent)
+        defense = _ml97_defense_score(opp, {}) if "_ml97_defense_score" in globals() else 50
+        framing = _ml97_framing_score(opp, {}) if "_ml97_framing_score" in globals() else 50
+        defense = _v3_safe_num(defense, 50) or 50
+        framing = _v3_safe_num(framing, 50) or 50
+        factor = 1.0
+        notes = []
+        if defense >= 62:
+            factor *= 0.985 if str(market).upper() == "HRR" else 0.990
+            notes.append(f"strong defense {defense:.0f}")
+        elif defense <= 42:
+            factor *= 1.015 if str(market).upper() == "HRR" else 1.010
+            notes.append(f"weak defense {defense:.0f}")
+        if framing >= 62:
+            factor *= 0.990 if str(market).upper() == "HRR" else 0.992
+            notes.append(f"strong framing {framing:.0f}")
+        elif framing <= 42:
+            factor *= 1.008 if str(market).upper() == "HRR" else 1.006
+            notes.append(f"weak framing {framing:.0f}")
+        out.update({
+            "Defense/Framing Factor": round(float(clamp(factor, 0.965, 1.030)), 3),
+            "Opponent Defense Score": round(float(defense), 1),
+            "Opponent Framing Score": round(float(framing), 1),
+            "Defense/Framing Note": ", ".join(notes) if notes else "Defense/framing neutral",
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_pitcher_confirmation_context(team, pctx, market="HRR"):
+    out = {
+        "Pitcher Confirmation Factor": 1.0,
+        "Pitcher Confirmed": False,
+        "Pitcher Confirmation Note": "Probable pitcher not confirmed",
+    }
+    try:
+        ctx = _ow_team_context(team)
+        pid = pctx.get("Pitcher ID")
+        name = str(pctx.get("Opp Pitcher") or "—")
+        status_text = " ".join(str(ctx.get(k) or "") for k in ["Status", "Game Status", "Detailed State", "codedGameState", "abstractGameState"]).upper()
+        if not pid or name in {"", "—", "None"}:
+            factor = 0.935 if str(market).upper() == "HRR" else 0.900
+            out.update({
+                "Pitcher Confirmation Factor": factor,
+                "Pitcher Confirmed": False,
+                "Pitcher Confirmation Note": "Missing opposing probable pitcher; projection downgraded hard",
+            })
+            return out
+        live_or_final = any(x in status_text for x in ["LIVE", "IN PROGRESS", "FINAL", "GAME OVER"])
+        confirmed = live_or_final or bool(ctx.get("Probable Pitcher Confirmed") or ctx.get("Pitcher Confirmed"))
+        if confirmed:
+            out.update({
+                "Pitcher Confirmation Factor": 1.0,
+                "Pitcher Confirmed": True,
+                "Pitcher Confirmation Note": f"Pitcher confirmed/locked: {name}",
+            })
+        else:
+            factor = 0.985 if str(market).upper() == "HRR" else 0.975
+            out.update({
+                "Pitcher Confirmation Factor": factor,
+                "Pitcher Confirmed": False,
+                "Pitcher Confirmation Note": f"Probable pitcher listed but verify before lock: {name}",
+            })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_bullpen_leash_context(team, pctx, bpctx, market="HRR"):
+    out = {
+        "Bullpen/Leash Factor": 1.0,
+        "Starter Leash Label": "VERIFY",
+        "Starter Leash Note": "Starter leash neutral",
+        "Bullpen Rest Note": (bpctx or {}).get("Bullpen Weakness Note", "Bullpen neutral"),
+    }
+    try:
+        factor = 1.0
+        notes = []
+        ip = _v3_safe_num(pctx.get("Pitcher IP") or pctx.get("IP"), None)
+        starts = _v3_safe_num(pctx.get("Pitcher Starts") or pctx.get("GS"), None)
+        avg_ip = ip / max(starts, 1.0) if ip is not None and starts and starts > 0 else None
+        kp = _v3_safe_num(pctx.get("Pitcher K%"), None)
+        era = _v3_safe_num(pctx.get("Pitcher ERA"), None)
+        bp_score = _v3_safe_num((bpctx or {}).get("Bullpen Weakness Score"), 50) or 50
+        leash = "NORMAL"
+        if avg_ip is not None:
+            if avg_ip <= 4.6:
+                leash = "SHORT"
+                factor *= 1.018 if str(market).upper() == "HRR" else 1.010
+                notes.append(f"short starter leash {avg_ip:.1f} IP/start")
+            elif avg_ip >= 5.9:
+                leash = "LONG"
+                if kp is not None and kp >= 26:
+                    factor *= 0.986 if str(market).upper() == "HRR" else 0.990
+                    notes.append(f"long high-K starter {avg_ip:.1f} IP/start")
+        if era is not None and era >= 4.80:
+            factor *= 1.010 if str(market).upper() == "HRR" else 1.012
+            notes.append(f"starter run risk ERA {era:.2f}")
+        if bp_score >= 65:
+            factor *= 1.025 if str(market).upper() == "HRR" else 1.015
+            notes.append("tired/weak bullpen support")
+        elif bp_score <= 40:
+            factor *= 0.990 if str(market).upper() == "HRR" else 0.992
+            notes.append("fresh/strong bullpen resistance")
+        out.update({
+            "Bullpen/Leash Factor": round(float(clamp(factor, 0.965, 1.055)), 3),
+            "Starter Leash Label": leash,
+            "Starter Leash Note": ", ".join(notes) if notes else "Starter leash/bullpen neutral",
+            "Bullpen Rest Note": (bpctx or {}).get("Bullpen Weakness Note", "Bullpen neutral"),
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_batter_availability_context(player, logs, lineup_ctx, market="HRR"):
+    out = {
+        "Availability Factor": 1.0,
+        "Availability Note": "Availability neutral",
+        "Days Since Last Game": None,
+        "Lineup Slot Trend Factor": 1.0,
+        "Lineup Slot Trend Note": "Lineup slot trend neutral",
+    }
+    try:
+        factor = 1.0
+        notes = []
+        days_since = None
+        if logs:
+            last_date = pd.to_datetime((logs[-1] or {}).get("date"), errors="coerce")
+            if pd.notna(last_date):
+                days_since = int(max(0, (pd.Timestamp(california_now().date()) - last_date.normalize()).days))
+                if days_since >= 5:
+                    factor *= 0.970
+                    notes.append(f"{days_since} days since last logged game")
+                elif days_since >= 3:
+                    factor *= 0.985
+                    notes.append(f"{days_since} days rest/check status")
+        if lineup_ctx.get("Lineup Confirmed") and lineup_ctx.get("Lineup Slot") not in (None, "—"):
+            notes.append("confirmed in lineup")
+        elif str(lineup_ctx.get("Lineup Source") or "").upper() == "RECENT_LOG_FALLBACK":
+            factor *= 0.985
+            notes.append("not matched to current lineup source")
+        slot = _v3_safe_num(lineup_ctx.get("Lineup Slot"), None)
+        slot_factor = 1.0
+        slot_note = "Lineup slot neutral"
+        if slot is not None:
+            if slot <= 2:
+                slot_factor = 1.025 if str(market).upper() == "HRR" else 1.010
+                slot_note = f"premium slot {int(slot)}"
+            elif slot <= 4:
+                slot_factor = 1.010
+                slot_note = f"strong run/RBI slot {int(slot)}"
+            elif slot >= 8:
+                slot_factor = 0.955 if str(market).upper() == "HRR" else 0.970
+                slot_note = f"lower lineup slot {int(slot)}"
+            elif slot >= 6:
+                slot_factor = 0.980 if str(market).upper() == "HRR" else 0.990
+                slot_note = f"lower-mid lineup slot {int(slot)}"
+        out.update({
+            "Availability Factor": round(float(clamp(factor, 0.94, 1.01)), 3),
+            "Availability Note": ", ".join(notes) if notes else "Availability neutral",
+            "Days Since Last Game": days_since,
+            "Lineup Slot Trend Factor": round(float(clamp(slot_factor, 0.94, 1.04)), 3),
+            "Lineup Slot Trend Note": slot_note,
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_projection_risk_context(vals, line, data_confidence, market="HRR"):
+    out = {
+        "Volatility Factor": 1.0,
+        "Volatility Label": "NEUTRAL",
+        "Volatility Note": "Volatility neutral",
+        "Overall Rating": "C / RESEARCH",
+        "No-Bet Risk Flags": "",
+    }
+    try:
+        arr = [float(v) for v in (vals or []) if v is not None]
+        factor = 1.0
+        flags = []
+        label = "NEUTRAL"
+        if len(arr) >= 10:
+            sd = float(np.std(arr[-20:]))
+            avg = max(0.10, float(np.mean(arr[-20:])))
+            cv = sd / avg
+            if cv >= 1.15:
+                factor *= 0.975 if str(market).upper() == "HRR" else 0.990
+                label = "HIGH"
+                flags.append(f"high volatility CV {cv:.2f}")
+            elif cv <= 0.65:
+                factor *= 1.008 if str(market).upper() == "HRR" else 1.000
+                label = "STABLE"
+        if data_confidence < 50:
+            flags.append("low data confidence")
+        if line is None:
+            flags.append("missing line")
+        dc = _v3_safe_num(data_confidence, 0) or 0
+        if dc >= 72 and label != "HIGH":
+            rating = "A / STRONG"
+        elif dc >= 60:
+            rating = "B / PLAYABLE"
+        elif dc >= 50:
+            rating = "C / RESEARCH"
+        else:
+            rating = "D / PASS"
+        out.update({
+            "Volatility Factor": round(float(clamp(factor, 0.965, 1.015)), 3),
+            "Volatility Label": label,
+            "Volatility Note": ", ".join(flags) if flags else "Volatility neutral",
+            "Overall Rating": rating,
+            "No-Bet Risk Flags": " | ".join(flags[:5]),
+        })
+        return out
+    except Exception:
+        return out
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -27511,7 +27971,7 @@ def _ow_batter_split_factor(player_id, pitcher_hand, market):
 @st.cache_data(ttl=900, show_spinner=False)
 def _ow_probable_pitcher_context(team):
     team_abbr = _ow_team_abbr(team)
-    out = {"Pitcher ID": None, "Opp Pitcher": "—", "Pitcher Hand": "—", "Pitcher HR9": None, "Pitcher K%": None, "Pitcher ERA": None}
+    out = {"Pitcher ID": None, "Opp Pitcher": "—", "Pitcher Hand": "—", "Pitcher HR9": None, "Pitcher K%": None, "Pitcher ERA": None, "Pitcher IP": None, "Pitcher Starts": None}
     try:
         ds = globals().get("dates") or target_dates("Today")
         for dd in ds:
@@ -27535,6 +27995,9 @@ def _ow_probable_pitcher_context(team):
                         prof = get_pitcher_profile(pid) or {}
                         ip = _v3_safe_num(prof.get("IP"), None)
                         hr = _v3_safe_num(prof.get("HR"), None)
+                        starts = _v3_safe_num(prof.get("GS") or prof.get("Starts") or prof.get("Games Started"), None)
+                        out["Pitcher IP"] = ip
+                        out["Pitcher Starts"] = starts
                         out["Pitcher HR9"] = round((hr / ip * 9), 2) if ip and hr is not None else None
                         k_rate = _v3_safe_num(prof.get("Pitcher K%"), None)
                         out["Pitcher K%"] = round(k_rate * 100, 1) if k_rate is not None and k_rate <= 1 else k_rate
@@ -27728,6 +28191,13 @@ def _ow_batter_quality_context(player_id, days=365):
         "Ahead Count xwOBA": None,
         "Behind Count xwOBA": None,
         "Count Leverage Factor": 1.0,
+        "Recent 15d HardHit%": None,
+        "Recent 15d Barrel%": None,
+        "Recent 15d xwOBA": None,
+        "Recent 30d xwOBA": None,
+        "Recent Statcast Factor HRR": 1.0,
+        "Recent Statcast Factor HR": 1.0,
+        "Recent Statcast Note": "Recent Statcast unavailable",
         "Batter Quality Factor HRR": 1.0,
         "Batter Quality Factor HR": 1.0,
         "Batter Quality Note": "Batter Statcast unavailable",
@@ -27779,6 +28249,58 @@ def _ow_batter_quality_context(player_id, days=365):
             x = pd.to_numeric(df["estimated_slg_using_speedangle"], errors="coerce")
             if x.notna().sum() >= 10:
                 xslg = float(x.dropna().mean())
+
+        def _ow_recent_statcast_metrics(frame):
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return {"rows": 0, "hardhit": None, "barrel": None, "xwoba": None}
+            ev_local = pd.to_numeric(frame.get("launch_speed"), errors="coerce") if "launch_speed" in frame.columns else pd.Series(dtype=float)
+            bbe_local = ev_local.notna()
+            hardhit_local = float((ev_local[bbe_local] >= 95).mean()) if int(bbe_local.sum()) >= 8 else None
+            barrel_local = None
+            if "launch_speed_angle" in frame.columns and int(bbe_local.sum()) >= 8:
+                lsa_local = pd.to_numeric(frame["launch_speed_angle"], errors="coerce")
+                barrel_local = float((lsa_local[bbe_local] == 6).mean())
+            xwoba_local = None
+            if "estimated_woba_using_speedangle" in frame.columns:
+                x_local = pd.to_numeric(frame["estimated_woba_using_speedangle"], errors="coerce")
+                if x_local.notna().sum() >= 8:
+                    xwoba_local = float(x_local.dropna().mean())
+            return {"rows": int(len(frame)), "hardhit": hardhit_local, "barrel": barrel_local, "xwoba": xwoba_local}
+
+        recent_15 = {"rows": 0, "hardhit": None, "barrel": None, "xwoba": None}
+        recent_30 = {"rows": 0, "hardhit": None, "barrel": None, "xwoba": None}
+        recent_hrr_factor = 1.0
+        recent_hr_factor = 1.0
+        recent_notes = []
+        try:
+            if "game_date" in df.columns:
+                gdt = pd.to_datetime(df["game_date"], errors="coerce")
+                today = pd.Timestamp(end.date())
+                recent_15 = _ow_recent_statcast_metrics(df[gdt >= today - pd.Timedelta(days=15)])
+                recent_30 = _ow_recent_statcast_metrics(df[gdt >= today - pd.Timedelta(days=30)])
+                if recent_15.get("rows", 0) >= 12:
+                    r15_xwoba = recent_15.get("xwoba")
+                    r15_barrel = recent_15.get("barrel")
+                    if r15_xwoba is not None and xwoba is not None:
+                        diff = r15_xwoba - xwoba
+                        if diff >= 0.035:
+                            recent_hrr_factor *= 1.025
+                            recent_hr_factor *= 1.030
+                            recent_notes.append(f"15d xwOBA up {diff:+.3f}")
+                        elif diff <= -0.035:
+                            recent_hrr_factor *= 0.975
+                            recent_hr_factor *= 0.970
+                            recent_notes.append(f"15d xwOBA down {diff:+.3f}")
+                    if r15_barrel is not None and barrel is not None:
+                        bdiff = r15_barrel - barrel
+                        if bdiff >= 0.025:
+                            recent_hr_factor *= 1.035
+                            recent_notes.append(f"15d barrel up {bdiff*100:+.1f} pts")
+                        elif bdiff <= -0.025:
+                            recent_hr_factor *= 0.965
+                            recent_notes.append(f"15d barrel down {bdiff*100:+.1f} pts")
+        except Exception:
+            pass
 
         ahead_xwoba = None
         behind_xwoba = None
@@ -27858,6 +28380,12 @@ def _ow_batter_quality_context(player_id, days=365):
         hr_factor *= count_factor
         if count_factor != 1.0:
             notes.append(f"count leverage x{count_factor:.3f}")
+        recent_hrr_factor = float(clamp(recent_hrr_factor, 0.955, 1.045))
+        recent_hr_factor = float(clamp(recent_hr_factor, 0.925, 1.075))
+        hrr_factor *= recent_hrr_factor
+        hr_factor *= recent_hr_factor
+        if recent_notes:
+            notes.extend(recent_notes[:3])
         return {
             "Batter Statcast Rows": int(len(df)),
             "Batter Avg EV": None if avg_ev is None else round(avg_ev, 1),
@@ -27870,6 +28398,13 @@ def _ow_batter_quality_context(player_id, days=365):
             "Ahead Count xwOBA": None if ahead_xwoba is None else round(ahead_xwoba, 3),
             "Behind Count xwOBA": None if behind_xwoba is None else round(behind_xwoba, 3),
             "Count Leverage Factor": round(float(count_factor), 3),
+            "Recent 15d HardHit%": None if recent_15.get("hardhit") is None else round(recent_15.get("hardhit") * 100, 1),
+            "Recent 15d Barrel%": None if recent_15.get("barrel") is None else round(recent_15.get("barrel") * 100, 1),
+            "Recent 15d xwOBA": None if recent_15.get("xwoba") is None else round(recent_15.get("xwoba"), 3),
+            "Recent 30d xwOBA": None if recent_30.get("xwoba") is None else round(recent_30.get("xwoba"), 3),
+            "Recent Statcast Factor HRR": round(float(recent_hrr_factor), 3),
+            "Recent Statcast Factor HR": round(float(recent_hr_factor), 3),
+            "Recent Statcast Note": ", ".join(recent_notes) if recent_notes else "Recent Statcast neutral",
             "Batter Quality Factor HRR": round(float(clamp(hrr_factor, 0.90, 1.10)), 3),
             "Batter Quality Factor HR": round(float(clamp(hr_factor, 0.86, 1.16)), 3),
             "Batter Quality Note": ", ".join(notes) if notes else "Batter contact/count quality neutral",
@@ -28208,6 +28743,11 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         pctx = _ow_pitcher_matchup_factors(team)
         bpctx = _v3_bullpen_weakness_context_from_team(team)
         team_ctx = _ow_team_context(team)
+        protection_ctx = _ow_lineup_protection_context(player, team, pctx.get("Pitcher Hand"))
+        ump_ctx = _ow_umpire_hitter_context(team, "HRR")
+        defense_ctx = _ow_defense_framing_context(opp, "HRR")
+        pitcher_confirm_ctx = _ow_pitcher_confirmation_context(team, pctx, "HRR")
+        availability_ctx = _ow_batter_availability_context(player, logs, lineup_ctx, "HRR")
         team_runs, team_run_note = _v3_team_run_environment(team_ctx)
         projected_pa = lineup_ctx.get("Projected PA") or _ow_projected_pa_from_logs(logs, prof.get("season"))
         base_pa = _ow_projected_pa_from_logs(logs, prof.get("season"))
@@ -28221,9 +28761,17 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         weather_factor = _v3_safe_num(weather_ctx.get("Weather Factor"), 1.0) or 1.0
         park_factor, venue = _ow_park_factor(team, "HRR")
         pitcher_factor = _v3_safe_num(pctx.get("HRR Matchup Factor"), 1.0) or 1.0
+        protection_factor = _v3_safe_num(protection_ctx.get("Lineup Protection Factor"), 1.0) or 1.0
+        umpire_factor_hitter = _v3_safe_num(ump_ctx.get("Umpire Hitter Factor"), 1.0) or 1.0
+        defense_factor = _v3_safe_num(defense_ctx.get("Defense/Framing Factor"), 1.0) or 1.0
         bullpen_factor = 1.03 if (_v3_safe_num(bpctx.get("Bullpen Weakness Score"), 50) or 50) >= 62 else 0.99 if (_v3_safe_num(bpctx.get("Bullpen Weakness Score"), 50) or 50) <= 42 else 1.0
+        bullpen_leash_ctx = _ow_bullpen_leash_context(team, pctx, bpctx, "HRR")
+        bullpen_leash_factor = _v3_safe_num(bullpen_leash_ctx.get("Bullpen/Leash Factor"), 1.0) or 1.0
+        pitcher_confirmation_factor = _v3_safe_num(pitcher_confirm_ctx.get("Pitcher Confirmation Factor"), 1.0) or 1.0
+        availability_factor = _v3_safe_num(availability_ctx.get("Availability Factor"), 1.0) or 1.0
+        slot_trend_factor = _v3_safe_num(availability_ctx.get("Lineup Slot Trend Factor"), 1.0) or 1.0
         run_factor = 1.03 if team_runs is not None and team_runs >= 5.0 else 0.97 if team_runs is not None and team_runs <= 3.7 else 1.0
-        proj = round(float(proj) * park_factor * weather_factor * pa_factor * pitcher_factor * split_factor * batter_quality_factor * pitch_mix_factor * bullpen_factor * run_factor, 2)
+        proj = round(float(proj) * park_factor * weather_factor * pa_factor * pitcher_factor * split_factor * batter_quality_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_factor * bullpen_leash_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * run_factor, 2)
         edge = round(proj - float(line), 2)
         recent_vals = vals[-10:] if vals else []
         raw_over_rate = _ow_hit_rate_text(vals[-20:], float(line), "OVER")[1]
@@ -28251,6 +28799,15 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         best_pct = max([x for x in [l5_pct, l10_pct, l15_pct, same_pct] if x is not None] or [0]) * 100
         win_prob = max(over_prob, 1.0 - over_prob) * 100
         data_conf, data_flags = _ow_data_confidence(logs, lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx)
+        risk_ctx = _ow_projection_risk_context(vals, line, data_conf, "HRR")
+        volatility_factor = _v3_safe_num(risk_ctx.get("Volatility Factor"), 1.0) or 1.0
+        if volatility_factor != 1.0:
+            proj = round(float(proj) * volatility_factor, 2)
+            edge = round(proj - float(line), 2)
+            model_over_prob = _ow_logistic_probability(edge, 1.10)
+            over_prob = (0.65 * raw_over_rate + 0.35 * model_over_prob) if raw_over_rate is not None else model_over_prob
+            pick = "OVER" if over_prob >= 0.50 else "UNDER"
+            win_prob = max(over_prob, 1.0 - over_prob) * 100
         sync = int(round(clamp(50 + abs(edge) * 14 + max(0, best_pct - 50) * 0.35 + min(8, len(vals) / 4) + max(-6, (data_conf - 55) * 0.08), 0, 100)))
         conf = round(clamp(5.0 + abs(edge) * 1.4 + max(0, win_prob - 50) / 10 + max(0, best_pct - 50) / 22, 1, 10), 1)
         official_filter = _ow_hrr_official_label(sync, edge, data_conf, lineup_ctx, pctx)
@@ -28281,9 +28838,20 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Projected PA": projected_pa,
             "Lineup Slot": lineup_ctx.get("Lineup Slot"),
             "Lineup Status": lineup_ctx.get("Lineup Status"),
+            "Lineup Source": lineup_ctx.get("Lineup Source"),
             "Lineup Confirmed": lineup_ctx.get("Lineup Confirmed"),
+            "Lineup Protection Factor": protection_ctx.get("Lineup Protection Factor"),
+            "Lineup Protection Note": protection_ctx.get("Lineup Protection Note"),
+            "Ahead OBP": protection_ctx.get("Ahead OBP"),
+            "Behind SLG": protection_ctx.get("Behind SLG"),
+            "Protection Source": protection_ctx.get("Protection Source"),
             "Opp Pitcher": pctx.get("Opp Pitcher"),
             "Pitcher Hand": pctx.get("Pitcher Hand"),
+            "Pitcher Confirmed": pitcher_confirm_ctx.get("Pitcher Confirmed"),
+            "Pitcher Confirmation Factor": pitcher_confirm_ctx.get("Pitcher Confirmation Factor"),
+            "Pitcher Confirmation Note": pitcher_confirm_ctx.get("Pitcher Confirmation Note"),
+            "Pitcher IP": pctx.get("Pitcher IP"),
+            "Pitcher Starts": pctx.get("Pitcher Starts"),
             "Pitcher HR9": pctx.get("Pitcher HR9"),
             "Pitcher K%": pctx.get("Pitcher K%"),
             "Pitcher CSW%": pctx.get("Pitcher CSW%"),
@@ -28317,20 +28885,49 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Ahead Count xwOBA": bctx.get("Ahead Count xwOBA"),
             "Behind Count xwOBA": bctx.get("Behind Count xwOBA"),
             "Count Leverage Factor": bctx.get("Count Leverage Factor"),
+            "Recent 15d HardHit%": bctx.get("Recent 15d HardHit%"),
+            "Recent 15d Barrel%": bctx.get("Recent 15d Barrel%"),
+            "Recent 15d xwOBA": bctx.get("Recent 15d xwOBA"),
+            "Recent 30d xwOBA": bctx.get("Recent 30d xwOBA"),
+            "Recent Statcast Factor HRR": bctx.get("Recent Statcast Factor HRR"),
+            "Recent Statcast Note": bctx.get("Recent Statcast Note"),
             "Bullpen Weakness Label": bpctx.get("Bullpen Weakness Label"),
             "Bullpen Factor": round(bullpen_factor, 3),
+            "Bullpen/Leash Factor": bullpen_leash_ctx.get("Bullpen/Leash Factor"),
+            "Starter Leash Label": bullpen_leash_ctx.get("Starter Leash Label"),
+            "Starter Leash Note": bullpen_leash_ctx.get("Starter Leash Note"),
+            "Bullpen Rest Note": bullpen_leash_ctx.get("Bullpen Rest Note"),
             "Team Run Environment": team_run_note,
             "Run Factor": round(run_factor, 3),
             "PA Factor": round(pa_factor, 3),
+            "Availability Factor": availability_ctx.get("Availability Factor"),
+            "Availability Note": availability_ctx.get("Availability Note"),
+            "Days Since Last Game": availability_ctx.get("Days Since Last Game"),
+            "Lineup Slot Trend Factor": availability_ctx.get("Lineup Slot Trend Factor"),
+            "Lineup Slot Trend Note": availability_ctx.get("Lineup Slot Trend Note"),
             "Park": venue,
             "Park Factor": round(park_factor, 3),
             "Weather Factor": round(weather_factor, 3),
             "Weather Note": weather_ctx.get("Weather Note"),
             "Weather Temp F": weather_ctx.get("Weather Temp F"),
             "Weather Wind MPH": weather_ctx.get("Weather Wind MPH"),
+            "Weather Wind Direction": weather_ctx.get("Weather Wind Direction"),
+            "Wind Carry Label": weather_ctx.get("Wind Carry Label"),
             "Weather Humidity %": weather_ctx.get("Weather Humidity %"),
+            "Umpire Hitter Factor": ump_ctx.get("Umpire Hitter Factor"),
+            "Umpire Name": ump_ctx.get("Umpire Name"),
+            "Umpire Note": ump_ctx.get("Umpire Note"),
+            "Defense/Framing Factor": defense_ctx.get("Defense/Framing Factor"),
+            "Opponent Defense Score": defense_ctx.get("Opponent Defense Score"),
+            "Opponent Framing Score": defense_ctx.get("Opponent Framing Score"),
+            "Defense/Framing Note": defense_ctx.get("Defense/Framing Note"),
             "Data Confidence": data_conf,
             "Data Flags": data_flags,
+            "Volatility Factor": risk_ctx.get("Volatility Factor"),
+            "Volatility Label": risk_ctx.get("Volatility Label"),
+            "Volatility Note": risk_ctx.get("Volatility Note"),
+            "Overall Rating": risk_ctx.get("Overall Rating"),
+            "No-Bet Risk Flags": risk_ctx.get("No-Bet Risk Flags"),
             "Best Hit Rate %": round(best_pct, 1) if best_pct else "—",
             "Sync Score": sync,
             "Sync Label": "STRONG" if sync >= 72 else "GOOD" if sync >= 60 else "THIN",
@@ -28338,7 +28935,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
             "Official Play Filter": official_filter,
-            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. PA {projected_pa}; {lineup_ctx.get('Lineup Status')}; {pctx.get('Pitcher Matchup Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; park {venue} ({park_factor:.3f}); {team_run_note}; bullpen {bpctx.get('Bullpen Weakness Label')}; data {data_conf}/100; CSV prior {'used' if hrr_prior_used else 'not used'}.",
+            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. PA {projected_pa}; {lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); {team_run_note}; bullpen {bpctx.get('Bullpen Weakness Label')}; volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if hrr_prior_used else 'not used'}.",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -28393,6 +28990,11 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         opp = _ow_team_abbr(raw_opp)
         lineup_ctx = _ow_lineup_context(player, team)
         pctx = _ow_pitcher_matchup_factors(team)
+        protection_ctx = _ow_lineup_protection_context(player, team, pctx.get("Pitcher Hand"))
+        ump_ctx = _ow_umpire_hitter_context(team, "HR")
+        defense_ctx = _ow_defense_framing_context(opp, "HR")
+        pitcher_confirm_ctx = _ow_pitcher_confirmation_context(team, pctx, "HR")
+        availability_ctx = _ow_batter_availability_context(player, logs, lineup_ctx, "HR")
         split_factor, split_note = _ow_batter_split_factor(prof.get("player_id"), pctx.get("Pitcher Hand"), "HR")
         bctx = _ow_batter_quality_context(prof.get("player_id"))
         batter_quality_factor = _v3_safe_num(bctx.get("Batter Quality Factor HR"), 1.0) or 1.0
@@ -28404,7 +29006,16 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         pa_factor = clamp((safe_float(lineup_pa, pa) or pa) / max(pa, 0.1), 0.88, 1.14)
         park_factor, venue = _ow_park_factor(team, "HR")
         pitcher_factor = _v3_safe_num(pctx.get("HR Matchup Factor"), 1.0) or 1.0
-        proj_hr = round(float(clamp(proj_hr * park_factor * weather_factor * pitcher_factor * split_factor * batter_quality_factor * pitch_mix_factor * pa_factor, 0.01, 0.95)), 3)
+        protection_factor = _v3_safe_num(protection_ctx.get("Lineup Protection Factor"), 1.0) or 1.0
+        umpire_factor_hitter = _v3_safe_num(ump_ctx.get("Umpire Hitter Factor"), 1.0) or 1.0
+        defense_factor = _v3_safe_num(defense_ctx.get("Defense/Framing Factor"), 1.0) or 1.0
+        bpctx = _v3_bullpen_weakness_context_from_team(team)
+        bullpen_leash_ctx = _ow_bullpen_leash_context(team, pctx, bpctx, "HR")
+        bullpen_leash_factor = _v3_safe_num(bullpen_leash_ctx.get("Bullpen/Leash Factor"), 1.0) or 1.0
+        pitcher_confirmation_factor = _v3_safe_num(pitcher_confirm_ctx.get("Pitcher Confirmation Factor"), 1.0) or 1.0
+        availability_factor = _v3_safe_num(availability_ctx.get("Availability Factor"), 1.0) or 1.0
+        slot_trend_factor = _v3_safe_num(availability_ctx.get("Lineup Slot Trend Factor"), 1.0) or 1.0
+        proj_hr = round(float(clamp(proj_hr * park_factor * weather_factor * pitcher_factor * split_factor * batter_quality_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_leash_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * pa_factor, 0.01, 0.95)), 3)
         threshold = int(math.floor(float(line))) + 1
         p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
         prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
@@ -28429,6 +29040,16 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
         grade = _ow_grade_hr_probability(prob_pct)
         data_conf, data_flags = _ow_data_confidence(logs, lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx)
+        risk_ctx = _ow_projection_risk_context(hr_vals, line, data_conf, "HR")
+        volatility_factor = _v3_safe_num(risk_ctx.get("Volatility Factor"), 1.0) or 1.0
+        if volatility_factor != 1.0:
+            proj_hr = round(float(clamp(proj_hr * volatility_factor, 0.01, 0.95)), 3)
+            p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
+            prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
+            pick = _ow_hr_over_label(prob_pct)
+            edge = round(proj_hr - float(line), 3)
+            win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
+            grade = _ow_grade_hr_probability(prob_pct)
         official_filter = _ow_hr_official_label(grade, prob_pct, data_conf, pctx)
         out.append({
             "Player": player,
@@ -28452,9 +29073,20 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Projected PA": lineup_pa,
             "Lineup Slot": lineup_ctx.get("Lineup Slot"),
             "Lineup Status": lineup_ctx.get("Lineup Status"),
+            "Lineup Source": lineup_ctx.get("Lineup Source"),
             "Lineup Confirmed": lineup_ctx.get("Lineup Confirmed"),
+            "Lineup Protection Factor": protection_ctx.get("Lineup Protection Factor"),
+            "Lineup Protection Note": protection_ctx.get("Lineup Protection Note"),
+            "Ahead OBP": protection_ctx.get("Ahead OBP"),
+            "Behind SLG": protection_ctx.get("Behind SLG"),
+            "Protection Source": protection_ctx.get("Protection Source"),
             "Opp Pitcher": pctx.get("Opp Pitcher"),
             "Pitcher Hand": pctx.get("Pitcher Hand"),
+            "Pitcher Confirmed": pitcher_confirm_ctx.get("Pitcher Confirmed"),
+            "Pitcher Confirmation Factor": pitcher_confirm_ctx.get("Pitcher Confirmation Factor"),
+            "Pitcher Confirmation Note": pitcher_confirm_ctx.get("Pitcher Confirmation Note"),
+            "Pitcher IP": pctx.get("Pitcher IP"),
+            "Pitcher Starts": pctx.get("Pitcher Starts"),
             "Pitcher HR9": pctx.get("Pitcher HR9"),
             "Pitcher K%": pctx.get("Pitcher K%"),
             "Pitcher CSW%": pctx.get("Pitcher CSW%"),
@@ -28488,16 +29120,46 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Ahead Count xwOBA": bctx.get("Ahead Count xwOBA"),
             "Behind Count xwOBA": bctx.get("Behind Count xwOBA"),
             "Count Leverage Factor": bctx.get("Count Leverage Factor"),
+            "Recent 15d HardHit%": bctx.get("Recent 15d HardHit%"),
+            "Recent 15d Barrel%": bctx.get("Recent 15d Barrel%"),
+            "Recent 15d xwOBA": bctx.get("Recent 15d xwOBA"),
+            "Recent 30d xwOBA": bctx.get("Recent 30d xwOBA"),
+            "Recent Statcast Factor HR": bctx.get("Recent Statcast Factor HR"),
+            "Recent Statcast Note": bctx.get("Recent Statcast Note"),
+            "Bullpen Weakness Label": bpctx.get("Bullpen Weakness Label"),
+            "Bullpen/Leash Factor": bullpen_leash_ctx.get("Bullpen/Leash Factor"),
+            "Starter Leash Label": bullpen_leash_ctx.get("Starter Leash Label"),
+            "Starter Leash Note": bullpen_leash_ctx.get("Starter Leash Note"),
+            "Bullpen Rest Note": bullpen_leash_ctx.get("Bullpen Rest Note"),
             "PA Factor": round(pa_factor, 3),
+            "Availability Factor": availability_ctx.get("Availability Factor"),
+            "Availability Note": availability_ctx.get("Availability Note"),
+            "Days Since Last Game": availability_ctx.get("Days Since Last Game"),
+            "Lineup Slot Trend Factor": availability_ctx.get("Lineup Slot Trend Factor"),
+            "Lineup Slot Trend Note": availability_ctx.get("Lineup Slot Trend Note"),
             "Park": venue,
             "Park Factor": round(park_factor, 3),
             "Weather Factor": round(weather_factor, 3),
             "Weather Note": weather_ctx.get("Weather Note"),
             "Weather Temp F": weather_ctx.get("Weather Temp F"),
             "Weather Wind MPH": weather_ctx.get("Weather Wind MPH"),
+            "Weather Wind Direction": weather_ctx.get("Weather Wind Direction"),
+            "Wind Carry Label": weather_ctx.get("Wind Carry Label"),
             "Weather Humidity %": weather_ctx.get("Weather Humidity %"),
+            "Umpire Hitter Factor": ump_ctx.get("Umpire Hitter Factor"),
+            "Umpire Name": ump_ctx.get("Umpire Name"),
+            "Umpire Note": ump_ctx.get("Umpire Note"),
+            "Defense/Framing Factor": defense_ctx.get("Defense/Framing Factor"),
+            "Opponent Defense Score": defense_ctx.get("Opponent Defense Score"),
+            "Opponent Framing Score": defense_ctx.get("Opponent Framing Score"),
+            "Defense/Framing Note": defense_ctx.get("Defense/Framing Note"),
             "Data Confidence": data_conf,
             "Data Flags": data_flags,
+            "Volatility Factor": risk_ctx.get("Volatility Factor"),
+            "Volatility Label": risk_ctx.get("Volatility Label"),
+            "Volatility Note": risk_ctx.get("Volatility Note"),
+            "Overall Rating": risk_ctx.get("Overall Rating"),
+            "No-Bet Risk Flags": risk_ctx.get("No-Bet Risk Flags"),
             "L7 HR": int(sum(hr_vals[-7:])) if hr_vals else 0,
             "L15 HR": int(sum(hr_vals[-15:])) if hr_vals else 0,
             "L30 HR": int(sum(hr_vals[-30:])) if hr_vals else 0,
@@ -28508,7 +29170,7 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Official Play Filter": official_filter,
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
-            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. PA {lineup_pa}; {lineup_ctx.get('Lineup Status')}; {pctx.get('Pitcher Matchup Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; park {venue} ({park_factor:.3f}); data {data_conf}/100; CSV prior {'used' if prior_used else 'not used'}.",
+            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. PA {lineup_pa}; {lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if prior_used else 'not used'}.",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -28599,12 +29261,21 @@ def build_v3_batter_upside_board_final():
                     "HRR Over Probability %": rd.get("Over Probability %"),
                     "Best Hit Rate %": max(_v3_final_num(d.get("Best Hit Rate %"), 0) or 0, _v3_final_num(rd.get("Best Hit Rate %"), 0) or 0),
                     "Lineup Status": rd.get("Lineup Status", d.get("Lineup Status")),
+                    "Lineup Source": rd.get("Lineup Source", d.get("Lineup Source")),
+                    "Lineup Protection Factor": rd.get("Lineup Protection Factor", d.get("Lineup Protection Factor")),
+                    "Lineup Slot Trend Factor": rd.get("Lineup Slot Trend Factor", d.get("Lineup Slot Trend Factor")),
                     "Opp Pitcher": rd.get("Opp Pitcher", d.get("Opp Pitcher")),
                     "Pitcher Hand": rd.get("Pitcher Hand", d.get("Pitcher Hand")),
+                    "Pitcher Confirmed": rd.get("Pitcher Confirmed", d.get("Pitcher Confirmed")),
                     "Park": rd.get("Park", d.get("Park")),
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
                     "Data Flags": rd.get("Data Flags", d.get("Data Flags")),
+                    "Overall Rating": rd.get("Overall Rating", d.get("Overall Rating")),
+                    "No-Bet Risk Flags": rd.get("No-Bet Risk Flags", d.get("No-Bet Risk Flags")),
                     "Weather Factor": rd.get("Weather Factor", d.get("Weather Factor")),
+                    "Wind Carry Label": rd.get("Wind Carry Label", d.get("Wind Carry Label")),
+                    "Umpire Name": rd.get("Umpire Name", d.get("Umpire Name")),
+                    "Defense/Framing Factor": rd.get("Defense/Framing Factor", d.get("Defense/Framing Factor")),
                     "Pitch Mix Matchup Factor": rd.get("Pitch Mix Matchup Factor", d.get("Pitch Mix Matchup Factor")),
                     "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
                 })
@@ -28628,12 +29299,21 @@ def build_v3_batter_upside_board_final():
                     "HR Line": rd.get("Line"),
                     "HR Pick": rd.get("Pick"),
                     "Lineup Status": rd.get("Lineup Status", d.get("Lineup Status")),
+                    "Lineup Source": rd.get("Lineup Source", d.get("Lineup Source")),
+                    "Lineup Protection Factor": rd.get("Lineup Protection Factor", d.get("Lineup Protection Factor")),
+                    "Lineup Slot Trend Factor": rd.get("Lineup Slot Trend Factor", d.get("Lineup Slot Trend Factor")),
                     "Opp Pitcher": rd.get("Opp Pitcher", d.get("Opp Pitcher")),
                     "Pitcher Hand": rd.get("Pitcher Hand", d.get("Pitcher Hand")),
+                    "Pitcher Confirmed": rd.get("Pitcher Confirmed", d.get("Pitcher Confirmed")),
                     "Park": rd.get("Park", d.get("Park")),
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
                     "Data Flags": rd.get("Data Flags", d.get("Data Flags")),
+                    "Overall Rating": rd.get("Overall Rating", d.get("Overall Rating")),
+                    "No-Bet Risk Flags": rd.get("No-Bet Risk Flags", d.get("No-Bet Risk Flags")),
                     "Weather Factor": rd.get("Weather Factor", d.get("Weather Factor")),
+                    "Wind Carry Label": rd.get("Wind Carry Label", d.get("Wind Carry Label")),
+                    "Umpire Name": rd.get("Umpire Name", d.get("Umpire Name")),
+                    "Defense/Framing Factor": rd.get("Defense/Framing Factor", d.get("Defense/Framing Factor")),
                     "Pitch Mix Matchup Factor": rd.get("Pitch Mix Matchup Factor", d.get("Pitch Mix Matchup Factor")),
                     "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
                 })
@@ -28668,7 +29348,7 @@ def build_v3_batter_upside_board_final():
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
     df = df.sort_values(["Upside Score", "Best Hit Rate %"], ascending=[False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
-    cols = ["Player", "Team", "Opponent", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Park", "Weather Factor", "Pitch Mix Matchup Factor", "Data Confidence", "Data Flags", "Official Play Filter", "Upside Score"]
+    cols = ["Player", "Team", "Opponent", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix Matchup Factor", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
     return df[[c for c in cols if c in df.columns]]
 
 
@@ -28689,7 +29369,7 @@ def render_v3_batter_research_tab(market="HRR"):
     c2.metric("Projected", len(df))
     c3.metric("Overs", int((df["Pick"].astype(str) == "OVER").sum()))
     c4.metric("Mode", "UD + MLB")
-    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Data Confidence", "Data Flags", "Projected PA", "Lineup Slot", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Humidity %", "Last 5", "Last 10", "Last 15", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HRR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "Last 5", "Last 10", "Last 15", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -28724,7 +29404,7 @@ def render_v3_home_run_tab():
     c2.metric("Projected", len(df))
     c3.metric("A/A+ Spots", aa)
     c4.metric("Mode", "UD + MLB")
-    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "Data Confidence", "Data Flags", "Projected PA", "Lineup Slot", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Humidity %", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -28777,7 +29457,7 @@ def render_v3_batter_official_plays_tab():
     else:
         df["_hr_sort"] = 0
     df = df.sort_values(["_sync_sort", "_hr_sort"], ascending=[False, False]).drop(columns=["_sync_sort", "_hr_sort"], errors="ignore")
-    cols = [c for c in ["Player", "Market", "Team", "Opponent", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "Data Confidence", "Data Flags", "Projected PA", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Primary Pitch", "Slider/Sweeper Usage %", "Pitcher Stuff Factor", "Pitch Mix Matchup Factor", "Batter Quality Factor", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA", "Ahead Count xwOBA", "Count Leverage Factor", "Weather Factor", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Market", "Team", "Opponent", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Primary Pitch", "Slider/Sweeper Usage %", "Pitcher Stuff Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Batter Quality Factor", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA", "Recent 15d xwOBA", "Ahead Count xwOBA", "Count Leverage Factor", "Volatility Label", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(80), use_container_width=True, hide_index=True)
 
 # Clean V3 batter-only tab layout. Removed visible Pitcher K, Batter FS, Pitcher FS, Research Hub, and Moneyline tabs.
