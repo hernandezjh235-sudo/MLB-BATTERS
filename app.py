@@ -27320,6 +27320,187 @@ def _ow_logistic_probability(edge, scale):
         return 0.50
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _ow_live_boxscore_players(game_pk):
+    if not game_pk:
+        return []
+    data = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12) or {}
+    teams = (((data.get("liveData") or {}).get("boxscore") or {}).get("teams") or {})
+    out = []
+    for side in ("away", "home"):
+        node = teams.get(side) or {}
+        team = (node.get("team") or {}).get("abbreviation") or (node.get("team") or {}).get("teamCode") or ""
+        for player in (node.get("players") or {}).values():
+            person = player.get("person") or {}
+            batting_order = player.get("battingOrder")
+            slot = None
+            try:
+                slot = int(str(batting_order)[:1]) if batting_order not in (None, "") else None
+            except Exception:
+                slot = None
+            out.append({
+                "name": person.get("fullName") or "",
+                "team": str(team).upper(),
+                "side": side,
+                "slot": slot,
+                "batting_order": batting_order,
+                "status": player.get("status") or {},
+            })
+    return out
+
+
+def _ow_lineup_context(player, team):
+    ctx = _ow_team_context(team)
+    for row in _ow_live_boxscore_players(ctx.get("GamePk")):
+        if row.get("team") and str(team or "").upper() not in {"", row.get("team")}:
+            continue
+        if name_score(player, row.get("name")) >= 0.88:
+            slot = row.get("slot")
+            if slot:
+                return {
+                    "Lineup Slot": slot,
+                    "Lineup Status": f"CONFIRMED SLOT {slot}",
+                    "Lineup Confirmed": True,
+                    "Projected PA": _v3_pa_from_slot(slot, None),
+                }
+    slot, status = _v3_latest_lineup_slot_for_player(player)
+    return {
+        "Lineup Slot": slot if slot is not None else "—",
+        "Lineup Status": status,
+        "Lineup Confirmed": False,
+        "Projected PA": _v3_pa_from_slot(slot, None) if slot is not None else None,
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_batter_split_factor(player_id, pitcher_hand, market):
+    if not player_id or pitcher_hand not in {"R", "L"}:
+        return 1.0, "Split unavailable"
+    sit_code = "vrhp" if pitcher_hand == "R" else "vlhp"
+    try:
+        split_data = safe_get_json(
+            f"{MLB_BASE}/people/{player_id}/stats",
+            params={"stats": "statSplits", "group": "hitting", "sitCodes": sit_code, "season": datetime.utcnow().year},
+            timeout=12,
+        ) or {}
+        season_data = safe_get_json(
+            f"{MLB_BASE}/people/{player_id}/stats",
+            params={"stats": "season", "group": "hitting", "season": datetime.utcnow().year},
+            timeout=12,
+        ) or {}
+        split_stat = None
+        season_stat = None
+        for block in split_data.get("stats") or []:
+            for split in block.get("splits") or []:
+                split_stat = split.get("stat") or {}
+                break
+        for block in season_data.get("stats") or []:
+            for split in block.get("splits") or []:
+                season_stat = split.get("stat") or {}
+                break
+        if not split_stat or not season_stat:
+            return 1.0, "Split unavailable"
+        split_pa = max(1.0, _ow_stat_num(split_stat, "plateAppearances", "atBats", default=1.0))
+        season_pa = max(1.0, _ow_stat_num(season_stat, "plateAppearances", "atBats", default=1.0))
+        if split_pa < 20:
+            return 1.0, f"Small split sample vs {pitcher_hand}HP"
+        if market == "HR":
+            split_rate = _ow_stat_num(split_stat, "homeRuns") / split_pa
+            season_rate = _ow_stat_num(season_stat, "homeRuns") / season_pa
+        else:
+            split_rate = (
+                _ow_stat_num(split_stat, "hits") + _ow_stat_num(split_stat, "runs") + _ow_stat_num(split_stat, "rbi")
+            ) / split_pa
+            season_rate = (
+                _ow_stat_num(season_stat, "hits") + _ow_stat_num(season_stat, "runs") + _ow_stat_num(season_stat, "rbi")
+            ) / season_pa
+        if season_rate <= 0:
+            return 1.0, "Split neutral"
+        factor = clamp((split_rate / season_rate) ** 0.35, 0.88, 1.14)
+        return float(factor), f"Split vs {pitcher_hand}HP {factor:.3f}"
+    except Exception:
+        return 1.0, "Split unavailable"
+
+
+def _ow_pitcher_matchup_factors(team):
+    pctx = _v3_pitcher_weakness_summary(team)
+    hr9 = _v3_safe_num(pctx.get("Pitcher HR9"), None)
+    kp = _v3_safe_num(pctx.get("Pitcher K%"), None)
+    hr_factor = 1.0
+    hrr_factor = 1.0
+    notes = []
+    if hr9 is not None:
+        if hr9 >= 1.60:
+            hr_factor *= 1.18
+            hrr_factor *= 1.04
+            notes.append(f"HR9 friendly {hr9:.2f}")
+        elif hr9 >= 1.25:
+            hr_factor *= 1.09
+            hrr_factor *= 1.02
+            notes.append(f"HR9 elevated {hr9:.2f}")
+        elif hr9 <= 0.65:
+            hr_factor *= 0.88
+            hrr_factor *= 0.98
+            notes.append(f"HR9 suppressor {hr9:.2f}")
+    if kp is not None:
+        if kp <= 18:
+            hrr_factor *= 1.04
+            hr_factor *= 1.03
+            notes.append(f"low K% {kp:.1f}")
+        elif kp >= 27:
+            hrr_factor *= 0.96
+            hr_factor *= 0.97
+            notes.append(f"high K% {kp:.1f}")
+    pctx["HR Matchup Factor"] = round(float(clamp(hr_factor, 0.84, 1.22)), 3)
+    pctx["HRR Matchup Factor"] = round(float(clamp(hrr_factor, 0.92, 1.08)), 3)
+    pctx["Pitcher Matchup Note"] = ", ".join(notes) if notes else "Pitcher matchup neutral"
+    return pctx
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _ow_optional_hr_csv_prior():
+    paths = [
+        Path("/Users/j/Documents/HR.csv"),
+        Path("HR.csv"),
+        Path("outputs/HR.csv"),
+        Path("/Users/j/Documents/Codex/2026-07-21/review/outputs/HR.csv"),
+    ]
+    for path in paths:
+        try:
+            if path.exists():
+                return pd.read_csv(path)
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _ow_hr_csv_prior_for_player(player):
+    try:
+        df = _ow_optional_hr_csv_prior()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        pcol = _v3_col(df, ["Player", "Batter", "Name", "player_name", "full_name"])
+        if not pcol:
+            return None
+        d = df[df[pcol].map(_v3_norm_name) == _v3_norm_name(player)].copy()
+        if d.empty:
+            return None
+        row = d.iloc[0].to_dict()
+        proj_col = _v3_col(d, ["HR Projection", "Home Run Projection", "Projection", "Projected HR", "proj_hr", "xHR"])
+        prob_col = _v3_col(d, ["HR Probability %", "HR Prob %", "Home Run Probability %", "Probability %", "HR Probability", "Probability"])
+        grade_col = _v3_col(d, ["HR Grade", "Grade", "Signal"])
+        prior_prob = _v3_safe_num(row.get(prob_col), None) if prob_col else None
+        if prior_prob is not None and 0 < prior_prob <= 1:
+            prior_prob *= 100
+        return {
+            "HR Projection": _v3_safe_num(row.get(proj_col), None) if proj_col else None,
+            "HR Probability %": prior_prob,
+            "HR Grade": row.get(grade_col) if grade_col else None,
+        }
+    except Exception:
+        return None
+
+
 def _ow_stat_num(stat, *keys, default=0.0):
     for key in keys:
         v = safe_float((stat or {}).get(key), None)
@@ -27428,8 +27609,20 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             continue
         team = logs[-1].get("team", "—") if logs else "—"
         opp = logs[-1].get("opponent", "—") if logs else "—"
+        lineup_ctx = _ow_lineup_context(player, team)
+        pctx = _ow_pitcher_matchup_factors(team)
+        bpctx = _v3_bullpen_weakness_context_from_team(team)
+        team_ctx = _ow_team_context(team)
+        team_runs, team_run_note = _v3_team_run_environment(team_ctx)
+        projected_pa = lineup_ctx.get("Projected PA") or _ow_projected_pa_from_logs(logs, prof.get("season"))
+        base_pa = _ow_projected_pa_from_logs(logs, prof.get("season"))
+        pa_factor = clamp((safe_float(projected_pa, base_pa) or base_pa) / max(base_pa, 0.1), 0.88, 1.14)
+        split_factor, split_note = _ow_batter_split_factor(prof.get("player_id"), pctx.get("Pitcher Hand"), "HRR")
         park_factor, venue = _ow_park_factor(team, "HRR")
-        proj = round(float(proj) * park_factor, 2)
+        pitcher_factor = _v3_safe_num(pctx.get("HRR Matchup Factor"), 1.0) or 1.0
+        bullpen_factor = 1.03 if (_v3_safe_num(bpctx.get("Bullpen Weakness Score"), 50) or 50) >= 62 else 0.99 if (_v3_safe_num(bpctx.get("Bullpen Weakness Score"), 50) or 50) <= 42 else 1.0
+        run_factor = 1.03 if team_runs is not None and team_runs >= 5.0 else 0.97 if team_runs is not None and team_runs <= 3.7 else 1.0
+        proj = round(float(proj) * park_factor * pa_factor * pitcher_factor * split_factor * bullpen_factor * run_factor, 2)
         edge = round(proj - float(line), 2)
         recent_vals = vals[-10:] if vals else []
         raw_over_rate = _ow_hit_rate_text(vals[-20:], float(line), "OVER")[1]
@@ -27465,7 +27658,23 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Same-Line": same,
             "Average": round(float(np.mean(vals)), 2) if vals else proj,
             "Median": round(float(np.median(vals)), 2) if vals else proj,
-            "Projected PA": _ow_projected_pa_from_logs(logs, prof.get("season")),
+            "Projected PA": projected_pa,
+            "Lineup Slot": lineup_ctx.get("Lineup Slot"),
+            "Lineup Status": lineup_ctx.get("Lineup Status"),
+            "Lineup Confirmed": lineup_ctx.get("Lineup Confirmed"),
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
+            "Pitcher Hand": pctx.get("Pitcher Hand"),
+            "Pitcher HR9": pctx.get("Pitcher HR9"),
+            "Pitcher K%": pctx.get("Pitcher K%"),
+            "Pitcher Matchup Factor": pitcher_factor,
+            "Pitcher Matchup Note": pctx.get("Pitcher Matchup Note"),
+            "Split Factor": round(split_factor, 3),
+            "Split Note": split_note,
+            "Bullpen Weakness Label": bpctx.get("Bullpen Weakness Label"),
+            "Bullpen Factor": round(bullpen_factor, 3),
+            "Team Run Environment": team_run_note,
+            "Run Factor": round(run_factor, 3),
+            "PA Factor": round(pa_factor, 3),
             "Park": venue,
             "Park Factor": round(park_factor, 3),
             "Best Hit Rate %": round(best_pct, 1) if best_pct else "—",
@@ -27475,7 +27684,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
             "Official Play Filter": "OFFICIAL HRR LEAN" if sync >= 72 and abs(edge) >= 0.5 else "RESEARCH / VERIFY",
-            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. Park: {venue} ({park_factor:.3f}).",
+            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. PA {projected_pa}; {lineup_ctx.get('Lineup Status')}; {pctx.get('Pitcher Matchup Note')}; {split_note}; park {venue} ({park_factor:.3f}); {team_run_note}; bullpen {bpctx.get('Bullpen Weakness Label')}.",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -27491,6 +27700,15 @@ def _ow_grade_hr_probability(prob):
     if prob >= 18:
         return "B VIABLE SPRINKLE"
     return "C PASS"
+
+
+def _ow_hr_over_label(prob_pct):
+    prob = safe_float(prob_pct, 0.0) or 0.0
+    if prob >= 25:
+        return "OVER WATCH"
+    if prob >= 18:
+        return "SPRINKLE"
+    return "PASS"
 
 
 def _ow_build_hr_rows_from_ud(raw_rows):
@@ -27517,12 +27735,32 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             proj_hr = _ow_stat_num(stat, "homeRuns") / games if stat else 0.0
         team = logs[-1].get("team", "—") if logs else "—"
         opp = logs[-1].get("opponent", "—") if logs else "—"
+        lineup_ctx = _ow_lineup_context(player, team)
+        pctx = _ow_pitcher_matchup_factors(team)
+        split_factor, split_note = _ow_batter_split_factor(prof.get("player_id"), pctx.get("Pitcher Hand"), "HR")
+        lineup_pa = lineup_ctx.get("Projected PA") or pa
+        pa_factor = clamp((safe_float(lineup_pa, pa) or pa) / max(pa, 0.1), 0.88, 1.14)
         park_factor, venue = _ow_park_factor(team, "HR")
-        proj_hr = round(float(clamp(proj_hr * park_factor, 0.01, 0.85)), 3)
+        pitcher_factor = _v3_safe_num(pctx.get("HR Matchup Factor"), 1.0) or 1.0
+        proj_hr = round(float(clamp(proj_hr * park_factor * pitcher_factor * split_factor * pa_factor, 0.01, 0.95)), 3)
         threshold = int(math.floor(float(line))) + 1
         p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
         prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
-        pick = "OVER" if p_over >= 0.50 else "UNDER"
+        prior = _ow_hr_csv_prior_for_player(player)
+        prior_used = False
+        prior_proj = None
+        prior_prob = None
+        if prior:
+            prior_proj = _v3_safe_num(prior.get("HR Projection"), None)
+            prior_prob = _v3_safe_num(prior.get("HR Probability %"), None)
+            if prior_proj is not None:
+                proj_hr = round(float(clamp(0.82 * proj_hr + 0.18 * prior_proj, 0.01, 0.95)), 3)
+                prior_used = True
+            if prior_prob is not None:
+                p_over = clamp((0.78 * prob_pct + 0.22 * prior_prob) / 100.0, 0.01, 0.75)
+                prob_pct = round(p_over * 100, 1)
+                prior_used = True
+        pick = _ow_hr_over_label(prob_pct)
         edge = round(proj_hr - float(line), 3)
         win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
         grade = _ow_grade_hr_probability(prob_pct)
@@ -27541,7 +27779,22 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "HR Probability %": prob_pct,
             "Win Probability %": win_prob,
             "HR Grade": grade,
-            "Projected PA": pa,
+            "HR CSV Prior": "YES" if prior_used else "NO",
+            "Prior HR Projection": round(prior_proj, 3) if prior_proj is not None else "—",
+            "Prior HR Probability %": round(prior_prob, 1) if prior_prob is not None else "—",
+            "Projected PA": lineup_pa,
+            "Lineup Slot": lineup_ctx.get("Lineup Slot"),
+            "Lineup Status": lineup_ctx.get("Lineup Status"),
+            "Lineup Confirmed": lineup_ctx.get("Lineup Confirmed"),
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
+            "Pitcher Hand": pctx.get("Pitcher Hand"),
+            "Pitcher HR9": pctx.get("Pitcher HR9"),
+            "Pitcher K%": pctx.get("Pitcher K%"),
+            "Pitcher Matchup Factor": pitcher_factor,
+            "Pitcher Matchup Note": pctx.get("Pitcher Matchup Note"),
+            "Split Factor": round(split_factor, 3),
+            "Split Note": split_note,
+            "PA Factor": round(pa_factor, 3),
             "Park": venue,
             "Park Factor": round(park_factor, 3),
             "L7 HR": int(sum(hr_vals[-7:])) if hr_vals else 0,
@@ -27550,10 +27803,11 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "xHR L15": "—",
             "Due Gap": "—",
             "Due Label": "MLB LOG MODEL",
+            "HR Signal": "STRONG" if prob_pct >= 25 else "SPRINKLE" if prob_pct >= 18 else "PASS",
             "Official Play Filter": "OFFICIAL HR WATCH" if grade.startswith("A") else "HR SPRINKLE ONLY" if grade.startswith("B") else "PASS / HR RESEARCH",
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
-            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. Park: {venue} ({park_factor:.3f}).",
+            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. PA {lineup_pa}; {lineup_ctx.get('Lineup Status')}; {pctx.get('Pitcher Matchup Note')}; {split_note}; park {venue} ({park_factor:.3f}).",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -27593,6 +27847,122 @@ def build_v3_home_run_table():
     }
 
 
+def build_v3_batter_upside_board_final():
+    rows = {}
+
+    def getrow(player):
+        key = _v3_final_norm_player(player)
+        if not key:
+            return None
+        if key not in rows:
+            rows[key] = {
+                "Player": str(player),
+                "Team": "—",
+                "Opponent": "—",
+                "Projected PA": None,
+                "HRR Projection": None,
+                "HRR Line": None,
+                "HRR Pick": None,
+                "HRR Edge": None,
+                "HRR Over Probability %": None,
+                "HR Probability": None,
+                "HR Line": None,
+                "HR Pick": None,
+                "HR Projection": None,
+                "Best Hit Rate %": None,
+                "Lineup Status": "—",
+                "Opp Pitcher": "—",
+                "Pitcher Hand": "—",
+                "Park": "—",
+                "Official Play Filter": "RESEARCH / VERIFY",
+                "Upside Score": 0,
+            }
+        return rows[key]
+
+    try:
+        hrr_df, _ = build_v3_batter_research_table("HRR")
+        if isinstance(hrr_df, pd.DataFrame) and not hrr_df.empty:
+            for _, r in hrr_df.iterrows():
+                rd = r.to_dict()
+                d = getrow(rd.get("Player"))
+                if d is None:
+                    continue
+                d.update({
+                    "Team": rd.get("Team", d.get("Team")),
+                    "Opponent": rd.get("Opponent", d.get("Opponent")),
+                    "Projected PA": _v3_final_num(rd.get("Projected PA"), d.get("Projected PA")),
+                    "HRR Projection": _v3_final_num(rd.get("Projection"), None),
+                    "HRR Line": rd.get("Line"),
+                    "HRR Pick": rd.get("Pick"),
+                    "HRR Edge": rd.get("Edge"),
+                    "HRR Over Probability %": rd.get("Over Probability %"),
+                    "Best Hit Rate %": max(_v3_final_num(d.get("Best Hit Rate %"), 0) or 0, _v3_final_num(rd.get("Best Hit Rate %"), 0) or 0),
+                    "Lineup Status": rd.get("Lineup Status", d.get("Lineup Status")),
+                    "Opp Pitcher": rd.get("Opp Pitcher", d.get("Opp Pitcher")),
+                    "Pitcher Hand": rd.get("Pitcher Hand", d.get("Pitcher Hand")),
+                    "Park": rd.get("Park", d.get("Park")),
+                    "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
+                })
+    except Exception:
+        pass
+
+    try:
+        hr_df, _ = build_v3_home_run_table()
+        if isinstance(hr_df, pd.DataFrame) and not hr_df.empty:
+            for _, r in hr_df.iterrows():
+                rd = r.to_dict()
+                d = getrow(rd.get("Player"))
+                if d is None:
+                    continue
+                d.update({
+                    "Team": rd.get("Team", d.get("Team")),
+                    "Opponent": rd.get("Opponent", d.get("Opponent")),
+                    "Projected PA": _v3_final_num(rd.get("Projected PA"), d.get("Projected PA")),
+                    "HR Probability": _v3_final_num(rd.get("HR Probability %"), d.get("HR Probability")),
+                    "HR Projection": rd.get("HR Projection"),
+                    "HR Line": rd.get("Line"),
+                    "HR Pick": rd.get("Pick"),
+                    "Lineup Status": rd.get("Lineup Status", d.get("Lineup Status")),
+                    "Opp Pitcher": rd.get("Opp Pitcher", d.get("Opp Pitcher")),
+                    "Pitcher Hand": rd.get("Pitcher Hand", d.get("Pitcher Hand")),
+                    "Park": rd.get("Park", d.get("Park")),
+                    "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
+                })
+    except Exception:
+        pass
+
+    out = []
+    for d in rows.values():
+        if not any(_v3_is_live_ud_line(d.get(k)) for k in ["HRR Line", "HR Line"]):
+            continue
+        pa = _v3_final_num(d.get("Projected PA"), 4.1) or 4.1
+        hrr = _v3_final_num(d.get("HRR Projection"), 0) or 0
+        hrr_edge = abs(_v3_final_num(d.get("HRR Edge"), 0) or 0)
+        hrr_prob = _v3_final_num(d.get("HRR Over Probability %"), 0) or 0
+        hrp = _v3_final_num(d.get("HR Probability"), 0) or 0
+        hit = _v3_final_num(d.get("Best Hit Rate %"), 0) or 0
+        score = 0
+        score += min(18, max(0, (pa - 3.5) * 12))
+        score += min(22, hrr * 5.0)
+        score += min(22, hrr_edge * 10.0)
+        score += min(18, max(0, hrr_prob - 50) * 0.45)
+        score += min(22, hrp * 0.80)
+        score += min(12, max(0, hit - 50) * 0.30)
+        d["Projected PA"] = round(pa, 2)
+        d["HRR Projection"] = round(hrr, 2) if hrr else "—"
+        d["HR Probability"] = f"{round(hrp, 1)}%" if hrp else "—"
+        d["Best Hit Rate %"] = round(hit, 1) if hit else "—"
+        d["Upside Score"] = int(round(clamp(score, 0, 100)))
+        out.append(d)
+    if not out:
+        return pd.DataFrame()
+    df = pd.DataFrame(out)
+    df["_norm"] = df["Player"].map(_v3_final_norm_player)
+    df = df.sort_values(["Upside Score", "Best Hit Rate %"], ascending=[False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
+    cols = ["Player", "Team", "Opponent", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Park", "Official Play Filter", "Upside Score"]
+    return df[[c for c in cols if c in df.columns]]
+
+
 def render_v3_batter_research_tab(market="HRR"):
     st.markdown('<div class="section-title-pro">🧪 H+R+RBI Research — Underdog Lines + Projections</div>', unsafe_allow_html=True)
     st.caption("Pulled Underdog H+R+RBI lines with MLB Stats API game-log projections, edge, pick, and hit-rate context.")
@@ -27610,7 +27980,7 @@ def render_v3_batter_research_tab(market="HRR"):
     c2.metric("Projected", len(df))
     c3.metric("Overs", int((df["Pick"].astype(str) == "OVER").sum()))
     c4.metric("Mode", "UD + MLB")
-    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "Confidence", "Projected PA", "Park", "Park Factor", "Last 5", "Last 10", "Last 15", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "Confidence", "Projected PA", "Lineup Slot", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Pitcher K%", "Pitcher Matchup Factor", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Last 5", "Last 10", "Last 15", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -27645,7 +28015,7 @@ def render_v3_home_run_tab():
     c2.metric("Projected", len(df))
     c3.metric("A/A+ Spots", aa)
     c4.metric("Mode", "UD + MLB")
-    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Pick", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "Projected PA", "Park", "Park Factor", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Opponent", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "Projected PA", "Lineup Slot", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Pitcher K%", "Pitcher Matchup Factor", "Split Factor", "PA Factor", "Park", "Park Factor", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -27659,6 +28029,47 @@ def render_v3_home_run_tab():
             d.metric("Over Prob", f"{rr.get('HR Probability %', '—')}%")
             e.metric("Grade", rr.get("HR Grade", "—"))
             st.info(rr.get("Matchup Summary", "—"))
+
+
+def render_v3_batter_official_plays_tab():
+    st.markdown('<div class="section-title-pro">✅ Batter Official Plays</div>', unsafe_allow_html=True)
+    st.caption("Only active Underdog-line players are considered. H+R+RBI uses edge/hit-rate sync; HR uses over-only watch/sprinkle/pass.")
+    frames = []
+    try:
+        hrr, _ = build_v3_batter_research_table("HRR")
+        if isinstance(hrr, pd.DataFrame) and not hrr.empty:
+            frames.append(hrr.copy())
+    except Exception:
+        pass
+    try:
+        hr, _ = build_v3_home_run_table()
+        if isinstance(hr, pd.DataFrame) and not hr.empty:
+            h2 = hr.copy()
+            h2["Projection"] = h2.get("HR Projection")
+            h2["Confidence"] = h2.get("HR Grade")
+            frames.append(h2)
+    except Exception:
+        pass
+    if not frames:
+        st.info("No official batter plays loaded yet.")
+        return
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    keep = df["Official Play Filter"].astype(str).str.contains("OFFICIAL|SPRINKLE", case=False, na=False) if "Official Play Filter" in df.columns else pd.Series([True] * len(df))
+    df = df[keep].copy()
+    if df.empty:
+        st.info("No plays passed the official filters yet.")
+        return
+    if "Sync Score" in df.columns:
+        df["_sync_sort"] = pd.to_numeric(df["Sync Score"], errors="coerce").fillna(0)
+    else:
+        df["_sync_sort"] = 0
+    if "HR Probability %" in df.columns:
+        df["_hr_sort"] = pd.to_numeric(df["HR Probability %"], errors="coerce").fillna(0)
+    else:
+        df["_hr_sort"] = 0
+    df = df.sort_values(["_sync_sort", "_hr_sort"], ascending=[False, False]).drop(columns=["_sync_sort", "_hr_sort"], errors="ignore")
+    cols = [c for c in ["Player", "Market", "Team", "Opponent", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "Projected PA", "Lineup Status", "Opp Pitcher", "Pitcher Hand", "Pitcher HR9", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
+    st.dataframe(df[cols].head(80), use_container_width=True, hide_index=True)
 
 # Clean V3 batter-only tab layout. Removed visible Pitcher K, Batter FS, Pitcher FS, Research Hub, and Moneyline tabs.
 tab_top, tab_hrr, tab_hr, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
