@@ -10700,6 +10700,29 @@ def _ow_clean_slate_text(value, max_len=90):
     return txt[:max_len]
 
 
+def _ow_slate_risk_text(row):
+    parts = []
+    try:
+        base = str(row.get("No-Bet Risk Flags") or "").strip()
+        if base and base.lower() not in {"nan", "none", "—"}:
+            parts.extend([x.strip() for x in base.split("|") if x.strip()])
+        lineup_status = str(row.get("Lineup Status") or "").upper()
+        if lineup_status and "CONFIRMED" not in lineup_status:
+            parts.append("verify lineup")
+        if str(row.get("Pitcher Confirmed") or "").strip().lower() not in {"true", "1", "yes"}:
+            parts.append("verify pitcher")
+        guard = str(row.get("Final Data Guardrail Label") or "").upper()
+        if guard in {"VERIFY", "THIN_DATA"}:
+            parts.append(f"data {guard.lower()}")
+        seen = []
+        for item in parts:
+            if item and item not in seen:
+                seen.append(item)
+        return _ow_clean_slate_text(" | ".join(seen), 70) if seen else "clean"
+    except Exception:
+        return "verify"
+
+
 def _ow_projection_copy_paste_slate(df, market_label, max_rows=12):
     if not isinstance(df, pd.DataFrame) or df.empty:
         return ""
@@ -10741,9 +10764,9 @@ def _ow_projection_copy_paste_slate(df, market_label, max_rows=12):
             prob = _ow_fmt_slate_num(r.get("HR Probability %"), 1)
             grade = _ow_clean_slate_text(r.get("HR Grade") or r.get("Official Play Filter"), 35)
             pitcher = _ow_clean_slate_text(r.get("Opp Pitcher"), 35)
-            risk = _ow_clean_slate_text(r.get("No-Bet Risk Flags"), 60)
+            risk = _ow_slate_risk_text(r)
             l10 = _ow_clean_slate_text(r.get("Last 10"), 20)
-            lines.append(f"{player} HR | {pick} {line} | Proj {proj} | HR Prob {prob}% | {grade} | L10 {l10} | vs {pitcher} | Risk {risk or 'clean'}")
+            lines.append(f"{player} HR | {pick} {line} | xHR {proj} | HR Prob {prob}% | {grade} | L10 over {l10} | vs {pitcher} | Risk {risk}")
         return "\n".join(lines)
 
     if "Projection" in d.columns:
@@ -10761,8 +10784,8 @@ def _ow_projection_copy_paste_slate(df, market_label, max_rows=12):
             l10 = _ow_clean_slate_text(r.get("Last 10"), 20)
             h2h = _ow_clean_slate_text(r.get("H2H"), 20)
             pitcher = _ow_clean_slate_text(r.get("Opp Pitcher"), 35)
-            risk = _ow_clean_slate_text(r.get("No-Bet Risk Flags"), 60)
-            lines.append(f"{player} {market} | {pick} {line} | Proj {proj} | Edge {edge} | Win {win}% | L10 {l10} | H2H {h2h} | vs {pitcher} | Risk {risk or 'clean'}")
+            risk = _ow_slate_risk_text(r)
+            lines.append(f"{player} {market} | {pick} {line} | Proj {proj} | Edge {edge} | Win {win}% | L10 pick {l10} | H2H opp {h2h} | vs {pitcher} | Risk {risk}")
     return "\n".join(lines)
 
 
@@ -27447,7 +27470,7 @@ def _v3_fetch_ud_home_run_rows():
 # Underdog supplies the playable line. MLB Stats API game logs supply projections
 # when local Opening Day batter logs do not match posted players.
 # =========================
-OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_STRONG_PLAYS_FINAL_GUARDRAILS_2026_07_22"
+OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_STRONG_PLAYS_PA_OUTCOME_SIM_2026_07_23"
 OW_BATTER_PICK_LOG = os.path.join(STORAGE_DIR, "ow_batter_pick_log.json")
 OW_BATTER_RESULT_LOG = os.path.join(STORAGE_DIR, "ow_batter_result_log.json")
 OW_BATTER_LINE_TRACKER_FILE = os.path.join(STORAGE_DIR, "ow_batter_line_tracker.json")
@@ -28115,6 +28138,34 @@ def _ow_projection_risk_context(vals, line, data_confidence, market="HRR"):
         return out
 
 
+def _ow_append_batter_verify_flags(risk_ctx, lineup_ctx, pitcher_confirm_ctx, guard_ctx=None):
+    risk_ctx = dict(risk_ctx or {})
+    flags = [x.strip() for x in str(risk_ctx.get("No-Bet Risk Flags") or "").split("|") if x.strip()]
+    lineup_status = str((lineup_ctx or {}).get("Lineup Status") or "").upper()
+    lineup_confirmed = bool((lineup_ctx or {}).get("Lineup Confirmed")) or "CONFIRMED" in lineup_status
+    pitcher_confirmed = bool((pitcher_confirm_ctx or {}).get("Pitcher Confirmed"))
+    guard_label = str((guard_ctx or {}).get("Final Data Guardrail Label") or "").upper()
+    if not lineup_confirmed:
+        flags.append("lineup not confirmed")
+    if not pitcher_confirmed:
+        flags.append("probable pitcher not confirmed")
+    if guard_label in {"VERIFY", "THIN_DATA"}:
+        flags.append(f"data guardrail {guard_label.lower()}")
+    seen = []
+    for f in flags:
+        if f not in seen:
+            seen.append(f)
+    rating = str(risk_ctx.get("Overall Rating") or "C / RESEARCH")
+    if seen:
+        if rating.startswith("A"):
+            rating = "B / VERIFY"
+        elif rating.startswith("B") and ("probable pitcher not confirmed" in seen or "lineup not confirmed" in seen):
+            rating = "C / VERIFY"
+    risk_ctx["Overall Rating"] = rating
+    risk_ctx["No-Bet Risk Flags"] = " | ".join(seen[:6])
+    return risk_ctx
+
+
 def _ow_matchup_integrity_context(player, team, displayed_opp, pctx, raw=None):
     out = {
         "Today Opponent": displayed_opp,
@@ -28521,6 +28572,15 @@ def _ow_probable_pitcher_context(team):
                     out["Pitcher ID"] = pid
                     out["Opp Pitcher"] = opp_prob.get("fullName") or "—"
                     out["Pitcher Hand"] = ((opp_prob.get("pitchHand") or {}).get("code") or "—")
+                    if pid and out["Pitcher Hand"] in (None, "", "—"):
+                        try:
+                            pdata = safe_get_json(f"{MLB_BASE}/people/{pid}", params={"hydrate": "currentTeam"}, timeout=10) or {}
+                            people = pdata.get("people") or []
+                            if people:
+                                ph = ((people[0].get("pitchHand") or {}).get("code") or (people[0].get("pitchHand") or {}).get("description") or "—")
+                                out["Pitcher Hand"] = str(ph).upper()[0] if ph not in (None, "", "—") else "—"
+                        except Exception:
+                            pass
                     if pid and "get_pitcher_profile" in globals():
                         prof = get_pitcher_profile(pid) or {}
                         ip = _v3_safe_num(prof.get("IP"), None)
@@ -29333,6 +29393,26 @@ def _ow_mlb_batter_game_log_profile(player_name):
     return {"player_id": pid, "logs": [], "season": season_stat, "status": last_status}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_current_batter_team_context(player_id):
+    out = {"Current Team": None, "Current Team Source": "unavailable"}
+    if not player_id:
+        return out
+    try:
+        data = safe_get_json(f"{MLB_BASE}/people/{player_id}", timeout=10) or {}
+        people = data.get("people") or []
+        if not people:
+            return out
+        p = people[0] or {}
+        team = p.get("currentTeam") or {}
+        team_abbr = _ow_team_abbr(team.get("abbreviation") or team.get("teamCode") or team.get("name"))
+        if team_abbr and team_abbr != "—":
+            out.update({"Current Team": team_abbr, "Current Team Source": "MLB currentTeam"})
+        return out
+    except Exception:
+        return out
+
+
 def _ow_projected_pa_from_logs(logs, season_stat=None):
     pa_vals = [safe_float(g.get("PA"), None) for g in (logs or [])]
     pa_vals = [v for v in pa_vals if v is not None and v > 0]
@@ -29555,7 +29635,7 @@ def _ow_batter_learning_adjustment_context(row, market="HRR"):
         "Batter Learning Note": "Need graded batter history",
     }
     try:
-        hist = load_json(OW_BATTER_RESULT_LOG, [])
+        hist = _ow_deduped_batter_results()
         if not hist:
             return out
         target_market = "HOME RUN" if str(market).upper() == "HR" else "H+R+RBI"
@@ -29620,7 +29700,7 @@ def _ow_result_downgrade_context(row, market="HRR"):
         "Result Gate Note": "Need graded sample",
     }
     try:
-        hist = load_json(OW_BATTER_RESULT_LOG, [])
+        hist = _ow_deduped_batter_results()
         if not hist:
             return out
         target_market = "HOME RUN" if str(market).upper() == "HR" else "H+R+RBI"
@@ -29691,6 +29771,121 @@ def _ow_result_downgrade_context(row, market="HRR"):
         return out
 
 
+def _ow_projection_error_calibration_context(row, market="HRR"):
+    out = {
+        "Projection Calibration Add": 0.0,
+        "Projection Calibration Factor": 1.0,
+        "Projection Calibration Samples": 0,
+        "Projection Calibration Avg Error": None,
+        "Projection Calibration Label": "NO_HISTORY",
+        "Projection Calibration Note": "Need graded projection errors",
+    }
+    try:
+        hist = _ow_deduped_batter_results()
+        target_market = "HOME RUN" if str(market).upper() == "HR" else "H+R+RBI"
+        samples = []
+        for r in hist:
+            rm = str(r.get("Market") or r.get("Best Market") or "").upper()
+            if target_market == "HOME RUN":
+                if "HOME RUN" not in rm and rm != "HR":
+                    continue
+            elif "H+R+RBI" not in rm and "HRR" not in rm:
+                continue
+            err = _v3_safe_num(r.get("Projection Error"), None)
+            if err is None:
+                continue
+            score = 1
+            if str(r.get("Team") or "").upper() == str(row.get("Team") or "").upper():
+                score += 2
+            if str(r.get("Opp Pitcher") or "").upper() == str(row.get("Opp Pitcher") or "").upper():
+                score += 2
+            if str(r.get("Overall Rating") or "").split("/")[0].strip().upper() == str(row.get("Overall Rating") or "").split("/")[0].strip().upper():
+                score += 1
+            if str(r.get("Official Play Filter") or "").split("/")[0].strip().upper() == str(row.get("Official Play Filter") or "").split("/")[0].strip().upper():
+                score += 1
+            samples.append((score, err, r))
+        if not samples:
+            return out
+        samples = sorted(samples, key=lambda x: x[0], reverse=True)
+        chosen = [err for score, err, _ in samples if score >= 3][:40]
+        if len(chosen) < 8:
+            chosen = [err for _, err, _ in samples][-80:]
+        n = len(chosen)
+        if n < 8:
+            out.update({
+                "Projection Calibration Samples": n,
+                "Projection Calibration Label": "SMALL_SAMPLE",
+                "Projection Calibration Note": f"Only {n} graded projection-error rows",
+            })
+            return out
+        avg_err = float(sum(chosen) / max(1, n))
+        if str(market).upper() == "HR":
+            # HR projection is a rate/xHR, so use a light multiplicative nudge.
+            factor = 1.0 + clamp(avg_err * 0.060, -0.060, 0.035)
+            add = 0.0
+        else:
+            # Prior grades showed HRR was optimistic; apply partial error correction.
+            add = clamp(avg_err * 0.42, -0.55, 0.30)
+            factor = 1.0
+        label = "NEUTRAL"
+        if avg_err <= -0.25:
+            label = "OVERPROJECTING_DOWNGRADE"
+        elif avg_err >= 0.25:
+            label = "UNDERPROJECTING_BOOST"
+        out.update({
+            "Projection Calibration Add": round(float(add), 3),
+            "Projection Calibration Factor": round(float(clamp(factor, 0.925, 1.04)), 3),
+            "Projection Calibration Samples": n,
+            "Projection Calibration Avg Error": round(avg_err, 3),
+            "Projection Calibration Label": label,
+            "Projection Calibration Note": f"{label}: avg actual-minus-proj {avg_err:+.2f} over {n} deduped graded rows",
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _ow_harden_overall_rating(risk_ctx, edge, win_prob, data_confidence, lineup_ctx, pctx, pitcher_confirm_ctx, guard_ctx, result_gate_ctx=None, calibration_ctx=None, daily_ctx=None):
+    risk_ctx = dict(risk_ctx or {})
+    flags = str(risk_ctx.get("No-Bet Risk Flags") or "").strip()
+    lineup_status = str((lineup_ctx or {}).get("Lineup Status") or "").upper()
+    clean_inputs = (
+        not flags
+        and ((lineup_ctx or {}).get("Lineup Confirmed") or "CONFIRMED" in lineup_status)
+        and bool((pitcher_confirm_ctx or {}).get("Pitcher Confirmed"))
+        and bool((pctx or {}).get("Pitcher ID"))
+        and str((pctx or {}).get("Pitcher Hand") or "—") not in {"", "—"}
+        and _v3_safe_num((guard_ctx or {}).get("Final Data Quality Score"), 0) >= 76
+        and _v3_safe_num((daily_ctx or {}).get("Daily Data Score"), 0) >= 74
+        and not bool((daily_ctx or {}).get("Daily Data Hard Stop"))
+    )
+    result_wr = _v3_safe_num((result_gate_ctx or {}).get("Result Gate Win Rate %"), None)
+    cal_label = str((calibration_ctx or {}).get("Projection Calibration Label") or "")
+    edge_num = abs(_v3_safe_num(edge, 0) or 0)
+    win_num = _v3_safe_num(win_prob, 0) or 0
+    dc = _v3_safe_num(data_confidence, 0) or 0
+    if clean_inputs and edge_num >= 0.85 and win_num >= 58 and dc >= 76 and (result_wr is None or result_wr >= 52) and cal_label != "OVERPROJECTING_DOWNGRADE":
+        rating = "A / STRONG"
+    elif edge_num >= 0.45 and win_num >= 54 and dc >= 62 and not flags:
+        rating = "B / PLAYABLE"
+    elif edge_num >= 0.20 and dc >= 50:
+        rating = "C / RESEARCH"
+    else:
+        rating = "D / PASS"
+    if not clean_inputs and rating.startswith("A"):
+        rating = "B / VERIFY"
+    daily_score = _v3_safe_num((daily_ctx or {}).get("Daily Data Score"), None)
+    if daily_score is not None:
+        if daily_score < 58:
+            rating = "D / PASS"
+        elif daily_score < 70 and rating.startswith("A"):
+            rating = "B / VERIFY DATA"
+        elif daily_score < 70 and rating.startswith("B"):
+            rating = "C / VERIFY DATA"
+    risk_ctx["Overall Rating"] = rating
+    return risk_ctx
+
+
 def _ow_data_quality_guardrail_context(lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx, market="HRR"):
     factor = 1.0
     score = 100
@@ -29754,6 +29949,142 @@ def _ow_data_quality_guardrail_context(lineup_ctx, pctx, bctx, pitch_ctx, weathe
             "Final Data Quality Score": 50,
             "Final Data Guardrail Label": "VERIFY",
             "Final Data Guardrail Note": "guardrail check failed; verify manually",
+        }
+
+
+def _ow_daily_clean_data_context(raw_line, lineup_ctx, pctx, pitcher_confirm_ctx, matchup_ctx, weather_ctx, guard_ctx, line_move_ctx, logs, bctx, pitch_ctx, market="HRR"):
+    score = 100
+    checks = []
+    warnings = []
+    try:
+        if _v3_safe_num((raw_line or {}).get("Line"), None) is not None:
+            checks.append("active Underdog line")
+        else:
+            score -= 35
+            warnings.append("active line missing")
+
+        lineup_src = str((lineup_ctx or {}).get("Lineup Source") or "").upper()
+        lineup_status = str((lineup_ctx or {}).get("Lineup Status") or "").upper()
+        if (lineup_ctx or {}).get("Lineup Confirmed") or "CONFIRMED" in lineup_src or "CONFIRMED" in lineup_status:
+            checks.append("confirmed lineup")
+        elif "PA_USAGE_PRE_LINEUP_FALLBACK" in lineup_src:
+            score -= 7
+            warnings.append("good PA fallback lineup")
+        elif "SEASON_PA_PRE_LINEUP_FALLBACK" in lineup_src or "RECENT_LOG_FALLBACK" in lineup_src:
+            score -= 13
+            warnings.append("pre-lineup fallback")
+        else:
+            score -= 18
+            warnings.append("lineup source weak")
+
+        if (pitcher_confirm_ctx or {}).get("Pitcher Confirmed"):
+            checks.append("pitcher confirmed")
+        elif (pctx or {}).get("Pitcher ID") and (pctx or {}).get("Opp Pitcher") not in (None, "", "—"):
+            score -= 8
+            warnings.append("probable pitcher verify")
+        else:
+            score -= 28
+            warnings.append("probable pitcher missing")
+
+        if (matchup_ctx or {}).get("Pitcher Matchup Verified"):
+            checks.append("team/opponent matchup verified")
+        else:
+            score -= 12
+            warnings.append("matchup verify")
+
+        game_pk = (matchup_ctx or {}).get("Game PK") or (raw_line or {}).get("Game PK")
+        if game_pk:
+            checks.append("game id mapped")
+        else:
+            score -= 6
+            warnings.append("game id fallback")
+
+        if len(logs or []) >= 60:
+            checks.append("deep batter logs")
+        elif len(logs or []) >= 30:
+            score -= 4
+            checks.append("usable batter logs")
+        elif len(logs or []) >= 15:
+            score -= 9
+            warnings.append("thin batter logs")
+        else:
+            score -= 16
+            warnings.append("very thin batter logs")
+
+        statcast_rows = _v3_safe_num((bctx or {}).get("Batter Statcast Rows"), 0) or 0
+        if statcast_rows >= 120:
+            checks.append("batter Statcast current")
+        elif statcast_rows >= 80:
+            score -= 3
+            checks.append("batter Statcast usable")
+        else:
+            score -= 9 if str(market).upper() != "HR" else 12
+            warnings.append("batter Statcast thin")
+
+        if _v3_safe_num((pctx or {}).get("Pitcher CSW%"), None) is not None or _v3_safe_num((pctx or {}).get("Pitcher Whiff%"), None) is not None:
+            checks.append("pitcher CSW/whiff loaded")
+        else:
+            score -= 8
+            warnings.append("pitcher CSW/whiff missing")
+
+        pitch_note = str((pitch_ctx or {}).get("Pitch Mix Matchup Note") or "").lower()
+        if (pitch_ctx or {}).get("Pitch Mix Matchup Pitch") and "unavailable" not in pitch_note:
+            checks.append("pitch arsenal matchup")
+        else:
+            score -= 7 if str(market).upper() != "HR" else 10
+            warnings.append("pitch arsenal thin")
+
+        weather_note = str((weather_ctx or {}).get("Weather Note") or "").lower()
+        if "roof" in weather_note or "dome" in weather_note or (weather_ctx or {}).get("Weather Temp F") is not None:
+            checks.append("weather/roof resolved")
+        else:
+            score -= 5
+            warnings.append("weather missing")
+
+        if str((line_move_ctx or {}).get("Sportsbook Market Status") or "").upper() in {"OK", "CONSENSUS", "LIVE", "ACTIVE"}:
+            checks.append("sportsbook context loaded")
+        elif (line_move_ctx or {}).get("Sportsbook Consensus Line") not in (None, "", "—"):
+            checks.append("sportsbook line edge loaded")
+        else:
+            score -= 4
+            warnings.append("sportsbook context missing")
+
+        guard_score = _v3_safe_num((guard_ctx or {}).get("Final Data Quality Score"), None)
+        if guard_score is not None:
+            score = min(score, int(round((0.70 * score) + (0.30 * guard_score))))
+
+        score = int(round(clamp(score, 0, 100)))
+        if score >= 86:
+            label = "LOCK_READY"
+            factor = 1.0
+        elif score >= 74:
+            label = "CLEAN"
+            factor = 0.995
+        elif score >= 60:
+            label = "VERIFY"
+            factor = 0.985
+        else:
+            label = "THIN_DATA"
+            factor = 0.965
+        hard_stop = score < 58 or any(x in warnings for x in ["active line missing", "probable pitcher missing", "lineup source weak"])
+        return {
+            "Daily Data Score": score,
+            "Daily Data Label": label,
+            "Daily Data Factor": round(float(factor), 3),
+            "Daily Data Hard Stop": bool(hard_stop),
+            "Daily Data Checks": " | ".join(checks[:8]) if checks else "—",
+            "Daily Data Warnings": " | ".join(warnings[:8]) if warnings else "NONE",
+            "Daily Data Note": f"{label} {score}/100: " + ("; ".join(warnings[:5]) if warnings else "daily feeds clean"),
+        }
+    except Exception as e:
+        return {
+            "Daily Data Score": 50,
+            "Daily Data Label": "VERIFY",
+            "Daily Data Factor": 0.975,
+            "Daily Data Hard Stop": False,
+            "Daily Data Checks": "—",
+            "Daily Data Warnings": "daily data check failed",
+            "Daily Data Note": f"daily data check failed: {e}",
         }
 
 
@@ -29888,6 +30219,229 @@ def _ow_hrr_moneyball_component_context(projected_pa, key_stats_ctx, profile_ctx
         return out
 
 
+def _ow_seed_from_text(*parts):
+    txt = "|".join(str(p or "") for p in parts)
+    seed = 2166136261
+    for ch in txt:
+        seed ^= ord(ch)
+        seed = (seed * 16777619) & 0xFFFFFFFF
+    return seed or 1337
+
+
+def _ow_pa_outcome_simulation_context(
+    player,
+    market,
+    line,
+    projected_pa,
+    component_ctx=None,
+    key_stats_ctx=None,
+    profile_ctx=None,
+    bctx=None,
+    pctx=None,
+    pitch_ctx=None,
+    park_factor=1.0,
+    weather_factor=1.0,
+    team_runs=None,
+    passes=5000,
+):
+    out = {
+        "PA Sim Passes": 0,
+        "PA Sim H+R+RBI Mean": None,
+        "PA Sim H+R+RBI Median": None,
+        "PA Sim H+R+RBI P75": None,
+        "PA Sim H+R+RBI P90": None,
+        "PA Sim HRR Over %": None,
+        "PA Sim HRR Under %": None,
+        "PA Sim HR Mean": None,
+        "PA Sim HR Median": None,
+        "PA Sim HR Over %": None,
+        "PA Sim Hit/G": None,
+        "PA Sim HR/G": None,
+        "PA Sim BB/G": None,
+        "PA Sim K/G": None,
+        "PA Outcome Hit %": None,
+        "PA Outcome HR %": None,
+        "PA Outcome BB %": None,
+        "PA Outcome K %": None,
+        "Fantasy Involvement Score": None,
+        "Fantasy Involvement Label": "UNAVAILABLE",
+        "HR Score": None,
+        "HR Score Label": "UNAVAILABLE",
+        "HR Likelihood Rank": None,
+        "Batter Outcome Tags": "",
+        "PA Sim Volatility CV": None,
+        "PA Sim Volatility Label": "UNAVAILABLE",
+        "PA Sim Note": "PA outcome simulation unavailable",
+    }
+    try:
+        pa = _v3_safe_num(projected_pa, None)
+        if pa is None or pa <= 0:
+            return out
+        line_num = _v3_safe_num(line, 0.5) or 0.5
+        comp = component_ctx or {}
+        key = key_stats_ctx or {}
+        prof = profile_ctx or {}
+        b = bctx or {}
+        p = pctx or {}
+        pitch = pitch_ctx or {}
+
+        avg = _v3_safe_num(comp.get("Component AVG"), None)
+        if avg is None:
+            avg = _v3_safe_num(key.get("Split AVG"), None) or _v3_safe_num(key.get("Season AVG"), None) or _v3_safe_num(prof.get("Profile BA"), None) or 0.245
+        bb_pct = _v3_safe_num(comp.get("Component BB%"), None)
+        if bb_pct is not None and bb_pct > 1:
+            bb_pct /= 100.0
+        if bb_pct is None:
+            bb_pct = 0.082
+        hr_pct = _v3_safe_num(comp.get("Component HR%"), None)
+        if hr_pct is not None and hr_pct > 1:
+            hr_pct /= 100.0
+        if hr_pct is None:
+            hr_pct = _v3_safe_num(prof.get("Profile hr_pa"), None)
+        if hr_pct is None:
+            hr_pct = 0.025
+        ab_pa = _v3_safe_num(key.get("Split AB/PA"), None) or _v3_safe_num(key.get("Season AB/PA"), None) or 0.875
+        hit_pa = clamp(avg * clamp(ab_pa, 0.72, 0.96), 0.120, 0.430)
+        hr_pa = clamp(hr_pct, 0.002, min(0.140, hit_pa * 0.60))
+        bb_pa = clamp(bb_pct, 0.020, 0.220)
+
+        k_pa = _v3_safe_num(pitch.get("Batter Pitch K%"), None)
+        if k_pa is not None and k_pa > 1:
+            k_pa /= 100.0
+        if k_pa is None:
+            k_pa = _v3_safe_num(prof.get("Profile k_pa"), None)
+        if k_pa is None:
+            whiff = _v3_safe_num(b.get("Batter Whiff%"), None)
+            pk = _v3_safe_num(p.get("Pitcher K%"), None)
+            k_pa = 0.215
+            if whiff is not None:
+                k_pa += clamp((whiff - 24.0) / 100.0 * 0.45, -0.055, 0.080)
+            if pk is not None:
+                k_pa += clamp((pk - 22.0) / 100.0 * 0.35, -0.045, 0.070)
+        k_pa = clamp(k_pa, 0.070, 0.420)
+
+        # Context nudges are intentionally small because the base projection already applies matchup factors.
+        context_hr = clamp((_v3_safe_num(park_factor, 1.0) or 1.0) * (_v3_safe_num(weather_factor, 1.0) or 1.0), 0.86, 1.18)
+        hr_pa = clamp(hr_pa * (0.72 + 0.28 * context_hr), 0.002, min(0.155, hit_pa * 0.70))
+        hit_non_hr_pa = max(0.020, hit_pa - hr_pa)
+        total = hr_pa + hit_non_hr_pa + bb_pa + k_pa
+        if total >= 0.92:
+            scale = 0.92 / total
+            hr_pa *= scale
+            hit_non_hr_pa *= scale
+            bb_pa *= scale
+            k_pa *= scale
+        out_pa = max(0.01, 1.0 - (hr_pa + hit_non_hr_pa + bb_pa + k_pa))
+
+        pass_n = int(clamp(_v3_safe_num(passes, 5000) or 5000, 2500, 50000))
+        seed = _ow_seed_from_text(player, market, line_num, round(pa, 2), OW_FINAL_LINE_PROJECTION_VERSION)
+        rng = np.random.default_rng(seed)
+        pa_counts = rng.poisson(lam=max(1.0, pa), size=pass_n)
+        pa_counts = np.clip(pa_counts, 1, 7)
+        probs = np.array([hr_pa, hit_non_hr_pa, bb_pa, k_pa, out_pa], dtype=float)
+        probs = probs / probs.sum()
+        draws = np.array([rng.multinomial(int(n), probs) for n in pa_counts])
+        hr = draws[:, 0].astype(float)
+        hit_non_hr = draws[:, 1].astype(float)
+        bb = draws[:, 2].astype(float)
+        kk = draws[:, 3].astype(float)
+        hits = hr + hit_non_hr
+
+        comp_runs = _v3_safe_num(comp.get("Projected Runs"), None)
+        comp_rbi = _v3_safe_num(comp.get("Projected RBI"), None)
+        run_pa = clamp((comp_runs / max(pa, 0.1)) if comp_runs is not None else 0.115, 0.020, 0.420)
+        rbi_pa = clamp((comp_rbi / max(pa, 0.1)) if comp_rbi is not None else 0.105, 0.015, 0.420)
+        team_mult = clamp((_v3_safe_num(team_runs, None) or 4.28) / 4.28, 0.80, 1.25)
+        times_on_base = hits + bb
+        tob_expected = max(0.5, pa * (hit_pa + bb_pa))
+        run_lambda = np.clip(pa_counts * run_pa * team_mult * (0.70 + 0.30 * (times_on_base / tob_expected)), 0.01, 4.5)
+        rbi_lambda = np.clip(pa_counts * rbi_pa * team_mult * (0.68 + 0.32 * ((hits + hr) / max(0.4, pa * hit_pa))), 0.01, 4.5)
+        runs = rng.poisson(run_lambda)
+        rbi = rng.poisson(rbi_lambda) + hr.astype(int)
+        hrr = hits + runs + rbi
+
+        threshold = int(math.floor(float(line_num))) + 1
+        hrr_over = hrr > float(line_num)
+        hr_over = hr >= threshold
+        mean_hrr = float(np.mean(hrr))
+        std_hrr = float(np.std(hrr))
+        cv = std_hrr / max(0.15, mean_hrr)
+        fantasy = (hit_non_hr * 3.0) + (hr * 10.0) + (bb * 2.0) + (runs * 2.0) + (rbi * 2.0)
+        fantasy_mean = float(np.mean(fantasy))
+
+        hardhit = _v3_safe_num(b.get("Batter HardHit%"), None)
+        barrel = _v3_safe_num(b.get("Batter Barrel%"), None)
+        ev = _v3_safe_num(b.get("Batter Avg EV"), None)
+        phr9 = _v3_safe_num(p.get("Pitcher HR9"), None)
+        pk = _v3_safe_num(p.get("Pitcher K%"), None)
+        hr_score = 36
+        hr_score += clamp((hr_pa * 100 - 2.2) * 7.0, -12, 26)
+        if barrel is not None:
+            hr_score += clamp((barrel - 7.0) * 1.8, -9, 18)
+        if hardhit is not None:
+            hr_score += clamp((hardhit - 40.0) * 0.55, -8, 14)
+        if ev is not None:
+            hr_score += clamp((ev - 89.0) * 1.7, -8, 14)
+        if phr9 is not None:
+            hr_score += clamp((phr9 - 1.05) * 8.5, -8, 14)
+        if pk is not None:
+            hr_score += clamp((22.0 - pk) * 0.45, -7, 7)
+        hr_score += clamp((context_hr - 1.0) * 35.0, -6, 7)
+        hr_score = int(round(clamp(hr_score, 0, 100)))
+
+        tags = []
+        if hr_score >= 72:
+            tags.append("HR candidate")
+        elif hr_score >= 58:
+            tags.append("HR lean")
+        if phr9 is not None and phr9 >= 1.25:
+            tags.append("HR-prone pitcher")
+        if k_pa <= 0.175:
+            tags.append("contact boost")
+        if k_pa >= 0.285:
+            tags.append("K risk")
+        if barrel is not None and barrel >= 10:
+            tags.append("barrel profile")
+        if cv >= 1.15:
+            tags.append("volatile")
+        if fantasy_mean >= 10.5:
+            tags.append("fantasy involvement")
+
+        out.update({
+            "PA Sim Passes": pass_n,
+            "PA Sim H+R+RBI Mean": round(mean_hrr, 2),
+            "PA Sim H+R+RBI Median": round(float(np.median(hrr)), 2),
+            "PA Sim H+R+RBI P75": round(float(np.percentile(hrr, 75)), 2),
+            "PA Sim H+R+RBI P90": round(float(np.percentile(hrr, 90)), 2),
+            "PA Sim HRR Over %": round(float(np.mean(hrr_over)) * 100, 1),
+            "PA Sim HRR Under %": round(float(1.0 - np.mean(hrr_over)) * 100, 1),
+            "PA Sim HR Mean": round(float(np.mean(hr)), 3),
+            "PA Sim HR Median": round(float(np.median(hr)), 2),
+            "PA Sim HR Over %": round(float(np.mean(hr_over)) * 100, 1),
+            "PA Sim Hit/G": round(float(np.mean(hits)), 2),
+            "PA Sim HR/G": round(float(np.mean(hr)), 3),
+            "PA Sim BB/G": round(float(np.mean(bb)), 2),
+            "PA Sim K/G": round(float(np.mean(kk)), 2),
+            "PA Outcome Hit %": round(hit_pa * 100, 1),
+            "PA Outcome HR %": round(hr_pa * 100, 2),
+            "PA Outcome BB %": round(bb_pa * 100, 1),
+            "PA Outcome K %": round(k_pa * 100, 1),
+            "Fantasy Involvement Score": round(fantasy_mean, 2),
+            "Fantasy Involvement Label": "HIGH" if fantasy_mean >= 10.5 else "GOOD" if fantasy_mean >= 8.2 else "LIGHT",
+            "HR Score": hr_score,
+            "HR Score Label": "ELITE" if hr_score >= 72 else "STRONG" if hr_score >= 60 else "SPRINKLE" if hr_score >= 48 else "PASS",
+            "HR Likelihood Rank": int(round(clamp((0.65 * hr_score) + (0.35 * (float(np.mean(hr_over)) * 100)), 0, 100))),
+            "Batter Outcome Tags": " | ".join(tags[:7]),
+            "PA Sim Volatility CV": round(cv, 2),
+            "PA Sim Volatility Label": "VOLATILE" if cv >= 1.15 else "STABLE" if cv <= 0.72 else "NORMAL",
+            "PA Sim Note": f"PA outcome simulation {pass_n:,} pass: hit {hit_pa*100:.1f}%, HR {hr_pa*100:.2f}%, BB {bb_pa*100:.1f}%, K {k_pa*100:.1f}%",
+        })
+        return out
+    except Exception as e:
+        out["PA Sim Note"] = f"PA simulation failed: {e}"
+        return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _ow_today_game_pk_for_team(team, opponent=None):
     team_abbr = _ow_team_abbr(team)
@@ -29936,6 +30490,34 @@ def _ow_batter_pick_id(row):
     game_pk = str(row.get("Game PK") or "")
     stamp = str(row.get("Snapshot Date") or datetime.now().strftime("%Y-%m-%d"))
     return "|".join([stamp, game_pk, player, market, line])
+
+
+def _ow_batter_result_key(row):
+    player = _v3_norm_name((row or {}).get("Player") or (row or {}).get("UD Player"))
+    market = str((row or {}).get("Market") or (row or {}).get("Best Market") or "").upper()
+    if "HOME RUN" in market or market == "HR":
+        market = "HOME RUN"
+    elif "H+R+RBI" in market or "HRR" in market:
+        market = "H+R+RBI"
+    line = str((row or {}).get("Line") if (row or {}).get("Line") not in (None, "") else (row or {}).get("Best Line"))
+    game_pk = str((row or {}).get("Game PK") or "")
+    stamp = str((row or {}).get("Snapshot Date") or "")
+    if not game_pk:
+        game_pk = "|".join([str((row or {}).get("Team") or ""), str((row or {}).get("Opponent") or "")])
+    return "|".join([stamp, game_pk, player, market, line])
+
+
+def _ow_deduped_batter_results():
+    hist = load_json(OW_BATTER_RESULT_LOG, [])
+    out = []
+    seen = set()
+    for r in hist:
+        key = _ow_batter_result_key(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def _ow_get_actual_batter_boxscore(game_pk, player_id):
@@ -30015,6 +30597,7 @@ def _ow_grade_batter_snapshots():
     picks = load_json(OW_BATTER_PICK_LOG, [])
     results = load_json(OW_BATTER_RESULT_LOG, [])
     result_ids = {r.get("pick_id") for r in results}
+    result_keys = {_ow_batter_result_key(r) for r in results}
     graded = 0
     checked = 0
     waiting = 0
@@ -30059,12 +30642,22 @@ def _ow_grade_batter_snapshots():
         p["graded"] = True
         p["graded_at"] = now_iso()
         p["Grade Status"] = "CLEARED / GRADED"
-        if p.get("pick_id") not in result_ids:
+        result_key = _ow_batter_result_key(p)
+        if p.get("pick_id") not in result_ids and result_key not in result_keys:
             results.append(dict(p))
             result_ids.add(p.get("pick_id"))
+            result_keys.add(result_key)
         graded += 1
     save_json(OW_BATTER_PICK_LOG, picks[-10000:])
-    save_json(OW_BATTER_RESULT_LOG, results[-10000:])
+    deduped_results = []
+    seen_result_keys = set()
+    for r in results:
+        key = _ow_batter_result_key(r)
+        if key in seen_result_keys:
+            continue
+        seen_result_keys.add(key)
+        deduped_results.append(r)
+    save_json(OW_BATTER_RESULT_LOG, deduped_results[-10000:])
     return {"graded": graded, "checked": checked, "waiting_final": waiting, "missing": missing, "saved": len(picks), "results": len(results)}
 
 
@@ -30117,21 +30710,43 @@ def _ow_data_confidence(logs, lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx):
     return int(round(clamp(score, 0, 100))), " | ".join(flags[:5]) if flags else "DATA OK"
 
 
-def _ow_hrr_official_label(sync, edge, data_confidence, lineup_ctx, pctx):
+def _ow_hrr_official_label(sync, edge, data_confidence, lineup_ctx, pctx, pitcher_confirm_ctx=None, guard_ctx=None, daily_ctx=None):
     if data_confidence < 50:
         return "PASS / DATA THIN"
+    if (daily_ctx or {}).get("Daily Data Hard Stop"):
+        return "PASS / DAILY DATA THIN"
+    if _v3_safe_num((daily_ctx or {}).get("Daily Data Score"), 100) < 70:
+        return "VERIFY DAILY DATA"
+    lineup_status = str((lineup_ctx or {}).get("Lineup Status") or "").upper()
+    if not ((lineup_ctx or {}).get("Lineup Confirmed") or "CONFIRMED" in lineup_status):
+        return "VERIFY LINEUP"
     if not pctx.get("Pitcher ID"):
         return "VERIFY PITCHER"
+    if pitcher_confirm_ctx is not None and not (pitcher_confirm_ctx or {}).get("Pitcher Confirmed"):
+        return "VERIFY PITCHER"
+    if _v3_safe_num((guard_ctx or {}).get("Final Data Quality Score"), 100) < 70:
+        return "VERIFY DATA"
     if sync >= 72 and abs(edge) >= 0.5 and data_confidence >= 60:
         return "OFFICIAL HRR LEAN"
     return "RESEARCH / VERIFY"
 
 
-def _ow_hr_official_label(grade, prob_pct, data_confidence, pctx):
+def _ow_hr_official_label(grade, prob_pct, data_confidence, pctx, lineup_ctx=None, pitcher_confirm_ctx=None, guard_ctx=None, daily_ctx=None):
     if data_confidence < 45:
         return "PASS / DATA THIN"
+    if (daily_ctx or {}).get("Daily Data Hard Stop"):
+        return "PASS / DAILY DATA THIN"
+    if _v3_safe_num((daily_ctx or {}).get("Daily Data Score"), 100) < 70:
+        return "VERIFY DAILY DATA"
+    lineup_status = str((lineup_ctx or {}).get("Lineup Status") or "").upper()
+    if lineup_ctx is not None and not ((lineup_ctx or {}).get("Lineup Confirmed") or "CONFIRMED" in lineup_status):
+        return "VERIFY LINEUP"
     if not pctx.get("Pitcher ID"):
         return "VERIFY PITCHER"
+    if pitcher_confirm_ctx is not None and not (pitcher_confirm_ctx or {}).get("Pitcher Confirmed"):
+        return "VERIFY PITCHER"
+    if _v3_safe_num((guard_ctx or {}).get("Final Data Quality Score"), 100) < 70:
+        return "VERIFY DATA"
     grade = str(grade or "")
     if grade.startswith("A") and prob_pct >= 25 and data_confidence >= 58:
         return "OFFICIAL HR WATCH"
@@ -30160,7 +30775,8 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             continue
         raw_team = logs[-1].get("team", "—") if logs else "—"
         raw_opp = logs[-1].get("opponent", "—") if logs else "—"
-        team = _ow_team_abbr(raw_team)
+        current_team_ctx = _ow_current_batter_team_context(prof.get("player_id"))
+        team = _ow_team_abbr(current_team_ctx.get("Current Team") or raw_team)
         team_ctx = _ow_team_context(team)
         opp = _ow_team_abbr(team_ctx.get("Opponent") or raw_opp)
         lineup_ctx = _ow_lineup_context(player, team)
@@ -30231,6 +30847,28 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         raw_over_rate = _ow_hit_rate_text(vals[-20:], float(line), "OVER")[1]
         model_over_prob = _ow_logistic_probability(edge, 1.10)
         over_prob = (0.65 * raw_over_rate + 0.35 * model_over_prob) if raw_over_rate is not None else model_over_prob
+        sim_ctx = _ow_pa_outcome_simulation_context(
+            player,
+            "HRR",
+            line,
+            projected_pa,
+            component_ctx=component_ctx,
+            key_stats_ctx=key_stats_ctx,
+            profile_ctx=profile_ctx,
+            bctx=bctx,
+            pctx=pctx,
+            pitch_ctx=pitch_ctx,
+            park_factor=park_factor,
+            weather_factor=weather_factor,
+            team_runs=team_runs,
+        )
+        sim_hrr_mean = _v3_safe_num(sim_ctx.get("PA Sim H+R+RBI Mean"), None)
+        sim_hrr_over = _v3_safe_num(sim_ctx.get("PA Sim HRR Over %"), None)
+        if sim_hrr_mean is not None:
+            proj = round(float((0.82 * proj) + (0.18 * sim_hrr_mean)), 2)
+            edge = round(proj - float(line), 2)
+        if sim_hrr_over is not None:
+            over_prob = clamp((0.72 * (over_prob * 100) + 0.28 * sim_hrr_over) / 100.0, 0.01, 0.99)
         hrr_prior = _ow_projection_prior_for_player(player, "HRR")
         hrr_prior_used = False
         hrr_prior_proj = None
@@ -30257,7 +30895,16 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         best_pct = max([x for x in [l5_pct, l10_pct, l15_pct, l20_pct, l30_pct, h2h_pct, same_pct] if x is not None] or [0]) * 100
         win_prob = max(over_prob, 1.0 - over_prob) * 100
         data_conf, data_flags = _ow_data_confidence(logs, lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx)
+        daily_ctx = _ow_daily_clean_data_context(raw, lineup_ctx, pctx, pitcher_confirm_ctx, matchup_ctx, weather_ctx, guard_ctx, line_move_ctx, logs, bctx, pitch_ctx, "HRR")
+        daily_score = _v3_safe_num(daily_ctx.get("Daily Data Score"), data_conf) or data_conf
+        data_conf = int(round(min(data_conf, (0.55 * data_conf) + (0.45 * daily_score))))
+        if daily_ctx.get("Daily Data Warnings") not in (None, "", "NONE"):
+            data_flags = " | ".join([x for x in [data_flags if data_flags != "DATA OK" else "", daily_ctx.get("Daily Data Warnings")] if x]) or "DATA OK"
         risk_ctx = _ow_projection_risk_context(vals, line, data_conf, "HRR")
+        risk_ctx = _ow_append_batter_verify_flags(risk_ctx, lineup_ctx, pitcher_confirm_ctx, guard_ctx)
+        if daily_ctx.get("Daily Data Hard Stop") or _v3_safe_num(daily_ctx.get("Daily Data Score"), 100) < 70:
+            existing_flags = str(risk_ctx.get("No-Bet Risk Flags") or "").strip()
+            risk_ctx["No-Bet Risk Flags"] = " | ".join([x for x in [existing_flags, daily_ctx.get("Daily Data Note")] if x])
         if not matchup_ctx.get("Pitcher Matchup Verified"):
             existing_flags = str(risk_ctx.get("No-Bet Risk Flags") or "").strip()
             risk_ctx["No-Bet Risk Flags"] = " | ".join([x for x in [existing_flags, "pitcher matchup not verified"] if x])
@@ -30280,6 +30927,8 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Pitcher Matchup Verified": matchup_ctx.get("Pitcher Matchup Verified"),
             "Lineup Source": lineup_ctx.get("Lineup Source"),
             "Pitch Mix Matchup Pitch": pitch_ctx.get("Pitch Mix Matchup Pitch"),
+            "Team": team,
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
         }, "HRR")
         result_gate_factor = _v3_safe_num(result_gate_ctx.get("Result Gate Factor"), 1.0) or 1.0
         if result_gate_factor != 1.0:
@@ -30289,15 +30938,44 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             over_prob = (0.65 * raw_over_rate + 0.35 * model_over_prob) if raw_over_rate is not None else model_over_prob
             pick = "OVER" if over_prob >= 0.50 else "UNDER"
             win_prob = max(over_prob, 1.0 - over_prob) * 100
+        calibration_ctx = _ow_projection_error_calibration_context({
+            "Market": "H+R+RBI",
+            "Team": team,
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
+            "Overall Rating": risk_ctx.get("Overall Rating"),
+            "Official Play Filter": None,
+        }, "HRR")
+        cal_add = _v3_safe_num(calibration_ctx.get("Projection Calibration Add"), 0.0) or 0.0
+        cal_factor = _v3_safe_num(calibration_ctx.get("Projection Calibration Factor"), 1.0) or 1.0
+        if cal_add != 0.0 or cal_factor != 1.0:
+            proj = round(float(clamp((proj * cal_factor) + cal_add, 0.0, 8.5)), 2)
+        edge = round(proj - float(line), 2)
+        model_over_prob = _ow_logistic_probability(edge, 1.10)
+        over_prob = (0.65 * raw_over_rate + 0.35 * model_over_prob) if raw_over_rate is not None else model_over_prob
+        if sim_hrr_over is not None:
+            over_prob = clamp((0.76 * (over_prob * 100) + 0.24 * sim_hrr_over) / 100.0, 0.01, 0.99)
+        pick = "OVER" if edge >= 0 else "UNDER"
+        l5, l5_pct = _ow_hit_rate_text(vals[-5:], float(line), pick)
+        l10, l10_pct = _ow_hit_rate_text(vals[-10:], float(line), pick)
+        l15, l15_pct = _ow_hit_rate_text(vals[-15:], float(line), pick)
+        l20, l20_pct = _ow_hit_rate_text(vals[-20:], float(line), pick)
+        l30, l30_pct = _ow_hit_rate_text(vals[-30:], float(line), pick)
+        h2h, h2h_pct = _ow_hit_rate_text(h2h_vals, float(line), pick)
+        same, same_pct = _ow_hit_rate_text(vals, float(line), pick)
+        best_pct = max([x for x in [l5_pct, l10_pct, l15_pct, l20_pct, l30_pct, h2h_pct, same_pct] if x is not None] or [0]) * 100
+        win_prob = (over_prob if pick == "OVER" else (1.0 - over_prob)) * 100
+        risk_ctx = _ow_harden_overall_rating(risk_ctx, edge, win_prob, data_conf, lineup_ctx, pctx, pitcher_confirm_ctx, guard_ctx, result_gate_ctx, calibration_ctx, daily_ctx)
         sync = int(round(clamp(50 + abs(edge) * 14 + max(0, best_pct - 50) * 0.35 + min(8, len(vals) / 4) + max(-6, (data_conf - 55) * 0.08), 0, 100)))
         conf = round(clamp(5.0 + abs(edge) * 1.4 + max(0, win_prob - 50) / 10 + max(0, best_pct - 50) / 22, 1, 10), 1)
-        official_filter = _ow_hrr_official_label(sync, edge, data_conf, lineup_ctx, pctx)
+        official_filter = _ow_hrr_official_label(sync, edge, data_conf, lineup_ctx, pctx, pitcher_confirm_ctx, guard_ctx, daily_ctx)
         out.append({
             "Player": player,
             "UD Player": player,
             "Player ID": prof.get("player_id"),
             "Game PK": _ow_today_game_pk_for_team(team, opp),
             "Team": team,
+            "Raw Log Team": _ow_team_abbr(raw_team),
+            "Team Source": current_team_ctx.get("Current Team Source"),
             "Opponent": opp,
             "Today Opponent": matchup_ctx.get("Today Opponent"),
             "Matchup Data Status": matchup_ctx.get("Matchup Data Status"),
@@ -30458,6 +31136,30 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Pythagorean Win% Proxy": component_ctx.get("Pythagorean Win% Proxy"),
             "Moneyball Factor": component_ctx.get("Moneyball Factor"),
             "Moneyball Note": component_ctx.get("Moneyball Note"),
+            "PA Sim Passes": sim_ctx.get("PA Sim Passes"),
+            "PA Sim H+R+RBI Mean": sim_ctx.get("PA Sim H+R+RBI Mean"),
+            "PA Sim H+R+RBI Median": sim_ctx.get("PA Sim H+R+RBI Median"),
+            "PA Sim H+R+RBI P75": sim_ctx.get("PA Sim H+R+RBI P75"),
+            "PA Sim H+R+RBI P90": sim_ctx.get("PA Sim H+R+RBI P90"),
+            "PA Sim HRR Over %": sim_ctx.get("PA Sim HRR Over %"),
+            "PA Sim HRR Under %": sim_ctx.get("PA Sim HRR Under %"),
+            "PA Sim Hit/G": sim_ctx.get("PA Sim Hit/G"),
+            "PA Sim HR/G": sim_ctx.get("PA Sim HR/G"),
+            "PA Sim BB/G": sim_ctx.get("PA Sim BB/G"),
+            "PA Sim K/G": sim_ctx.get("PA Sim K/G"),
+            "PA Outcome Hit %": sim_ctx.get("PA Outcome Hit %"),
+            "PA Outcome HR %": sim_ctx.get("PA Outcome HR %"),
+            "PA Outcome BB %": sim_ctx.get("PA Outcome BB %"),
+            "PA Outcome K %": sim_ctx.get("PA Outcome K %"),
+            "Fantasy Involvement Score": sim_ctx.get("Fantasy Involvement Score"),
+            "Fantasy Involvement Label": sim_ctx.get("Fantasy Involvement Label"),
+            "HR Score": sim_ctx.get("HR Score"),
+            "HR Score Label": sim_ctx.get("HR Score Label"),
+            "HR Likelihood Rank": sim_ctx.get("HR Likelihood Rank"),
+            "Batter Outcome Tags": sim_ctx.get("Batter Outcome Tags"),
+            "PA Sim Volatility CV": sim_ctx.get("PA Sim Volatility CV"),
+            "PA Sim Volatility Label": sim_ctx.get("PA Sim Volatility Label"),
+            "PA Sim Note": sim_ctx.get("PA Sim Note"),
             "Opening Line": line_move_ctx.get("Opening Line"),
             "Current Line": line_move_ctx.get("Current Line"),
             "Line Move": line_move_ctx.get("Line Move"),
@@ -30472,10 +31174,23 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Batter Learning Samples": learning_ctx.get("Batter Learning Samples"),
             "Batter Learning Win Rate %": learning_ctx.get("Batter Learning Win Rate %"),
             "Batter Learning Note": learning_ctx.get("Batter Learning Note"),
+            "Projection Calibration Add": calibration_ctx.get("Projection Calibration Add"),
+            "Projection Calibration Factor": calibration_ctx.get("Projection Calibration Factor"),
+            "Projection Calibration Samples": calibration_ctx.get("Projection Calibration Samples"),
+            "Projection Calibration Avg Error": calibration_ctx.get("Projection Calibration Avg Error"),
+            "Projection Calibration Label": calibration_ctx.get("Projection Calibration Label"),
+            "Projection Calibration Note": calibration_ctx.get("Projection Calibration Note"),
             "Final Data Guardrail Factor": guard_ctx.get("Final Data Guardrail Factor"),
             "Final Data Quality Score": guard_ctx.get("Final Data Quality Score"),
             "Final Data Guardrail Label": guard_ctx.get("Final Data Guardrail Label"),
             "Final Data Guardrail Note": guard_ctx.get("Final Data Guardrail Note"),
+            "Daily Data Score": daily_ctx.get("Daily Data Score"),
+            "Daily Data Label": daily_ctx.get("Daily Data Label"),
+            "Daily Data Factor": daily_ctx.get("Daily Data Factor"),
+            "Daily Data Hard Stop": daily_ctx.get("Daily Data Hard Stop"),
+            "Daily Data Checks": daily_ctx.get("Daily Data Checks"),
+            "Daily Data Warnings": daily_ctx.get("Daily Data Warnings"),
+            "Daily Data Note": daily_ctx.get("Daily Data Note"),
             "Result Gate Factor": result_gate_ctx.get("Result Gate Factor"),
             "Result Gate Samples": result_gate_ctx.get("Result Gate Samples"),
             "Result Gate Win Rate %": result_gate_ctx.get("Result Gate Win Rate %"),
@@ -30517,7 +31232,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
             "Official Play Filter": official_filter,
-            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. Component projection {component_ctx.get('Component Projection')}; projected H/R/RBI {component_ctx.get('Projected Hits')}/{component_ctx.get('Projected Runs')}/{component_ctx.get('Projected RBI')}; {component_ctx.get('Moneyball Note')}. Matchup check: {matchup_ctx.get('Matchup Data Note')}. PA {projected_pa}; {lineup_quality_note}; key stats {key_stats_ctx.get('Key Matchup Stats Note')}; {lineup_ctx.get('LineupStatus') or lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {profile_ctx.get('Profile Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); {team_run_note}; bullpen {bpctx.get('Bullpen Weakness Label')}; {line_move_ctx.get('Line Move Note')}; sportsbook {line_move_ctx.get('Sportsbook Market Note')}; {learning_ctx.get('Batter Learning Note')}; guardrail {guard_ctx.get('Final Data Guardrail Label')} ({guard_ctx.get('Final Data Guardrail Note')}); result gate {result_gate_ctx.get('Result Gate Note')}; volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if hrr_prior_used else 'not used'}.",
+            "Matchup Summary": f"{player} H+R+RBI projection {proj} vs line {float(line):g}: {pick} by {edge:+.2f}. Over probability {round(over_prob * 100, 1)}%. Built from {len(vals)} MLB game-log rows. Sim {sim_ctx.get('PA Sim HRR Over %')}% over, mean {sim_ctx.get('PA Sim H+R+RBI Mean')}, {sim_ctx.get('PA Sim Volatility Label')}; {sim_ctx.get('PA Sim Note')}. Daily data {daily_ctx.get('Daily Data Label')} {daily_ctx.get('Daily Data Score')}/100 ({daily_ctx.get('Daily Data Warnings')}). Component projection {component_ctx.get('Component Projection')}; projected H/R/RBI {component_ctx.get('Projected Hits')}/{component_ctx.get('Projected Runs')}/{component_ctx.get('Projected RBI')}; {component_ctx.get('Moneyball Note')}. Matchup check: {matchup_ctx.get('Matchup Data Note')}. PA {projected_pa}; {lineup_quality_note}; key stats {key_stats_ctx.get('Key Matchup Stats Note')}; {lineup_ctx.get('LineupStatus') or lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {profile_ctx.get('Profile Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); {team_run_note}; bullpen {bpctx.get('Bullpen Weakness Label')}; tags {sim_ctx.get('Batter Outcome Tags')}; {line_move_ctx.get('Line Move Note')}; sportsbook {line_move_ctx.get('Sportsbook Market Note')}; {learning_ctx.get('Batter Learning Note')}; calibration {calibration_ctx.get('Projection Calibration Note')}; guardrail {guard_ctx.get('Final Data Guardrail Label')} ({guard_ctx.get('Final Data Guardrail Note')}); result gate {result_gate_ctx.get('Result Gate Note')}; volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if hrr_prior_used else 'not used'}.",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -30568,7 +31283,8 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             proj_hr = _ow_stat_num(stat, "homeRuns") / games if stat else 0.0
         raw_team = logs[-1].get("team", "—") if logs else "—"
         raw_opp = logs[-1].get("opponent", "—") if logs else "—"
-        team = _ow_team_abbr(raw_team)
+        current_team_ctx = _ow_current_batter_team_context(prof.get("player_id"))
+        team = _ow_team_abbr(current_team_ctx.get("Current Team") or raw_team)
         team_ctx = _ow_team_context(team)
         opp = _ow_team_abbr(team_ctx.get("Opponent") or raw_opp)
         lineup_ctx = _ow_lineup_context(player, team)
@@ -30615,6 +31331,37 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         threshold = int(math.floor(float(line))) + 1
         p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
         prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
+        hr_component_ctx = _ow_hrr_moneyball_component_context(
+            lineup_pa,
+            key_stats_ctx,
+            profile_ctx=profile_ctx,
+            team_runs=None,
+            team_ctx={**(team_ctx or {}), "Lineup Slot": lineup_ctx.get("Lineup Slot")},
+        )
+        sim_ctx = _ow_pa_outcome_simulation_context(
+            player,
+            "HR",
+            line,
+            lineup_pa,
+            component_ctx=hr_component_ctx,
+            key_stats_ctx=key_stats_ctx,
+            profile_ctx=profile_ctx,
+            bctx=bctx,
+            pctx=pctx,
+            pitch_ctx=pitch_ctx,
+            park_factor=park_factor,
+            weather_factor=weather_factor,
+            team_runs=None,
+        )
+        sim_hr_mean = _v3_safe_num(sim_ctx.get("PA Sim HR Mean"), None)
+        sim_hr_over = _v3_safe_num(sim_ctx.get("PA Sim HR Over %"), None)
+        if sim_hr_mean is not None:
+            proj_hr = round(float(clamp((0.72 * proj_hr) + (0.28 * sim_hr_mean), 0.01, 0.95)), 3)
+            p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
+            prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
+        if sim_hr_over is not None:
+            prob_pct = round(float(clamp((0.68 * prob_pct) + (0.32 * sim_hr_over), 1, 75)), 1)
+            p_over = prob_pct / 100.0
         prior = _ow_hr_csv_prior_for_player(player)
         prior_used = False
         prior_proj = None
@@ -30643,7 +31390,16 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         h2h_hr_vals = [float(g.get("HR", 0) or 0) for g in logs if _ow_team_abbr(g.get("opponent")) == opp]
         h2h_hr, h2h_hr_pct = _ow_hit_rate_text(h2h_hr_vals, float(line), "OVER")
         data_conf, data_flags = _ow_data_confidence(logs, lineup_ctx, pctx, bctx, pitch_ctx, weather_ctx)
+        daily_ctx = _ow_daily_clean_data_context(raw, lineup_ctx, pctx, pitcher_confirm_ctx, matchup_ctx, weather_ctx, guard_ctx, line_move_ctx, logs, bctx, pitch_ctx, "HR")
+        daily_score = _v3_safe_num(daily_ctx.get("Daily Data Score"), data_conf) or data_conf
+        data_conf = int(round(min(data_conf, (0.55 * data_conf) + (0.45 * daily_score))))
+        if daily_ctx.get("Daily Data Warnings") not in (None, "", "NONE"):
+            data_flags = " | ".join([x for x in [data_flags if data_flags != "DATA OK" else "", daily_ctx.get("Daily Data Warnings")] if x]) or "DATA OK"
         risk_ctx = _ow_projection_risk_context(hr_vals, line, data_conf, "HR")
+        risk_ctx = _ow_append_batter_verify_flags(risk_ctx, lineup_ctx, pitcher_confirm_ctx, guard_ctx)
+        if daily_ctx.get("Daily Data Hard Stop") or _v3_safe_num(daily_ctx.get("Daily Data Score"), 100) < 70:
+            existing_flags = str(risk_ctx.get("No-Bet Risk Flags") or "").strip()
+            risk_ctx["No-Bet Risk Flags"] = " | ".join([x for x in [existing_flags, daily_ctx.get("Daily Data Note")] if x])
         if not matchup_ctx.get("Pitcher Matchup Verified"):
             existing_flags = str(risk_ctx.get("No-Bet Risk Flags") or "").strip()
             risk_ctx["No-Bet Risk Flags"] = " | ".join([x for x in [existing_flags, "pitcher matchup not verified"] if x])
@@ -30667,6 +31423,8 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Pitcher Matchup Verified": matchup_ctx.get("Pitcher Matchup Verified"),
             "Lineup Source": lineup_ctx.get("Lineup Source"),
             "Pitch Mix Matchup Pitch": pitch_ctx.get("Pitch Mix Matchup Pitch"),
+            "Team": team,
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
         }, "HR")
         result_gate_factor = _v3_safe_num(result_gate_ctx.get("Result Gate Factor"), 1.0) or 1.0
         if result_gate_factor != 1.0:
@@ -30677,13 +31435,39 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             edge = round(proj_hr - float(line), 3)
             win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
             grade = _ow_grade_hr_probability(prob_pct)
-        official_filter = _ow_hr_official_label(grade, prob_pct, data_conf, pctx)
+        calibration_ctx = _ow_projection_error_calibration_context({
+            "Market": "Home Runs",
+            "Team": team,
+            "Opp Pitcher": pctx.get("Opp Pitcher"),
+            "Overall Rating": risk_ctx.get("Overall Rating"),
+            "Official Play Filter": None,
+        }, "HR")
+        cal_factor = _v3_safe_num(calibration_ctx.get("Projection Calibration Factor"), 1.0) or 1.0
+        if cal_factor != 1.0:
+            proj_hr = round(float(clamp(proj_hr * cal_factor, 0.01, 0.95)), 3)
+            p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
+            prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
+            pick = _ow_hr_over_label(prob_pct)
+            edge = round(proj_hr - float(line), 3)
+            win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
+            grade = _ow_grade_hr_probability(prob_pct)
+        if sim_hr_over is not None:
+            prob_pct = round(float(clamp((0.78 * prob_pct) + (0.22 * sim_hr_over), 1, 75)), 1)
+            p_over = prob_pct / 100.0
+            pick = _ow_hr_over_label(prob_pct)
+            edge = round(proj_hr - float(line), 3)
+            win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
+            grade = _ow_grade_hr_probability(prob_pct)
+        risk_ctx = _ow_harden_overall_rating(risk_ctx, edge, prob_pct, data_conf, lineup_ctx, pctx, pitcher_confirm_ctx, guard_ctx, result_gate_ctx, calibration_ctx, daily_ctx)
+        official_filter = _ow_hr_official_label(grade, prob_pct, data_conf, pctx, lineup_ctx, pitcher_confirm_ctx, guard_ctx, daily_ctx)
         out.append({
             "Player": player,
             "UD Player": player,
             "Player ID": prof.get("player_id"),
             "Game PK": _ow_today_game_pk_for_team(team, opp),
             "Team": team,
+            "Raw Log Team": _ow_team_abbr(raw_team),
+            "Team Source": current_team_ctx.get("Current Team Source"),
             "Opponent": opp,
             "Today Opponent": matchup_ctx.get("Today Opponent"),
             "Matchup Data Status": matchup_ctx.get("Matchup Data Status"),
@@ -30821,10 +31605,50 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Batter Learning Samples": learning_ctx.get("Batter Learning Samples"),
             "Batter Learning Win Rate %": learning_ctx.get("Batter Learning Win Rate %"),
             "Batter Learning Note": learning_ctx.get("Batter Learning Note"),
+            "PA Sim Passes": sim_ctx.get("PA Sim Passes"),
+            "PA Sim H+R+RBI Mean": sim_ctx.get("PA Sim H+R+RBI Mean"),
+            "PA Sim H+R+RBI Median": sim_ctx.get("PA Sim H+R+RBI Median"),
+            "PA Sim H+R+RBI P75": sim_ctx.get("PA Sim H+R+RBI P75"),
+            "PA Sim H+R+RBI P90": sim_ctx.get("PA Sim H+R+RBI P90"),
+            "PA Sim HRR Over %": sim_ctx.get("PA Sim HRR Over %"),
+            "PA Sim HRR Under %": sim_ctx.get("PA Sim HRR Under %"),
+            "PA Sim HR Mean": sim_ctx.get("PA Sim HR Mean"),
+            "PA Sim HR Median": sim_ctx.get("PA Sim HR Median"),
+            "PA Sim HR Over %": sim_ctx.get("PA Sim HR Over %"),
+            "PA Sim Hit/G": sim_ctx.get("PA Sim Hit/G"),
+            "PA Sim HR/G": sim_ctx.get("PA Sim HR/G"),
+            "PA Sim BB/G": sim_ctx.get("PA Sim BB/G"),
+            "PA Sim K/G": sim_ctx.get("PA Sim K/G"),
+            "PA Outcome Hit %": sim_ctx.get("PA Outcome Hit %"),
+            "PA Outcome HR %": sim_ctx.get("PA Outcome HR %"),
+            "PA Outcome BB %": sim_ctx.get("PA Outcome BB %"),
+            "PA Outcome K %": sim_ctx.get("PA Outcome K %"),
+            "Fantasy Involvement Score": sim_ctx.get("Fantasy Involvement Score"),
+            "Fantasy Involvement Label": sim_ctx.get("Fantasy Involvement Label"),
+            "HR Score": sim_ctx.get("HR Score"),
+            "HR Score Label": sim_ctx.get("HR Score Label"),
+            "HR Likelihood Rank": sim_ctx.get("HR Likelihood Rank"),
+            "Batter Outcome Tags": sim_ctx.get("Batter Outcome Tags"),
+            "PA Sim Volatility CV": sim_ctx.get("PA Sim Volatility CV"),
+            "PA Sim Volatility Label": sim_ctx.get("PA Sim Volatility Label"),
+            "PA Sim Note": sim_ctx.get("PA Sim Note"),
+            "Projection Calibration Add": calibration_ctx.get("Projection Calibration Add"),
+            "Projection Calibration Factor": calibration_ctx.get("Projection Calibration Factor"),
+            "Projection Calibration Samples": calibration_ctx.get("Projection Calibration Samples"),
+            "Projection Calibration Avg Error": calibration_ctx.get("Projection Calibration Avg Error"),
+            "Projection Calibration Label": calibration_ctx.get("Projection Calibration Label"),
+            "Projection Calibration Note": calibration_ctx.get("Projection Calibration Note"),
             "Final Data Guardrail Factor": guard_ctx.get("Final Data Guardrail Factor"),
             "Final Data Quality Score": guard_ctx.get("Final Data Quality Score"),
             "Final Data Guardrail Label": guard_ctx.get("Final Data Guardrail Label"),
             "Final Data Guardrail Note": guard_ctx.get("Final Data Guardrail Note"),
+            "Daily Data Score": daily_ctx.get("Daily Data Score"),
+            "Daily Data Label": daily_ctx.get("Daily Data Label"),
+            "Daily Data Factor": daily_ctx.get("Daily Data Factor"),
+            "Daily Data Hard Stop": daily_ctx.get("Daily Data Hard Stop"),
+            "Daily Data Checks": daily_ctx.get("Daily Data Checks"),
+            "Daily Data Warnings": daily_ctx.get("Daily Data Warnings"),
+            "Daily Data Note": daily_ctx.get("Daily Data Note"),
             "Result Gate Factor": result_gate_ctx.get("Result Gate Factor"),
             "Result Gate Samples": result_gate_ctx.get("Result Gate Samples"),
             "Result Gate Win Rate %": result_gate_ctx.get("Result Gate Win Rate %"),
@@ -30888,7 +31712,7 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Official Play Filter": official_filter,
             "Source": "Underdog line + MLB Stats API game logs",
             "Evidence": str(raw.get("Evidence", ""))[:350],
-            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. Matchup check: {matchup_ctx.get('Matchup Data Note')}. PA {lineup_pa}; {lineup_quality_note}; key stats {key_stats_ctx.get('Key Matchup Stats Note')}; {lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {profile_ctx.get('Profile Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); {line_move_ctx.get('Line Move Note')}; sportsbook {line_move_ctx.get('Sportsbook Market Note')}; {learning_ctx.get('Batter Learning Note')}; guardrail {guard_ctx.get('Final Data Guardrail Label')} ({guard_ctx.get('Final Data Guardrail Note')}); result gate {result_gate_ctx.get('Result Gate Note')}; volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if prior_used else 'not used'}.",
+            "Matchup Summary": f"{player} HR projection {proj_hr:.3f}; over {float(line):g} probability {prob_pct}%. Built from {len(hr_vals)} MLB game-log rows. Sim HR {sim_ctx.get('PA Sim HR Over %')}% over, xHR {sim_ctx.get('PA Sim HR Mean')}, HR score {sim_ctx.get('HR Score')}/100; {sim_ctx.get('PA Sim Note')}. Daily data {daily_ctx.get('Daily Data Label')} {daily_ctx.get('Daily Data Score')}/100 ({daily_ctx.get('Daily Data Warnings')}). Matchup check: {matchup_ctx.get('Matchup Data Note')}. PA {lineup_pa}; {lineup_quality_note}; key stats {key_stats_ctx.get('Key Matchup Stats Note')}; {lineup_ctx.get('Lineup Status')}; {availability_ctx.get('Lineup Slot Trend Note')}; {availability_ctx.get('Availability Note')}; {pitcher_confirm_ctx.get('Pitcher Confirmation Note')}; {protection_ctx.get('Lineup Protection Note')}; {pctx.get('Pitcher Matchup Note')}; {bullpen_leash_ctx.get('Starter Leash Note')}; {split_note}; {bctx.get('Batter Quality Note')}; {profile_ctx.get('Profile Note')}; {pitch_ctx.get('Pitch Mix Matchup Note')}; {weather_ctx.get('Weather Note')}; wind {weather_ctx.get('Wind Carry Label')}; umpire {ump_ctx.get('Umpire Name')} ({ump_ctx.get('Umpire Hitter Factor')}); {defense_ctx.get('Defense/Framing Note')}; park {venue} ({park_factor:.3f}); tags {sim_ctx.get('Batter Outcome Tags')}; {line_move_ctx.get('Line Move Note')}; sportsbook {line_move_ctx.get('Sportsbook Market Note')}; {learning_ctx.get('Batter Learning Note')}; calibration {calibration_ctx.get('Projection Calibration Note')}; guardrail {guard_ctx.get('Final Data Guardrail Label')} ({guard_ctx.get('Final Data Guardrail Note')}); result gate {result_gate_ctx.get('Result Gate Note')}; volatility {risk_ctx.get('Volatility Label')}; data {data_conf}/100; CSV prior {'used' if prior_used else 'not used'}.",
             "Projection Version": OW_FINAL_LINE_PROJECTION_VERSION,
         })
     if not out:
@@ -30995,6 +31819,10 @@ def build_v3_batter_upside_board_final():
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
                     "Final Data Quality Score": rd.get("Final Data Quality Score", d.get("Final Data Quality Score")),
                     "Final Data Guardrail Label": rd.get("Final Data Guardrail Label", d.get("Final Data Guardrail Label")),
+                    "Daily Data Score": rd.get("Daily Data Score", d.get("Daily Data Score")),
+                    "Daily Data Label": rd.get("Daily Data Label", d.get("Daily Data Label")),
+                    "Daily Data Hard Stop": rd.get("Daily Data Hard Stop", d.get("Daily Data Hard Stop")),
+                    "Daily Data Warnings": rd.get("Daily Data Warnings", d.get("Daily Data Warnings")),
                     "Result Gate Label": rd.get("Result Gate Label", d.get("Result Gate Label")),
                     "Result Gate Win Rate %": rd.get("Result Gate Win Rate %", d.get("Result Gate Win Rate %")),
                     "Data Flags": rd.get("Data Flags", d.get("Data Flags")),
@@ -31027,6 +31855,11 @@ def build_v3_batter_upside_board_final():
                     "Pitcher Matchup Verified": rd.get("Pitcher Matchup Verified", d.get("Pitcher Matchup Verified")),
                     "Projected PA": _v3_final_num(rd.get("Projected PA"), d.get("Projected PA")),
                     "HR Probability": _v3_final_num(rd.get("HR Probability %"), d.get("HR Probability")),
+                    "HR Score": rd.get("HR Score", d.get("HR Score")),
+                    "HR Likelihood Rank": rd.get("HR Likelihood Rank", d.get("HR Likelihood Rank")),
+                    "Fantasy Involvement Score": rd.get("Fantasy Involvement Score", d.get("Fantasy Involvement Score")),
+                    "PA Sim Volatility Label": rd.get("PA Sim Volatility Label", d.get("PA Sim Volatility Label")),
+                    "Batter Outcome Tags": rd.get("Batter Outcome Tags", d.get("Batter Outcome Tags")),
                     "HR Projection": rd.get("HR Projection"),
                     "HR Line": rd.get("Line"),
                     "HR Pick": rd.get("Pick"),
@@ -31046,6 +31879,10 @@ def build_v3_batter_upside_board_final():
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
                     "Final Data Quality Score": rd.get("Final Data Quality Score", d.get("Final Data Quality Score")),
                     "Final Data Guardrail Label": rd.get("Final Data Guardrail Label", d.get("Final Data Guardrail Label")),
+                    "Daily Data Score": rd.get("Daily Data Score", d.get("Daily Data Score")),
+                    "Daily Data Label": rd.get("Daily Data Label", d.get("Daily Data Label")),
+                    "Daily Data Hard Stop": rd.get("Daily Data Hard Stop", d.get("Daily Data Hard Stop")),
+                    "Daily Data Warnings": rd.get("Daily Data Warnings", d.get("Daily Data Warnings")),
                     "Result Gate Label": rd.get("Result Gate Label", d.get("Result Gate Label")),
                     "Result Gate Win Rate %": rd.get("Result Gate Win Rate %", d.get("Result Gate Win Rate %")),
                     "Data Flags": rd.get("Data Flags", d.get("Data Flags")),
@@ -31072,8 +31909,11 @@ def build_v3_batter_upside_board_final():
         hrr_edge = abs(_v3_final_num(d.get("HRR Edge"), 0) or 0)
         hrr_prob = _v3_final_num(d.get("HRR Over Probability %"), 0) or 0
         hrp = _v3_final_num(d.get("HR Probability"), 0) or 0
+        hr_score = _v3_final_num(d.get("HR Score"), 0) or 0
+        hr_rank = _v3_final_num(d.get("HR Likelihood Rank"), 0) or 0
         hit = _v3_final_num(d.get("Best Hit Rate %"), 0) or 0
         data_conf = _v3_final_num(d.get("Data Confidence"), 50) or 50
+        daily_score = _v3_final_num(d.get("Daily Data Score"), data_conf) or data_conf
         clean_flags = str(d.get("No-Bet Risk Flags") or "").strip()
         matchup_ok = bool(d.get("Pitcher Matchup Verified"))
         pitcher_confirmed = bool(d.get("Pitcher Confirmed"))
@@ -31087,13 +31927,19 @@ def build_v3_batter_upside_board_final():
             risk_penalty += 5
         if not lineup_confirmed:
             risk_penalty += 4
+        if bool(d.get("Daily Data Hard Stop")):
+            risk_penalty += 22
+        elif daily_score < 70:
+            risk_penalty += 10
+        elif daily_score < 82:
+            risk_penalty += 4
         hrr_likely = 0
         if _v3_is_live_ud_line(d.get("HRR Line")):
             hrr_likely = (
                 max(0, hrr_prob - 45) * 1.15
                 + max(0, hit - 45) * 0.35
                 + min(20, hrr_edge * 12.0)
-                + max(0, data_conf - 45) * 0.35
+                + max(0, min(data_conf, daily_score) - 45) * 0.35
                 + min(10, max(0, pa - 3.5) * 6)
             )
             hrr_likely = clamp(42 + hrr_likely - risk_penalty, 0, 100)
@@ -31101,8 +31947,10 @@ def build_v3_batter_upside_board_final():
         if _v3_is_live_ud_line(d.get("HR Line")):
             # HR is naturally lower probability, so normalize strong HR spots onto the same board scale.
             hr_likely = (
-                max(0, hrp - 12) * 2.15
-                + max(0, data_conf - 45) * 0.25
+                max(0, hrp - 18) * 1.75
+                + max(0, hr_score - 55) * 0.42
+                + max(0, hr_rank - 50) * 0.28
+                + max(0, min(data_conf, daily_score) - 45) * 0.25
                 + min(10, max(0, pa - 3.5) * 4)
             )
             if str(d.get("HR Grade") or "").startswith("A+"):
@@ -31110,8 +31958,10 @@ def build_v3_batter_upside_board_final():
             elif str(d.get("HR Grade") or "").startswith("A"):
                 hr_likely += 5
             elif str(d.get("HR Grade") or "").startswith("B"):
-                hr_likely += 2
-            hr_likely = clamp(35 + hr_likely - risk_penalty, 0, 100)
+                hr_likely -= 4
+            if hrp < 25:
+                hr_likely -= 8
+            hr_likely = clamp(28 + hr_likely - (risk_penalty * 1.15), 0, 100)
         likely_score = max(hrr_likely, hr_likely)
         if hrr_likely >= hr_likely and hrr_likely > 0:
             d["Best Market"] = "H+R+RBI"
@@ -31145,7 +31995,9 @@ def build_v3_batter_upside_board_final():
         d["HR Probability"] = f"{round(hrp, 1)}%" if hrp else "—"
         d["Best Hit Rate %"] = round(hit, 1) if hit else "—"
         d["Likely Score"] = int(round(clamp(likely_score, 0, 100)))
-        d["Clean Risk"] = "YES" if not clean_flags and matchup_ok else "NO"
+        guard_clean = str(d.get("Final Data Guardrail Label") or "").upper() not in {"VERIFY", "THIN_DATA"}
+        daily_clean = not bool(d.get("Daily Data Hard Stop")) and (_v3_final_num(d.get("Daily Data Score"), 0) or 0) >= 74
+        d["Clean Risk"] = "YES" if not clean_flags and matchup_ok and pitcher_confirmed and lineup_confirmed and guard_clean and daily_clean else "NO"
         d["Upside Score"] = int(round(clamp(score, 0, 100)))
         out.append(d)
     if not out:
@@ -31153,7 +32005,7 @@ def build_v3_batter_upside_board_final():
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
     df = df.sort_values(["Likely Score", "Upside Score", "Best Hit Rate %"], ascending=[False, False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
-    cols = ["Player", "Team", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix Matchup Factor", "Data Confidence", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
+    cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
     return df[[c for c in cols if c in df.columns]]
 
 
@@ -31181,7 +32033,7 @@ def render_v3_batter_research_tab(market="HRR"):
     if s2.button("Grade H+R+RBI snapshots", key=_v3_unique_widget_key("ow_grade_hrr_snapshot"), use_container_width=True):
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
-    cols = [c for c in ["Player", "Team", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Data Confidence", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Component AVG", "Component OBP", "Component SLG", "Component BB%", "Component HR%", "Team RPG", "Team Context Multiplier", "Moneyball OBP Edge", "Runs Created", "Runs Created/PA", "Pythagorean Win% Proxy", "Moneyball Factor", "Moneyball Note", "Season PA", "Season AB", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AB", "Split AVG", "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HRR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg", "H2H", "H2H Games", "H2H Avg", "H2H Median", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Component AVG", "Component OBP", "Component SLG", "Component BB%", "Component HR%", "PA Sim Passes", "PA Sim H+R+RBI Mean", "PA Sim H+R+RBI Median", "PA Sim H+R+RBI P75", "PA Sim H+R+RBI P90", "PA Sim HRR Over %", "PA Sim HRR Under %", "PA Sim Hit/G", "PA Sim HR/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "HR Score", "HR Score Label", "HR Likelihood Rank", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Team RPG", "Team Context Multiplier", "Moneyball OBP Edge", "Runs Created", "Runs Created/PA", "Pythagorean Win% Proxy", "Moneyball Factor", "Moneyball Note", "Season PA", "Season AB", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AB", "Split AVG", "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HRR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg", "H2H", "H2H Games", "H2H Avg", "H2H Median", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "H+R+RBI", "hrr", max_rows=12)
     names = df["Player"].dropna().astype(str).tolist()
@@ -31224,7 +32076,7 @@ def render_v3_home_run_tab():
     if s2.button("Grade HR snapshots", key=_v3_unique_widget_key("ow_grade_hr_snapshot"), use_container_width=True):
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
-    cols = [c for c in ["Player", "Team", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "Data Confidence", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(100), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Home Runs", "home_runs", max_rows=12)
     names = df["Player"].dropna().astype(str).tolist()
@@ -31286,7 +32138,7 @@ def render_v3_batter_official_plays_tab():
     else:
         df["_hr_sort"] = 0
     df = df.sort_values(["_sync_sort", "_hr_sort"], ascending=[False, False]).drop(columns=["_sync_sort", "_hr_sort"], errors="ignore")
-    cols = [c for c in ["Player", "Market", "Team", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "Data Confidence", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Moneyball OBP Edge", "Runs Created/PA", "Moneyball Factor", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Primary Pitch", "Slider/Sweeper Usage %", "Pitcher Stuff Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Batter Quality Factor", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA", "Recent 15d xwOBA", "Ahead Count xwOBA", "Count Leverage Factor", "Volatility Label", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Market", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "HR Score", "HR Likelihood Rank", "PA Sim HRR Over %", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim HR Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility Label", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Moneyball OBP Edge", "Runs Created/PA", "Moneyball Factor", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Primary Pitch", "Slider/Sweeper Usage %", "Pitcher Stuff Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Batter Quality Factor", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA", "Recent 15d xwOBA", "Ahead Count xwOBA", "Count Leverage Factor", "Volatility Label", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
     st.dataframe(df[cols].head(80), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Official Batter Plays", "official_batter", max_rows=12)
 
