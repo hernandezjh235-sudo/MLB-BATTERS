@@ -11366,24 +11366,25 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
     st.markdown(
         """
         <style>
-        .ow-card-list{display:flex;flex-direction:column;gap:18px;margin-top:12px}
-        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:18px;padding:14px 14px 12px;box-shadow:0 0 22px rgba(196,33,255,.16)}
+        .ow-card-list{display:flex;flex-direction:column;gap:14px;margin-top:12px}
+        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:18px;padding:12px 14px 10px;box-shadow:0 0 22px rgba(196,33,255,.16)}
         .ow-card-head{border:1px solid #d827ff;border-radius:12px;padding:8px 10px;display:flex;justify-content:space-between;gap:10px;align-items:center}
         .ow-player-name{font-size:17px;font-weight:800;color:#f8f8ff;line-height:1.1}
         .ow-card-proj{font-size:12px;color:#f6c43c;font-weight:800;white-space:nowrap}
-        .ow-card-sub{font-size:11px;color:#8f98ad;margin:10px 2px 12px;line-height:1.35}
+        .ow-card-sub{font-size:11px;color:#8f98ad;margin:9px 2px 10px;line-height:1.3}
         .ow-chip-row{display:grid;grid-template-columns:1.15fr .8fr 1.2fr;gap:8px;margin-bottom:12px}
         .ow-chip{border-radius:12px;padding:8px 9px;font-size:11px;font-weight:800;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .ow-bars{display:flex;flex-direction:column;gap:9px;margin:4px 0 13px}
+        .ow-bars{display:flex;flex-direction:column;gap:8px;margin:4px 0 11px}
         .ow-bar-line{display:grid;grid-template-columns:54px 1fr 38px;gap:9px;align-items:center}
         .ow-bar-label{font-size:10px;color:#a1aabd;font-weight:700}
         .ow-bar-bg{height:10px;border-radius:999px;background:#202839;overflow:hidden}
         .ow-bar-fill{height:10px;border-radius:999px}
         .ow-card-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
-        .ow-tile{background:#111827;border:1px solid #263247;border-radius:10px;padding:8px;min-height:48px}
+        .ow-tile{background:#111827;border:1px solid #263247;border-radius:10px;padding:8px;min-height:44px}
         .ow-tile-label{font-size:9px;color:#8f98ad;font-weight:700}
         .ow-tile-val{font-size:13px;color:#f8f8ff;font-weight:800;margin-top:4px;word-break:break-word}
-        @media (min-width: 760px){.ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.ow-card-tiles{grid-template-columns:repeat(6,minmax(0,1fr))}}
+        .ow-card-mini{font-size:10px;color:#8f98ad;margin:8px 2px 0;line-height:1.25}
+        @media (min-width: 760px){.ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.ow-card-tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}
         </style>
         """,
         unsafe_allow_html=True,
@@ -11438,10 +11439,8 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
                 <div class="ow-tile"><div class="ow-tile-label">EDGE</div><div class="ow-tile-val">{esc(_ow_fmt_slate_num(edge, 2))}</div></div>
                 <div class="ow-tile"><div class="ow-tile-label">WIN/PROB</div><div class="ow-tile-val" style="color:#31f08a">{esc(_ow_fmt_slate_num(prob, 1))}%</div></div>
                 <div class="ow-tile"><div class="ow-tile-label">PA</div><div class="ow-tile-val" style="color:#42d8ff">{esc(_ow_fmt_slate_num(pa, 1))}</div></div>
-                <div class="ow-tile"><div class="ow-tile-label">L10</div><div class="ow-tile-val">{esc(l10)}</div></div>
-                <div class="ow-tile"><div class="ow-tile-label">H2H</div><div class="ow-tile-val">{esc(h2h)}</div></div>
-                <div class="ow-tile"><div class="ow-tile-label">RISK</div><div class="ow-tile-val" style="color:{risk_color};font-size:11px">{esc(risk)}</div></div>
               </div>
+              <div class="ow-card-mini">L10 {esc(l10)} | H2H {esc(h2h)} | <span style="color:{risk_color}">Risk {esc(risk)}</span></div>
             </div>
         """).strip())
     st.markdown('<div class="ow-card-list">' + "".join(cards) + '</div>', unsafe_allow_html=True)
