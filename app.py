@@ -15,6 +15,7 @@ import io
 import re
 import unicodedata
 import html
+import textwrap
 import requests
 import numpy as np
 import pandas as pd
@@ -11416,34 +11417,34 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         edge_pct = clamp(abs(num(edge)) * 32, 0, 100)
         tier_color = pick_color(tier)
         risk_color = "#31f08a" if str(risk).lower() == "clean" else "#ff3f68"
-        cards.append(f"""
-        <div class="ow-player-card">
-          <div class="ow-card-head">
-            <div class="ow-player-name">#{i} {esc(player)}</div>
-            <div class="ow-card-proj">PROJ {esc(_ow_fmt_slate_num(proj, 2))}</div>
-          </div>
-          <div class="ow-card-sub">{esc(team)} vs {esc(opp)} | vs {esc(pitcher)} | ERA {esc(_ow_fmt_slate_num(p_era, 2))} WHIP {esc(_ow_fmt_slate_num(p_whip, 2))} BAA {esc(_ow_fmt_slate_num(p_baa, 3))}</div>
-          <div class="ow-chip-row">
-            <div class="ow-chip" style="border:1px solid #d827ff;color:#d827ff">{esc(str(market).upper())}</div>
-            <div class="ow-chip" style="border:1px solid #f6c43c;color:#f6c43c">{esc(pick)} {esc(_ow_fmt_slate_num(line, 1))}</div>
-            <div class="ow-chip" style="border:1px solid {tier_color};color:{tier_color}">{esc(str(tier).upper())}</div>
-          </div>
-          <div class="ow-bars">
-            <div class="ow-bar-line"><div class="ow-bar-label">CONF</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{conf_pct:.0f}%;background:#31f08a"></div></div><div class="ow-bar-label">{conf_pct:.0f}</div></div>
-            <div class="ow-bar-line"><div class="ow-bar-label">DATA</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{data_pct:.0f}%;background:#f6c43c"></div></div><div class="ow-bar-label">{data_pct:.0f}</div></div>
-            <div class="ow-bar-line"><div class="ow-bar-label">EDGE</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{edge_pct:.0f}%;background:#d827ff"></div></div><div class="ow-bar-label">{edge_pct:.0f}</div></div>
-          </div>
-          <div class="ow-card-tiles">
-            <div class="ow-tile"><div class="ow-tile-label">EDGE</div><div class="ow-tile-val">{esc(_ow_fmt_slate_num(edge, 2))}</div></div>
-            <div class="ow-tile"><div class="ow-tile-label">WIN/PROB</div><div class="ow-tile-val" style="color:#31f08a">{esc(_ow_fmt_slate_num(prob, 1))}%</div></div>
-            <div class="ow-tile"><div class="ow-tile-label">PA</div><div class="ow-tile-val" style="color:#42d8ff">{esc(_ow_fmt_slate_num(pa, 1))}</div></div>
-            <div class="ow-tile"><div class="ow-tile-label">L10</div><div class="ow-tile-val">{esc(l10)}</div></div>
-            <div class="ow-tile"><div class="ow-tile-label">H2H</div><div class="ow-tile-val">{esc(h2h)}</div></div>
-            <div class="ow-tile"><div class="ow-tile-label">RISK</div><div class="ow-tile-val" style="color:{risk_color};font-size:11px">{esc(risk)}</div></div>
-          </div>
-        </div>
-        """)
-    st.markdown(f'<div class="ow-card-list">{"".join(cards)}</div>', unsafe_allow_html=True)
+        cards.append(textwrap.dedent(f"""
+            <div class="ow-player-card">
+              <div class="ow-card-head">
+                <div class="ow-player-name">#{i} {esc(player)}</div>
+                <div class="ow-card-proj">PROJ {esc(_ow_fmt_slate_num(proj, 2))}</div>
+              </div>
+              <div class="ow-card-sub">{esc(team)} vs {esc(opp)} | vs {esc(pitcher)} | ERA {esc(_ow_fmt_slate_num(p_era, 2))} WHIP {esc(_ow_fmt_slate_num(p_whip, 2))} BAA {esc(_ow_fmt_slate_num(p_baa, 3))}</div>
+              <div class="ow-chip-row">
+                <div class="ow-chip" style="border:1px solid #d827ff;color:#d827ff">{esc(str(market).upper())}</div>
+                <div class="ow-chip" style="border:1px solid #f6c43c;color:#f6c43c">{esc(pick)} {esc(_ow_fmt_slate_num(line, 1))}</div>
+                <div class="ow-chip" style="border:1px solid {tier_color};color:{tier_color}">{esc(str(tier).upper())}</div>
+              </div>
+              <div class="ow-bars">
+                <div class="ow-bar-line"><div class="ow-bar-label">CONF</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{conf_pct:.0f}%;background:#31f08a"></div></div><div class="ow-bar-label">{conf_pct:.0f}</div></div>
+                <div class="ow-bar-line"><div class="ow-bar-label">DATA</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{data_pct:.0f}%;background:#f6c43c"></div></div><div class="ow-bar-label">{data_pct:.0f}</div></div>
+                <div class="ow-bar-line"><div class="ow-bar-label">EDGE</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{edge_pct:.0f}%;background:#d827ff"></div></div><div class="ow-bar-label">{edge_pct:.0f}</div></div>
+              </div>
+              <div class="ow-card-tiles">
+                <div class="ow-tile"><div class="ow-tile-label">EDGE</div><div class="ow-tile-val">{esc(_ow_fmt_slate_num(edge, 2))}</div></div>
+                <div class="ow-tile"><div class="ow-tile-label">WIN/PROB</div><div class="ow-tile-val" style="color:#31f08a">{esc(_ow_fmt_slate_num(prob, 1))}%</div></div>
+                <div class="ow-tile"><div class="ow-tile-label">PA</div><div class="ow-tile-val" style="color:#42d8ff">{esc(_ow_fmt_slate_num(pa, 1))}</div></div>
+                <div class="ow-tile"><div class="ow-tile-label">L10</div><div class="ow-tile-val">{esc(l10)}</div></div>
+                <div class="ow-tile"><div class="ow-tile-label">H2H</div><div class="ow-tile-val">{esc(h2h)}</div></div>
+                <div class="ow-tile"><div class="ow-tile-label">RISK</div><div class="ow-tile-val" style="color:{risk_color};font-size:11px">{esc(risk)}</div></div>
+              </div>
+            </div>
+        """).strip())
+    st.markdown('<div class="ow-card-list">' + "".join(cards) + '</div>', unsafe_allow_html=True)
 
 
 def render_kproj_tab(board):
@@ -26158,7 +26159,7 @@ def render_v3_batter_official_plays_tab():
         "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI",
     ]
     cols = [c for c in priority_cols if c in df.columns] + [c for c in cols if c not in priority_cols]
-    _ow_render_player_card_rows(df, "H+R+RBI", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="hrr_cards")
+    _ow_render_player_card_rows(df, "H+R+RBI", max_rows=len(df), key="hrr_cards")
     with st.expander("Full data table", expanded=False):
         st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
 
@@ -26918,7 +26919,7 @@ def render_v3_home_run_tab():
     c3.metric("A/A+ Spots", aa)
     c4.metric("Mode", "UD HR + fallback" if isinstance(meta, dict) and meta.get("ud_rows",0) else "Projection")
     cols=[c for c in ["Player","Team","Opponent","Matchup","Market","Line","Pick","HR Probability %","HR Grade","Projected PA","Opp Pitcher","Pitcher Hand","Pitcher HR9","L7 HR","L15 HR","L30 HR","xHR L15","Due Gap","Due Label","Official Play Filter"] if c in df.columns]
-    _ow_render_player_card_rows(df, "Home Runs", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="hr_cards")
+    _ow_render_player_card_rows(df, "Home Runs", max_rows=len(df), key="hr_cards")
     with st.expander("Full data table", expanded=False):
         st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
@@ -27002,7 +27003,7 @@ def render_v3_batter_official_plays_tab():
     if "Sync Score" in df.columns:
         df = df.sort_values("Sync Score", ascending=False, na_position="last")
     cols=[c for c in ["Player","Market","Team","Opponent","Matchup","Pick","Line","Projection","Edge","Confidence","HR Probability %","HR Grade","Last 5","Last 10","Same-Line","Sync Score","Sync Label","Official Play Filter"] if c in df.columns]
-    _ow_render_player_card_rows(df, "Official Batter Plays", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="official_cards")
+    _ow_render_player_card_rows(df, "Official Batter Plays", max_rows=len(df), key="official_cards")
     with st.expander("Full data table", expanded=False):
         st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
 
@@ -27530,7 +27531,7 @@ def render_v3_top_batter_plays_board():
     c2.metric("Top Likely", int(pd.to_numeric(df.get("Likely Score", df.get("Upside Score")), errors="coerce").max()))
     c3.metric("Clean Risk", int(df.get("Clean Risk", pd.Series(dtype=str)).astype(str).eq("YES").sum()) if "Clean Risk" in df.columns else "—")
     c4.metric("Mode", "HRR + HR")
-    _ow_render_player_card_rows(df, "Batter Strong Plays", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="top_batter_cards")
+    _ow_render_player_card_rows(df, "Batter Strong Plays", max_rows=len(df), key="top_batter_cards")
     with st.expander("Full data table", expanded=False):
         st.dataframe(df.head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Batter Strong Plays", "batter_strong", max_rows=12)
@@ -33586,7 +33587,9 @@ def render_v3_batter_research_tab(market="HRR"):
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
     cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Required Data Score", "Required Data Missing", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Component AVG", "Component OBP", "Component SLG", "Component BB%", "Component HR%", "PA Sim Passes", "PA Sim H+R+RBI Mean", "PA Sim H+R+RBI Median", "PA Sim H+R+RBI P75", "PA Sim H+R+RBI P90", "PA Sim HRR Over %", "PA Sim HRR Under %", "PA Sim Hit/G", "PA Sim HR/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "HR Score", "HR Score Label", "HR Likelihood Rank", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Team RPG", "Team Context Multiplier", "Moneyball OBP Edge", "Runs Created", "Runs Created/PA", "Pythagorean Win% Proxy", "Moneyball Factor", "Moneyball Note", "Season PA", "Season AB", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AB", "Split AVG", "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Savant Hitter Found", "Savant xwOBA", "Savant xBA", "Savant xSLG", "Savant xOBP", "Savant wOBA", "Savant K%", "Savant BB%", "Savant Whiff%", "Savant Chase%", "Savant HardHit%", "Savant Barrel%", "Savant Avg EV", "Savant Factor HRR", "Savant Note", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Required Data Loaded", "Required Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher Allowed xwOBA", "Pitcher Allowed xBA", "Pitcher Allowed xSLG", "Pitcher Allowed HardHit%", "Pitcher Allowed Barrel%", "Pitcher Allowed Avg EV", "Pitcher Allowed BBE", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HRR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg", "H2H", "H2H Games", "H2H Avg", "H2H Median", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "H+R+RBI", max_rows=len(df), key="hrr_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "H+R+RBI", "hrr", max_rows=12)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -33629,7 +33632,9 @@ def render_v3_home_run_tab():
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
     cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "Edge", "HR Probability %", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "Home Runs", max_rows=len(df), key="hr_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Home Runs", "home_runs", max_rows=12)
     names = df["Player"].dropna().astype(str).tolist()
     if names:
@@ -33691,7 +33696,9 @@ def render_v3_batter_official_plays_tab():
         df["_hr_sort"] = 0
     df = df.sort_values(["_sync_sort", "_hr_sort"], ascending=[False, False]).drop(columns=["_sync_sort", "_hr_sort"], errors="ignore")
     cols = [c for c in ["Player", "Market", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Pick", "Line", "Projection", "Edge", "Over Probability %", "HR Probability %", "Confidence", "HR Grade", "HR Score", "HR Likelihood Rank", "PA Sim HRR Over %", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim HR Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility Label", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Moneyball OBP Edge", "Runs Created/PA", "Moneyball Factor", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Primary Pitch", "Slider/Sweeper Usage %", "Pitcher Stuff Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Pitch Mix Matchup Factor", "Batter Quality Factor", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA", "Recent 15d xwOBA", "Ahead Count xwOBA", "Count Leverage Factor", "Volatility Label", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Split Factor", "Park", "Official Play Filter"] if c in df.columns]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "Official Batter Plays", max_rows=len(df), key="official_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Official Batter Plays", "official_batter", max_rows=12)
 
 
