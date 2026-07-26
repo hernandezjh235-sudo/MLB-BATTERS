@@ -11130,6 +11130,186 @@ def _ow_build_single_pick_poster_png(row, title_label="BATTER PROJECTION"):
     return bio.getvalue()
 
 
+def _ow_build_mobile_player_card_sheet_png(df, title_label="BATTER PROJECTION", max_rows=5):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        from io import BytesIO
+    except Exception:
+        return None
+
+    d = df.copy()
+    sort_cols = [c for c in ["Opportunity Tier", "Likely Score", "Sync Score", "HR Probability %", "Win Probability %", "Edge"] if c in d.columns]
+    if "Opportunity Tier" in d.columns:
+        tier_rank = {
+            "A / OFFICIAL": 5,
+            "B / OPPORTUNITY": 4,
+            "B / HR SPRINKLE": 4,
+            "C / HR WATCHLIST": 3,
+            "C / RESEARCH": 2,
+            "D / RISKY": 1,
+            "D / PASS": 0,
+            "PASS": 0,
+        }
+        d["_ow_card_tier_sort"] = d["Opportunity Tier"].astype(str).map(lambda x: tier_rank.get(x, 1)).fillna(1)
+        sort_cols = ["_ow_card_tier_sort"] + [c for c in sort_cols if c != "Opportunity Tier"]
+    if sort_cols:
+        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    rows = [r.to_dict() for _, r in d.head(int(max_rows or 5)).iterrows()]
+    if not rows:
+        return None
+
+    def font(size, bold=False):
+        candidates = [
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/SFNS.ttf",
+        ]
+        for path in candidates:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    def fit(draw, txt, fnt, max_width):
+        txt = str(txt or "")
+        try:
+            ok = lambda s: draw.textlength(s, font=fnt) <= max_width
+        except Exception:
+            ok = lambda s: len(s) * max(8, getattr(fnt, "size", 18) * 0.5) <= max_width
+        if ok(txt):
+            return txt
+        while txt and not ok(txt + "..."):
+            txt = txt[:-1]
+        return txt + "..." if txt else "..."
+
+    w = 1080
+    card_h = 520
+    gap = 28
+    top_h = 132
+    bottom_pad = 46
+    h = top_h + len(rows) * card_h + max(0, len(rows) - 1) * gap + bottom_pad
+    bg = Image.new("RGB", (w, h), "#02030a")
+    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for x, y, r, color in [
+        (160, 100, 240, (180, 22, 255, 85)),
+        (900, 150, 280, (255, 198, 52, 70)),
+        (620, h - 120, 420, (155, 0, 255, 55)),
+    ]:
+        gd.ellipse([x-r, y-r, x+r, y+r], fill=color)
+    glow = glow.filter(ImageFilter.GaussianBlur(58))
+    img = Image.alpha_composite(bg.convert("RGBA"), glow)
+    draw = ImageDraw.Draw(img)
+
+    title_f = font(36, True)
+    label_f = font(20, True)
+    small_f = font(18, False)
+    tiny_f = font(15, False)
+    name_f = font(34, True)
+    big_f = font(52, True)
+    stat_f = font(22, True)
+    white = "#f8f8ff"
+    muted = "#8992a8"
+    purple = "#d827ff"
+    gold = "#f6c43c"
+    green = "#31f08a"
+    cyan = "#42d8ff"
+    red = "#ff3f68"
+    panel = "#0b101a"
+    panel2 = "#111827"
+
+    now_txt = california_now().strftime("%m/%d %I:%M %p PT") if "california_now" in globals() else datetime.now().strftime("%m/%d %I:%M %p")
+    draw.rounded_rectangle([24, 24, w - 24, 104], radius=22, fill="#080a12", outline=gold, width=2)
+    draw.line([34, 34, w - 34, 34], fill=purple, width=3)
+    draw.text((48, 44), "ONE WAY PICKZ", fill=white, font=title_f)
+    draw.text((48, 82), fit(draw, str(title_label).upper(), label_f, 360), fill=gold, font=label_f)
+    draw.text((w - 260, 48), now_txt, fill=muted, font=small_f)
+    draw.text((w - 260, 78), "MOBILE CARD SHEET", fill=purple, font=tiny_f)
+
+    def pct_num(v):
+        n = _v3_safe_num(v, None)
+        return n if n is not None else 0
+
+    y = top_h
+    for idx, row in enumerate(rows, start=1):
+        market = _ow_poster_value(row, "Best Market", "Market", default="BATTER")
+        pick = _ow_poster_value(row, "Best Pick", "Pick", default="—")
+        line = _ow_poster_value(row, "Best Line", "Line", default="—")
+        proj = _ow_poster_value(row, "Best Projection", "Projection", "HR Projection", default="—")
+        edge = _ow_poster_value(row, "Edge", "HRR Edge", default="—")
+        prob = _ow_poster_value(row, "Best Win/Hit %", "Win Probability %", "Over Probability %", "HR Probability %", default="—")
+        daily = _ow_poster_value(row, "Daily Data Score", "Data Confidence", default="—")
+        tier = _ow_poster_value(row, "Opportunity Tier", "Official Play Filter", "Overall Rating", default="RESEARCH")
+        player = fit(draw, _ow_poster_value(row, "Player", "UD Player"), name_f, 520)
+        team = _ow_poster_value(row, "Team")
+        opp = _ow_poster_value(row, "Opponent")
+        pitcher = fit(draw, _ow_poster_value(row, "Opp Pitcher"), small_f, 280)
+        p_era = _ow_poster_value(row, "Pitcher ERA", default="—")
+        p_whip = _ow_poster_value(row, "Pitcher WHIP", default="—")
+        p_baa = _ow_poster_value(row, "Pitcher BAA", default="—")
+        pa = _ow_poster_value(row, "Projected PA", default="—")
+        l10 = _ow_poster_value(row, "Last 10", default="—")
+        h2h = _ow_poster_value(row, "H2H", default="—")
+        risk = _ow_slate_risk_text(row)
+        border = green if "OFFICIAL" in str(tier).upper() else gold if any(x in str(tier).upper() for x in ["OPPORTUNITY", "SPRINKLE", "WATCH"]) else purple
+
+        draw.rounded_rectangle([34, y, w - 34, y + card_h], radius=26, fill=panel, outline=border, width=3)
+        draw.rounded_rectangle([52, y + 18, w - 52, y + 76], radius=18, fill="#070a12", outline=purple, width=2)
+        draw.text((72, y + 34), f"#{idx}", fill=gold, font=label_f)
+        draw.text((122, y + 31), player, fill=white, font=name_f)
+        draw.text((w - 210, y + 33), f"PROJ {_ow_fmt_slate_num(proj, 2)}", fill=gold, font=stat_f)
+
+        matchup = f"{team} vs {opp} | vs {pitcher} | ERA {_ow_fmt_slate_num(p_era, 2)} WHIP {_ow_fmt_slate_num(p_whip, 2)} BAA {_ow_fmt_slate_num(p_baa, 3)}"
+        draw.text((72, y + 104), fit(draw, matchup, small_f, 850), fill=muted, font=small_f)
+
+        chip_y = y + 150
+        chips = [
+            (str(market).upper(), purple, 300),
+            (f"{pick} {line}", gold, 190),
+            (str(tier).upper(), green, 310),
+        ]
+        x = 72
+        for txt, color, cw in chips:
+            draw.rounded_rectangle([x, chip_y, x + cw, chip_y + 46], radius=18, fill="#111423", outline=color, width=2)
+            draw.text((x + 18, chip_y + 13), fit(draw, txt, label_f, cw - 36), fill=color, font=label_f)
+            x += cw + 18
+
+        bar_y = y + 232
+        bars = [("CONF", pct_num(prob), green), ("DATA", pct_num(daily), gold), ("EDGE", min(100, max(0, abs(_v3_safe_num(edge, 0) or 0) * 32)), purple)]
+        for bidx, (lbl, val, color) in enumerate(bars):
+            by = bar_y + bidx * 38
+            draw.text((72, by - 4), lbl, fill=muted, font=tiny_f)
+            draw.rounded_rectangle([164, by, 820, by + 13], radius=7, fill="#222a39")
+            draw.rounded_rectangle([164, by, 164 + int(656 * clamp(val, 0, 100) / 100), by + 13], radius=7, fill=color)
+            draw.text((840, by - 6), _ow_fmt_slate_num(val, 1), fill=color, font=tiny_f)
+
+        tile_y = y + 372
+        tiles = [
+            ("EDGE", _ow_fmt_slate_num(edge, 2), gold),
+            ("WIN/PROB", f"{_ow_fmt_slate_num(prob, 1)}%", green),
+            ("PA", _ow_fmt_slate_num(pa, 1), cyan),
+            ("L10", str(l10), white),
+            ("H2H", str(h2h), white),
+            ("RISK", fit(draw, risk, tiny_f, 96), red if risk != "clean" else green),
+        ]
+        x = 62
+        for lbl, val, color in tiles:
+            draw.rounded_rectangle([x, tile_y, x + 152, tile_y + 82], radius=14, fill=panel2, outline="#263146", width=2)
+            draw.text((x + 14, tile_y + 12), lbl, fill=muted, font=tiny_f)
+            draw.text((x + 14, tile_y + 39), fit(draw, val, stat_f if lbl != "RISK" else tiny_f, 118), fill=color, font=stat_f if lbl != "RISK" else tiny_f)
+            x += 164
+
+        y += card_h + gap
+
+    draw.text((44, h - 32), "Verify active line, lineup, pitcher, and weather before lock.", fill="#727b91", font=tiny_f)
+    bio = BytesIO()
+    img.convert("RGB").save(bio, format="PNG", optimize=True)
+    return bio.getvalue()
+
+
 def _ow_render_copy_paste_slate(df, market_label, key, max_rows=12):
     slate = _ow_projection_copy_paste_slate(df, market_label, max_rows=max_rows)
     if not slate:
@@ -33465,6 +33645,35 @@ def render_v3_discord_poster_studio_tab():
     if not names:
         st.info("No player names available for poster.")
         return
+    st.markdown("### Mobile card sheet")
+    sheet_cols = st.columns(2)
+    card_count = sheet_cols[0].select_slider(
+        "Players on sheet",
+        options=[3, 4, 5, 6, 8],
+        value=5,
+        key=_v3_unique_widget_key("ow_mobile_card_sheet_count"),
+    )
+    only_opp = sheet_cols[1].checkbox(
+        "Official/opportunity only",
+        value=False,
+        key=_v3_unique_widget_key("ow_mobile_card_sheet_official_only"),
+    )
+    sheet_df = df.copy()
+    if only_opp and "Official Play Filter" in sheet_df.columns:
+        keep = sheet_df["Official Play Filter"].astype(str).str.contains("OFFICIAL|SPRINKLE|OPPORTUNITY|WATCH", case=False, na=False)
+        sheet_df = sheet_df[keep].copy()
+    mobile_sheet = _ow_build_mobile_player_card_sheet_png(sheet_df, title_label=source_name, max_rows=card_count)
+    if mobile_sheet:
+        st.image(mobile_sheet, use_container_width=True)
+        st.download_button(
+            "Download mobile multi-player card sheet PNG",
+            data=mobile_sheet,
+            file_name=f"{source_name.lower().replace(' ', '_').replace('+', 'plus')}_mobile_cards_top{card_count}.png",
+            mime="image/png",
+            key=_v3_unique_widget_key("ow_mobile_card_sheet_download"),
+            use_container_width=True,
+        )
+    st.markdown("### Single-player poster")
     selected = st.selectbox("Pick poster player", names[:200], key=_v3_unique_widget_key("ow_poster_player_select"))
     row = df[df["Player"].astype(str) == selected].iloc[0].to_dict()
     poster = _ow_build_single_pick_poster_png(row, title_label=source_name)
