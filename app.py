@@ -11336,6 +11336,116 @@ def _ow_render_copy_paste_slate(df, market_label, key, max_rows=12):
             )
 
 
+def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key="cards"):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No player cards to show.")
+        return
+    d = df.copy()
+    sort_cols = [c for c in ["Likely Score", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
+    if sort_cols:
+        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+
+    def esc(v):
+        return html.escape(str(v if v not in (None, "", "nan", "None") else "—"))
+
+    def num(v, default=0):
+        n = _v3_safe_num(v, None)
+        return default if n is None else float(n)
+
+    def pick_color(txt):
+        t = str(txt or "").upper()
+        if "PASS" in t:
+            return "#ff3f68"
+        if "OFFICIAL" in t or "STRONG" in t or "CLEAN" in t:
+            return "#31f08a"
+        if "OPPORTUNITY" in t or "SPRINKLE" in t or "WATCH" in t:
+            return "#f6c43c"
+        return "#d827ff"
+
+    st.markdown(
+        """
+        <style>
+        .ow-card-list{display:flex;flex-direction:column;gap:18px;margin-top:12px}
+        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:18px;padding:14px 14px 12px;box-shadow:0 0 22px rgba(196,33,255,.16)}
+        .ow-card-head{border:1px solid #d827ff;border-radius:12px;padding:8px 10px;display:flex;justify-content:space-between;gap:10px;align-items:center}
+        .ow-player-name{font-size:17px;font-weight:800;color:#f8f8ff;line-height:1.1}
+        .ow-card-proj{font-size:12px;color:#f6c43c;font-weight:800;white-space:nowrap}
+        .ow-card-sub{font-size:11px;color:#8f98ad;margin:10px 2px 12px;line-height:1.35}
+        .ow-chip-row{display:grid;grid-template-columns:1.15fr .8fr 1.2fr;gap:8px;margin-bottom:12px}
+        .ow-chip{border-radius:12px;padding:8px 9px;font-size:11px;font-weight:800;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ow-bars{display:flex;flex-direction:column;gap:9px;margin:4px 0 13px}
+        .ow-bar-line{display:grid;grid-template-columns:54px 1fr 38px;gap:9px;align-items:center}
+        .ow-bar-label{font-size:10px;color:#a1aabd;font-weight:700}
+        .ow-bar-bg{height:10px;border-radius:999px;background:#202839;overflow:hidden}
+        .ow-bar-fill{height:10px;border-radius:999px}
+        .ow-card-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+        .ow-tile{background:#111827;border:1px solid #263247;border-radius:10px;padding:8px;min-height:48px}
+        .ow-tile-label{font-size:9px;color:#8f98ad;font-weight:700}
+        .ow-tile-val{font-size:13px;color:#f8f8ff;font-weight:800;margin-top:4px;word-break:break-word}
+        @media (min-width: 760px){.ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.ow-card-tiles{grid-template-columns:repeat(6,minmax(0,1fr))}}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cards = []
+    for i, (_, r) in enumerate(d.head(int(max_rows or 30)).iterrows(), start=1):
+        row = r.to_dict()
+        market = _ow_poster_value(row, "Best Market", "Market", default=title_label)
+        pick = _ow_poster_value(row, "Best Pick", "Pick", default="—")
+        line = _ow_poster_value(row, "Best Line", "Line", default="—")
+        proj = _ow_poster_value(row, "Best Projection", "Projection", "HR Projection", default="—")
+        prob = _ow_poster_value(row, "Best Win/Hit %", "Win Probability %", "Over Probability %", "HR Probability %", default="—")
+        edge = _ow_poster_value(row, "Edge", "HRR Edge", default="—")
+        data = _ow_poster_value(row, "Daily Data Score", "Data Confidence", default="—")
+        tier = _ow_poster_value(row, "Opportunity Tier", "Official Play Filter", "Overall Rating", default="RESEARCH")
+        player = _ow_poster_value(row, "Player", "UD Player", default="—")
+        team = _ow_poster_value(row, "Team", default="—")
+        opp = _ow_poster_value(row, "Opponent", default="—")
+        pitcher = _ow_poster_value(row, "Opp Pitcher", default="—")
+        p_era = _ow_poster_value(row, "Pitcher ERA", default="—")
+        p_whip = _ow_poster_value(row, "Pitcher WHIP", default="—")
+        p_baa = _ow_poster_value(row, "Pitcher BAA", default="—")
+        pa = _ow_poster_value(row, "Projected PA", default="—")
+        l10 = _ow_poster_value(row, "Last 10", default="—")
+        h2h = _ow_poster_value(row, "H2H", default="—")
+        risk = _ow_slate_risk_text(row)
+        likely = _ow_poster_value(row, "Likely Score", "Sync Score", "HR Score", default="—")
+        conf_pct = clamp(num(prob), 0, 100)
+        data_pct = clamp(num(data), 0, 100)
+        edge_pct = clamp(abs(num(edge)) * 32, 0, 100)
+        tier_color = pick_color(tier)
+        risk_color = "#31f08a" if str(risk).lower() == "clean" else "#ff3f68"
+        cards.append(f"""
+        <div class="ow-player-card">
+          <div class="ow-card-head">
+            <div class="ow-player-name">#{i} {esc(player)}</div>
+            <div class="ow-card-proj">PROJ {esc(_ow_fmt_slate_num(proj, 2))}</div>
+          </div>
+          <div class="ow-card-sub">{esc(team)} vs {esc(opp)} | vs {esc(pitcher)} | ERA {esc(_ow_fmt_slate_num(p_era, 2))} WHIP {esc(_ow_fmt_slate_num(p_whip, 2))} BAA {esc(_ow_fmt_slate_num(p_baa, 3))}</div>
+          <div class="ow-chip-row">
+            <div class="ow-chip" style="border:1px solid #d827ff;color:#d827ff">{esc(str(market).upper())}</div>
+            <div class="ow-chip" style="border:1px solid #f6c43c;color:#f6c43c">{esc(pick)} {esc(_ow_fmt_slate_num(line, 1))}</div>
+            <div class="ow-chip" style="border:1px solid {tier_color};color:{tier_color}">{esc(str(tier).upper())}</div>
+          </div>
+          <div class="ow-bars">
+            <div class="ow-bar-line"><div class="ow-bar-label">CONF</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{conf_pct:.0f}%;background:#31f08a"></div></div><div class="ow-bar-label">{conf_pct:.0f}</div></div>
+            <div class="ow-bar-line"><div class="ow-bar-label">DATA</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{data_pct:.0f}%;background:#f6c43c"></div></div><div class="ow-bar-label">{data_pct:.0f}</div></div>
+            <div class="ow-bar-line"><div class="ow-bar-label">EDGE</div><div class="ow-bar-bg"><div class="ow-bar-fill" style="width:{edge_pct:.0f}%;background:#d827ff"></div></div><div class="ow-bar-label">{edge_pct:.0f}</div></div>
+          </div>
+          <div class="ow-card-tiles">
+            <div class="ow-tile"><div class="ow-tile-label">EDGE</div><div class="ow-tile-val">{esc(_ow_fmt_slate_num(edge, 2))}</div></div>
+            <div class="ow-tile"><div class="ow-tile-label">WIN/PROB</div><div class="ow-tile-val" style="color:#31f08a">{esc(_ow_fmt_slate_num(prob, 1))}%</div></div>
+            <div class="ow-tile"><div class="ow-tile-label">PA</div><div class="ow-tile-val" style="color:#42d8ff">{esc(_ow_fmt_slate_num(pa, 1))}</div></div>
+            <div class="ow-tile"><div class="ow-tile-label">L10</div><div class="ow-tile-val">{esc(l10)}</div></div>
+            <div class="ow-tile"><div class="ow-tile-label">H2H</div><div class="ow-tile-val">{esc(h2h)}</div></div>
+            <div class="ow-tile"><div class="ow-tile-label">RISK</div><div class="ow-tile-val" style="color:{risk_color};font-size:11px">{esc(risk)}</div></div>
+          </div>
+        </div>
+        """)
+    st.markdown(f'<div class="ow-card-list">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
 def render_kproj_tab(board):
     st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
     st.caption("K Upside now uses true-talent projection + distribution simulation: floor, median, ceiling, volatility, recent Ks, BF, matchup, and Underdog line. Main engine stays separate.")
@@ -26048,7 +26158,9 @@ def render_v3_batter_official_plays_tab():
         "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI",
     ]
     cols = [c for c in priority_cols if c in df.columns] + [c for c in cols if c not in priority_cols]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "H+R+RBI", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="hrr_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
 
 
 
@@ -26806,7 +26918,9 @@ def render_v3_home_run_tab():
     c3.metric("A/A+ Spots", aa)
     c4.metric("Mode", "UD HR + fallback" if isinstance(meta, dict) and meta.get("ud_rows",0) else "Projection")
     cols=[c for c in ["Player","Team","Opponent","Matchup","Market","Line","Pick","HR Probability %","HR Grade","Projected PA","Opp Pitcher","Pitcher Hand","Pitcher HR9","L7 HR","L15 HR","L30 HR","xHR L15","Due Gap","Due Label","Official Play Filter"] if c in df.columns]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "Home Runs", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="hr_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist()
     selected = st.selectbox("Open HR card", names, key=_v3_unique_widget_key("v3_hr_select_final_cleanup"))
     rr = df[df["Player"].astype(str) == selected].iloc[0].to_dict()
@@ -26888,7 +27002,9 @@ def render_v3_batter_official_plays_tab():
     if "Sync Score" in df.columns:
         df = df.sort_values("Sync Score", ascending=False, na_position="last")
     cols=[c for c in ["Player","Market","Team","Opponent","Matchup","Pick","Line","Projection","Edge","Confidence","HR Probability %","HR Grade","Last 5","Last 10","Same-Line","Sync Score","Sync Label","Official Play Filter"] if c in df.columns]
-    st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "Official Batter Plays", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="official_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df[cols].head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
 
 
 
@@ -27414,7 +27530,9 @@ def render_v3_top_batter_plays_board():
     c2.metric("Top Likely", int(pd.to_numeric(df.get("Likely Score", df.get("Upside Score")), errors="coerce").max()))
     c3.metric("Clean Risk", int(df.get("Clean Risk", pd.Series(dtype=str)).astype(str).eq("YES").sum()) if "Clean Risk" in df.columns else "—")
     c4.metric("Mode", "HRR + HR")
-    st.dataframe(df.head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
+    _ow_render_player_card_rows(df, "Batter Strong Plays", max_rows=OW_FINAL_RESEARCH_DISPLAY_ROWS, key="top_batter_cards")
+    with st.expander("Full data table", expanded=False):
+        st.dataframe(df.head(OW_FINAL_RESEARCH_DISPLAY_ROWS), use_container_width=True, hide_index=True)
     _ow_render_copy_paste_slate(df, "Batter Strong Plays", "batter_strong", max_rows=12)
 
     names = df["Player"].dropna().astype(str).tolist()
