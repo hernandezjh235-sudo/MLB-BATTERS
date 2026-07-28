@@ -27570,7 +27570,7 @@ def build_v3_batter_upside_board_final():
 
 def render_v3_top_batter_plays_board():
     st.markdown('<div class="section-title-pro">🔥 Batter Strong Plays — H+R+RBI + Home Runs</div>', unsafe_allow_html=True)
-    st.caption("Only active Underdog H+R+RBI or Home Runs lines are shown. Sorted by Likely Score first: win/hit probability, edge, data confidence, clean risk flags, verified pitcher matchup, lineup, and PA.")
+    st.caption("Only active Underdog H+R+RBI and Home Runs lines are shown. Sorted by Likely Score first across all pulled games: win/hit probability, edge, data confidence, clean risk flags, verified pitcher matchup, lineup, and PA.")
     df = build_v3_batter_upside_board_final()
     if not isinstance(df, pd.DataFrame) or df.empty:
         st.info("No active Underdog batter lines matched yet. Refresh after the board posts.")
@@ -27989,6 +27989,28 @@ def _ow_ud_market(blob):
     return None
 
 
+def _ow_ud_market_label(market):
+    return {
+        "HRR": "H+R+RBI",
+        "HR": "Home Runs",
+    }.get(str(market or "").upper(), str(market or "Batter"))
+
+
+def _ow_ud_market_line_ok(market, line):
+    line = _v3_safe_num(line, None)
+    if line is None:
+        return False
+    market = str(market or "").upper()
+    ranges = {
+        "HR": (0.5, 2.5),
+        "HRR": (0.5, 6.5),
+    }
+    if market not in ranges:
+        return False
+    lo, hi = ranges[market]
+    return lo <= float(line) <= hi
+
+
 def _ow_ud_line_value(*objects):
     keys = (
         "stat_value", "statValue", "line", "over_under_line", "overUnderLine",
@@ -28014,6 +28036,11 @@ def _ow_clean_ud_player(value):
         r"\s+Hits\s*\+\s*Runs\s*\+\s*RBIs?.*$",
         r"\s+H\s*\+\s*R\s*\+\s*R(?:BI)?.*$",
         r"\s+(?:Batter\s+)?Home\s+Runs?.*$",
+        r"\s+(?:Batter\s+)?Total\s+Bases.*$",
+        r"\s+(?:Batter\s+)?Runs\s+Batted\s+In.*$",
+        r"\s+(?:Batter\s+)?RBIs?.*$",
+        r"\s+(?:Batter\s+)?Runs.*$",
+        r"\s+(?:Batter\s+)?Hits.*$",
         r"\s+Over/Under.*$",
         r"\s+O/U.*$",
         r"\s+(?:Higher|Lower|Over|Under).*$",
@@ -28103,9 +28130,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 line = _ow_ud_line_value(line_obj)
                 if line is None:
                     continue
-                if market == "HR" and not (0.5 <= line <= 2.5):
-                    continue
-                if market == "HRR" and not (0.5 <= line <= 6.5):
+                if not _ow_ud_market_line_ok(market, line):
                     continue
                 player = _ow_ud_player_name(player_obj) or _ow_ud_player_name(line_obj, ou_obj)
                 if not player:
@@ -28113,8 +28138,8 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 rows.append({
                     "Source": "Underdog",
                     "Player": player,
-                    "Market": "HRR" if market == "HRR" else "Home Runs",
-                    "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+                    "Market": "HRR" if market == "HRR" else _ow_ud_market_label(market),
+                    "Market Label": _ow_ud_market_label(market),
                     "Line": float(line),
                     "Evidence": blob[:350],
                     "Line ID": str(line_obj.get("id", "")),
@@ -28151,9 +28176,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             line = _ow_ud_line_value(line_obj, ou_obj, app_obj)
             if line is None:
                 continue
-            if market == "HR" and not (0.5 <= line <= 2.5):
-                continue
-            if market == "HRR" and not (0.5 <= line <= 6.5):
+            if not _ow_ud_market_line_ok(market, line):
                 continue
             player = _ow_ud_player_name(player_obj, app_obj, ou_obj, line_obj)
             if not player:
@@ -28161,8 +28184,8 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             rows.append({
                 "Source": "Underdog",
                 "Player": player,
-                "Market": "HRR" if market == "HRR" else "Home Runs",
-                "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+                "Market": "HRR" if market == "HRR" else _ow_ud_market_label(market),
+                "Market Label": _ow_ud_market_label(market),
                 "Line": float(line),
                 "Evidence": blob[:350],
                 "Line ID": str(line_obj.get("id", "")),
@@ -28177,9 +28200,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             line = _ow_ud_line_value(obj)
             if line is None:
                 continue
-            if market == "HR" and not (0.5 <= line <= 2.5):
-                continue
-            if market == "HRR" and not (0.5 <= line <= 6.5):
+            if not _ow_ud_market_line_ok(market, line):
                 continue
             player = _ow_ud_player_name(obj)
             if not player:
@@ -28194,17 +28215,17 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 rows.append({
                     "Source": "Underdog",
                     "Player": player,
-                    "Market": "HRR" if market == "HRR" else "Home Runs",
-                    "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+                    "Market": "HRR" if market == "HRR" else _ow_ud_market_label(market),
+                    "Market Label": _ow_ud_market_label(market),
                     "Line": float(line),
                     "Evidence": "flattened fallback: " + blob[:320],
                     "Line ID": str(obj.get("id", "")),
                 })
-        break
+        continue
 
     dedup = {}
     for row in rows:
-        key = (_v3_norm_name(row.get("Player")), row.get("Market"))
+        key = (_v3_norm_name(row.get("Player")), row.get("Market"), _v3_safe_num(row.get("Line"), None))
         if key not in dedup or row.get("Line ID"):
             dedup[key] = row
     out = list(dedup.values())
@@ -28256,7 +28277,7 @@ OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_STRONG_PLAYS_PA_OUTCOME_SIM_2026_07
 OW_BATTER_PICK_LOG = os.path.join(STORAGE_DIR, "ow_batter_pick_log.json")
 OW_BATTER_RESULT_LOG = os.path.join(STORAGE_DIR, "ow_batter_result_log.json")
 OW_BATTER_LINE_TRACKER_FILE = os.path.join(STORAGE_DIR, "ow_batter_line_tracker.json")
-OW_FINAL_MAX_PROJECTED_LINES = 80
+OW_FINAL_MAX_PROJECTED_LINES = 200
 OW_FINAL_RESEARCH_DISPLAY_ROWS = 160
 
 OW_FINAL_PARK_FACTORS = {
