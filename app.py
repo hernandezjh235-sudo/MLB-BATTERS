@@ -27847,6 +27847,7 @@ def render_v3_settings_tab():
 # from the previous batter-only file for H+R+RBI and Home Runs.
 # =========================
 OW_FINAL_UD_BATTER_LINE_PARSER_VERSION = "OW_FINAL_UD_BATTER_LINES_V7_HRR_HR_2026_07_21"
+OW_FINAL_UD_BATTER_ENDPOINT_SCAN_LIMIT = 3
 
 
 def _ow_ud_attrs(obj):
@@ -28094,8 +28095,10 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
         "sample_market_text": [],
     }
     headers = {"Origin": "https://underdogfantasy.com", "Referer": "https://underdogfantasy.com/"}
-    for url in UNDERDOG_URLS:
-        payload = safe_get_json(url, timeout=18, headers=headers)
+    for idx, url in enumerate(UNDERDOG_URLS):
+        if idx >= OW_FINAL_UD_BATTER_ENDPOINT_SCAN_LIMIT and rows:
+            break
+        payload = safe_get_json(url, timeout=10, headers=headers)
         if not payload:
             continue
         debug["endpoint"] = url
@@ -28277,7 +28280,7 @@ OW_FINAL_LINE_PROJECTION_VERSION = "OW_FINAL_STRONG_PLAYS_PA_OUTCOME_SIM_2026_07
 OW_BATTER_PICK_LOG = os.path.join(STORAGE_DIR, "ow_batter_pick_log.json")
 OW_BATTER_RESULT_LOG = os.path.join(STORAGE_DIR, "ow_batter_result_log.json")
 OW_BATTER_LINE_TRACKER_FILE = os.path.join(STORAGE_DIR, "ow_batter_line_tracker.json")
-OW_FINAL_MAX_PROJECTED_LINES = 200
+OW_FINAL_MAX_PROJECTED_LINES = 120
 OW_FINAL_RESEARCH_DISPLAY_ROWS = 160
 
 OW_FINAL_PARK_FACTORS = {
