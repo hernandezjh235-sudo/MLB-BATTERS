@@ -26960,11 +26960,11 @@ def render_v3_home_run_tab():
     c3.metric("A/A+ Spots", aa)
     c4.metric("Mode", "UD HR + fallback" if isinstance(meta, dict) and meta.get("ud_rows",0) else "Projection")
     cols=[c for c in ["Player","Team","Opponent","Matchup","Market","Line","Pick","HR Probability %","HR Grade","Projected PA","Opp Pitcher","Pitcher Hand","Pitcher HR9","L7 HR","L15 HR","L30 HR","xHR L15","Due Gap","Due Label","Official Play Filter"] if c in df.columns]
-    for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note"]:
+    for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note", "Pitcher Run/Contact Factor", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Line Opportunity Class", "Pitcher Run/Contact Note"]:
         if c in df.columns and c not in cols:
             anchor = cols.index("Pitch Mix Matchup Factor") if "Pitch Mix Matchup Factor" in cols else len(cols)
             cols.insert(anchor, c)
-    for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note"]:
+    for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note", "Pitcher Run/Contact Factor", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Line Opportunity Class", "Pitcher Run/Contact Note"]:
         if c in df.columns and c not in cols:
             anchor = cols.index("Pitch Mix Matchup Factor") if "Pitch Mix Matchup Factor" in cols else len(cols)
             cols.insert(anchor, c)
@@ -28282,6 +28282,12 @@ def _ow_local_context_file_candidates(kind):
         "bullpen_handedness": [
             "bullpen_handedness.csv", "bullpen_splits.csv", "bullpen_vs_hand.csv", "mlb_bullpen_handedness.csv"
         ],
+        "pitcher_logs": [
+            "Pitch.csv", "pitch.csv", "Pitcher.csv", "pitcher_game_logs.csv", "pitcher_logs.csv"
+        ],
+        "graded_history": [
+            "graded_history.csv", "pitcher_graded_history.csv", "grades.csv"
+        ],
     }.get(str(kind or ""), [])
     roots = [
         "/Users/j/Desktop",
@@ -29448,6 +29454,169 @@ def _ow_bullpen_handedness_context(team, batter_hand=None, market="HRR"):
     return out
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_local_pitcher_recent_log_context(pitcher_name):
+    out = {
+        "Pitcher Recent Log Source": "MISSING",
+        "Pitcher Recent Games": 0,
+        "Pitcher Recent IP/G": None,
+        "Pitcher Recent BF/G": None,
+        "Pitcher Recent H/9": None,
+        "Pitcher Recent ER/9": None,
+        "Pitcher Recent HR/9": None,
+        "Pitcher Recent BB/9": None,
+        "Pitcher Recent WHIP": None,
+        "Pitcher Recent K%": None,
+        "Pitcher Recent Contact Damage Score": None,
+        "Pitcher Recent Leash Label": "UNKNOWN",
+        "Pitcher Recent Note": "Pitcher recent logs unavailable",
+    }
+    try:
+        target = _v3_norm_name(pitcher_name)
+        if not target:
+            return out
+        for path in _ow_local_context_file_candidates("pitcher_logs"):
+            if not os.path.exists(path):
+                continue
+            try:
+                df = pd.read_csv(path, low_memory=False)
+            except Exception:
+                continue
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            pcol = _v3_col(df, ["Pitcher", "Player", "Name", "player_name"])
+            if not pcol:
+                continue
+            d = df[df[pcol].map(_v3_norm_name) == target].copy()
+            if d.empty:
+                names = df[pcol].dropna().astype(str).head(3000).tolist()
+                close = difflib.get_close_matches(str(pitcher_name), names, n=1, cutoff=0.88)
+                if close:
+                    d = df[df[pcol].astype(str) == close[0]].copy()
+            if d.empty:
+                continue
+            date_col = _v3_col(d, ["Date", "Game Date", "date"])
+            if date_col:
+                d["_ow_date"] = pd.to_datetime(d[date_col], errors="coerce")
+                d = d.sort_values("_ow_date")
+            d = d.tail(10)
+            def _ser(names):
+                col = _v3_col(d, names)
+                return pd.to_numeric(d[col], errors="coerce").fillna(0) if col else pd.Series(dtype=float)
+            ip = _ser(["IP", "Innings Pitched"])
+            bf = _ser(["BF", "Batters Faced"])
+            h = _ser(["H", "Hits"])
+            er = _ser(["ER", "Earned Runs"])
+            hr = _ser(["HR", "Home Runs"])
+            bb = _ser(["BB", "Walks"])
+            k = _ser(["K", "SO", "Strikeouts"])
+            ip_sum = float(ip.sum()) if len(ip) else 0.0
+            bf_sum = float(bf.sum()) if len(bf) else 0.0
+            games = int(len(d))
+            h9 = float(h.sum()) / ip_sum * 9 if ip_sum > 0 and len(h) else None
+            er9 = float(er.sum()) / ip_sum * 9 if ip_sum > 0 and len(er) else None
+            hr9 = float(hr.sum()) / ip_sum * 9 if ip_sum > 0 and len(hr) else None
+            bb9 = float(bb.sum()) / ip_sum * 9 if ip_sum > 0 and len(bb) else None
+            whip = (float(h.sum()) + float(bb.sum())) / ip_sum if ip_sum > 0 and len(h) and len(bb) else None
+            kp = float(k.sum()) / bf_sum * 100 if bf_sum > 0 and len(k) else None
+            score = 50.0
+            notes = []
+            if h9 is not None:
+                score += clamp((h9 - 8.2) * 4.3, -12, 16)
+                notes.append(f"L{games} H/9 {h9:.1f}")
+            if er9 is not None:
+                score += clamp((er9 - 4.2) * 3.6, -10, 14)
+            if whip is not None:
+                score += clamp((whip - 1.28) * 26, -10, 14)
+                notes.append(f"L{games} WHIP {whip:.2f}")
+            if kp is not None:
+                score += clamp((21.5 - kp) * 1.0, -10, 10)
+                notes.append(f"L{games} K {kp:.1f}%")
+            if hr9 is not None:
+                score += clamp((hr9 - 1.1) * 5.5, -6, 10)
+            ip_g = float(ip.mean()) if len(ip) else None
+            bf_g = float(bf.mean()) if len(bf) else None
+            leash = "SHORT" if ip_g is not None and ip_g < 4.6 else "LONG" if ip_g is not None and ip_g >= 5.8 else "NORMAL"
+            out.update({
+                "Pitcher Recent Log Source": os.path.basename(path),
+                "Pitcher Recent Games": games,
+                "Pitcher Recent IP/G": None if ip_g is None else round(ip_g, 2),
+                "Pitcher Recent BF/G": None if bf_g is None else round(bf_g, 1),
+                "Pitcher Recent H/9": None if h9 is None else round(h9, 2),
+                "Pitcher Recent ER/9": None if er9 is None else round(er9, 2),
+                "Pitcher Recent HR/9": None if hr9 is None else round(hr9, 2),
+                "Pitcher Recent BB/9": None if bb9 is None else round(bb9, 2),
+                "Pitcher Recent WHIP": None if whip is None else round(whip, 3),
+                "Pitcher Recent K%": None if kp is None else round(kp, 1),
+                "Pitcher Recent Contact Damage Score": int(round(clamp(score, 0, 100))),
+                "Pitcher Recent Leash Label": leash,
+                "Pitcher Recent Note": ", ".join(notes[:5]) if notes else f"Recent pitcher logs loaded from {os.path.basename(path)}",
+            })
+            return out
+    except Exception:
+        return out
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_local_pitcher_graded_history_context(pitcher_name):
+    out = {
+        "Pitcher K App Grade Source": "MISSING",
+        "Pitcher K App Samples": 0,
+        "Pitcher K App Win Rate %": None,
+        "Pitcher K App Avg Actual K": None,
+        "Pitcher K App Avg IP": None,
+        "Pitcher K App Reliability Label": "UNKNOWN",
+        "Pitcher K App Note": "Pitcher K graded history unavailable",
+    }
+    try:
+        target = _v3_norm_name(pitcher_name)
+        if not target:
+            return out
+        for path in _ow_local_context_file_candidates("graded_history"):
+            if not os.path.exists(path):
+                continue
+            try:
+                df = pd.read_csv(path, low_memory=False)
+            except Exception:
+                continue
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            pcol = _v3_col(df, ["Pitcher", "Player", "Name"])
+            if not pcol:
+                continue
+            d = df[df[pcol].map(_v3_norm_name) == target].copy()
+            if d.empty:
+                continue
+            date_col = _v3_col(d, ["Date", "Game Date", "date"])
+            if date_col:
+                d["_ow_date"] = pd.to_datetime(d[date_col], errors="coerce")
+                d = d.sort_values("_ow_date")
+            d = d.tail(20)
+            res_col = _v3_col(d, ["Result", "graded_result", "Grade Result"])
+            k_col = _v3_col(d, ["Actual_K", "Actual K", "K", "Strikeouts"])
+            ip_col = _v3_col(d, ["Actual_IP", "Actual IP", "IP"])
+            samples = int(len(d))
+            wins = int(d[res_col].astype(str).str.upper().str.contains("WIN", regex=False).sum()) if res_col else None
+            win_rate = (wins / samples * 100) if wins is not None and samples else None
+            avg_k = _v3_safe_num(pd.to_numeric(d[k_col], errors="coerce").mean(), None) if k_col else None
+            avg_ip = _v3_safe_num(pd.to_numeric(d[ip_col], errors="coerce").mean(), None) if ip_col else None
+            label = "K_SUPPRESSOR" if avg_k is not None and avg_k >= 6.8 else "CONTACT_FRIENDLY" if avg_k is not None and avg_k <= 4.2 else "NEUTRAL"
+            out.update({
+                "Pitcher K App Grade Source": os.path.basename(path),
+                "Pitcher K App Samples": samples,
+                "Pitcher K App Win Rate %": None if win_rate is None else round(win_rate, 1),
+                "Pitcher K App Avg Actual K": None if avg_k is None else round(avg_k, 2),
+                "Pitcher K App Avg IP": None if avg_ip is None else round(avg_ip, 2),
+                "Pitcher K App Reliability Label": label,
+                "Pitcher K App Note": f"K app history {samples} samples; avg K {avg_k:.1f}" if avg_k is not None else f"K app history {samples} samples",
+            })
+            return out
+    except Exception:
+        return out
+    return out
+
+
 def _ow_batter_wrc_proxy_from_ops(avg=None, obp=None, slg=None, ops=None):
     ops_val = _v3_safe_num(ops, None)
     if ops_val is None:
@@ -29799,11 +29968,14 @@ def _ow_pitcher_stuff_context(pitcher_id):
         "Pitcher Stuff Note": "Statcast pitcher stuff unavailable",
         "Pitcher Pitch Type Profile": [],
     }
-    if not pitcher_id or "get_statcast_pitch_profile" not in globals():
+    if not pitcher_id:
         return empty
     try:
-        sp = get_statcast_pitch_profile(pitcher_id, days=365) or {}
+        sp = get_statcast_pitch_profile(pitcher_id, days=365) if "get_statcast_pitch_profile" in globals() else {}
         if not sp.get("available"):
+            local = _ow_local_pitcher_savant_stuff_context(pitcher_id) if "_ow_local_pitcher_savant_stuff_context" in globals() else {}
+            if local:
+                return {**empty, **local}
             return empty
         csw = safe_float(sp.get("csw"), None)
         whiff = safe_float(sp.get("whiff"), None)
@@ -30235,8 +30407,52 @@ def _ow_savant_col(df, names):
     return None
 
 
+def _ow_local_savant_candidate_paths(kind="batter"):
+    names_by_kind = {
+        "batter": [
+            "Batter.csv",
+            "batter_profiles.csv",
+            "cleaned_batting_stats.csv",
+            "savant_batter_stats.csv",
+            "savant_hitter_stats.csv",
+            "savant_data.csv",
+        ],
+        "pitcher": [
+            "savant_pitcher_stats.csv",
+            "pitcher_profiles.csv",
+            "savant_pitch_level_heatmap_foul.csv",
+            "savant_pitcher_pitch_level.csv",
+            "savant_data (3).csv",
+            "pitch_mix_matchups.csv",
+        ],
+    }.get(str(kind or "batter").lower(), [])
+    roots = [
+        "/Users/j/Desktop",
+        "/Users/j/Downloads",
+        "/Users/j/Documents/Codex/data",
+        "/Users/j/Documents/Codex/data/raw",
+        os.path.join(os.getcwd(), "data"),
+        os.path.join(os.getcwd(), "data", "raw"),
+    ]
+    out = []
+    for root in roots:
+        for nm in names_by_kind:
+            out.append(os.path.join(root, nm))
+    return out
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def _ow_baseball_savant_leaderboard(kind="batter", season=2026):
+    for path in _ow_local_savant_candidate_paths(kind):
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path, low_memory=False)
+            if isinstance(df, pd.DataFrame) and not df.empty and len(df.columns) >= 4:
+                df["_OW Savant URL"] = f"LOCAL:{os.path.basename(path)}"
+                return df
+        except Exception:
+            continue
     urls = [
         f"https://baseballsavant.mlb.com/leaderboard/statcast?type={kind}&year={season}&csv=true",
         f"https://baseballsavant.mlb.com/leaderboard/statcast?type={kind}&season={season}&csv=true",
@@ -30299,6 +30515,179 @@ def _ow_savant_num(row, *names):
                 if val is not None:
                     return val
     return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_local_pitcher_savant_stuff_context(pitcher_id):
+    out = {}
+    try:
+        if not pitcher_id:
+            return out
+        rows = []
+        for path in _ow_local_savant_candidate_paths("pitcher"):
+            if not os.path.exists(path):
+                continue
+            try:
+                df = pd.read_csv(path, low_memory=False)
+            except Exception:
+                continue
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            pid_col = _ow_savant_col(df, ["player_id", "pitcher_id", "id"])
+            if not pid_col:
+                continue
+            d = df[pd.to_numeric(df[pid_col], errors="coerce") == float(pitcher_id)].copy()
+            if d.empty:
+                continue
+            pa_col = _ow_savant_col(d, ["pa", "pitches", "total_pitches"])
+            if pa_col:
+                d["_ow_sort"] = pd.to_numeric(d[pa_col], errors="coerce").fillna(0)
+                d = d.sort_values("_ow_sort", ascending=False)
+            rr = d.iloc[0].to_dict()
+            rr["_OW Local Savant Source"] = os.path.basename(path)
+            rows.append(rr)
+        if not rows:
+            df = _ow_baseball_savant_leaderboard("pitcher", datetime.utcnow().year)
+            pid_col = _ow_savant_col(df, ["player_id", "pitcher_id", "id"]) if isinstance(df, pd.DataFrame) else None
+            if not pid_col:
+                return out
+            d = df[pd.to_numeric(df[pid_col], errors="coerce") == float(pitcher_id)].copy()
+            if d.empty:
+                return out
+            rows.append(d.iloc[0].to_dict())
+
+        def _first_num(*names):
+            for rr in rows:
+                val = _ow_savant_num(rr, *names)
+                if val is not None:
+                    return val
+            return None
+
+        row = rows[0]
+        whiff = _first_num("whiff_percent", "swing_miss_percent", "whiff%")
+        kp = _first_num("k_percent", "k%")
+        bbp = _first_num("bb_percent", "bb%")
+        xwoba = _first_num("xwoba", "est_woba", "est woba")
+        xba = _first_num("xba", "est_ba", "est ba")
+        xslg = _first_num("xslg", "est_slg", "est slg")
+        hardhit = _first_num("hard_hit_percent", "hardhit_percent", "hardhit%")
+        barrel = _first_num("barrel_batted_rate", "barrels_per_bbe_percent", "barrel%")
+        ev = _first_num("avg_best_speed", "avg_hyper_speed", "launch_speed", "avg ev")
+        pitches = _first_num("pitches", "total_pitches", "pa")
+        if whiff is not None and 0 < whiff <= 1:
+            whiff *= 100
+        if kp is not None and 0 < kp <= 1:
+            kp *= 100
+        if bbp is not None and 0 < bbp <= 1:
+            bbp *= 100
+        if hardhit is not None and 0 < hardhit <= 1:
+            hardhit *= 100
+        if barrel is not None and 0 < barrel <= 1:
+            barrel *= 100
+        hrr_factor = 1.0
+        hr_factor = 1.0
+        notes = []
+        if kp is not None:
+            if kp <= 18:
+                hrr_factor *= 1.030
+                hr_factor *= 1.018
+                notes.append(f"local Savant low K {kp:.1f}%")
+            elif kp >= 28:
+                hrr_factor *= 0.965
+                hr_factor *= 0.975
+                notes.append(f"local Savant K suppressor {kp:.1f}%")
+        if whiff is not None:
+            if whiff <= 22:
+                hrr_factor *= 1.030
+                hr_factor *= 1.020
+                notes.append(f"local low whiff {whiff:.1f}%")
+            elif whiff >= 31:
+                hrr_factor *= 0.965
+                hr_factor *= 0.970
+        if xwoba is not None:
+            if xwoba >= 0.360:
+                hrr_factor *= 1.025
+                hr_factor *= 1.035
+                notes.append(f"local xwOBA allowed {xwoba:.3f}")
+            elif xwoba <= 0.295:
+                hrr_factor *= 0.985
+                hr_factor *= 0.975
+        if xslg is not None and xslg >= 0.470:
+            hr_factor *= 1.040
+            notes.append(f"local xSLG allowed {xslg:.3f}")
+        if hardhit is not None and hardhit >= 45:
+            hrr_factor *= 1.010
+            hr_factor *= 1.030
+            notes.append(f"local hard-hit allowed {hardhit:.1f}%")
+        if barrel is not None and barrel >= 9:
+            hr_factor *= 1.050
+            notes.append(f"local barrel allowed {barrel:.1f}%")
+
+        profiles = []
+        try:
+            mix_path = "/Users/j/Desktop/pitch_mix_matchups.csv"
+            if os.path.exists(mix_path):
+                mix = pd.read_csv(mix_path, low_memory=False)
+                mpid = _ow_savant_col(mix, ["player_id", "pitcher_id", "id"])
+                if mpid:
+                    md = mix[pd.to_numeric(mix[mpid], errors="coerce") == float(pitcher_id)].copy()
+                    for _, mr in md.head(12).iterrows():
+                        profiles.append({
+                            "Pitch Type": mr.get("pitch_type") or mr.get("pitch_name"),
+                            "Pitch Name": mr.get("pitch_name") or mr.get("pitch_type"),
+                            "Usage %": _v3_safe_num(mr.get("pitch_usage"), None),
+                            "Pitcher Whiff%": _v3_safe_num(mr.get("whiff_percent"), None),
+                            "Pitcher K%": _v3_safe_num(mr.get("k_percent"), None),
+                            "Pitcher wOBA": _v3_safe_num(mr.get("woba"), None),
+                            "Pitcher xwOBA": _v3_safe_num(mr.get("est_woba"), None),
+                            "Pitcher HardHit%": _v3_safe_num(mr.get("hard_hit_percent"), None),
+                        })
+        except Exception:
+            profiles = []
+        primary = "—"
+        if profiles:
+            profiles = sorted(profiles, key=lambda r: _v3_safe_num(r.get("Usage %"), 0) or 0, reverse=True)
+            primary = profiles[0].get("Pitch Type") or profiles[0].get("Pitch Name") or "—"
+        slider_usage = 0.0
+        slider_whiffs = []
+        for pr in profiles:
+            txt = f"{pr.get('Pitch Type','')} {pr.get('Pitch Name','')}".upper()
+            if any(x in txt for x in ["SL", "SLIDER", "SWEEPER", "ST"]):
+                slider_usage += _v3_safe_num(pr.get("Usage %"), 0) or 0
+                w = _v3_safe_num(pr.get("Pitcher Whiff%"), None)
+                if w is not None:
+                    slider_whiffs.append(w)
+        slider_whiff = float(np.mean(slider_whiffs)) if slider_whiffs else None
+        if slider_usage >= 32 and slider_whiff is not None:
+            if slider_whiff >= 34:
+                hrr_factor *= 0.975
+                hr_factor *= 0.960
+                notes.append(f"local slider/sweeper miss pitch {slider_usage:.1f}%")
+            elif slider_whiff <= 25:
+                hr_factor *= 1.030
+
+        out.update({
+            "Pitcher Whiff%": None if whiff is None else round(whiff, 1),
+            "Pitcher K%": None if kp is None else round(kp, 1),
+            "Pitcher BB%": None if bbp is None else round(bbp, 1),
+            "Pitcher Allowed BBE": None if pitches is None else int(round(pitches)),
+            "Pitcher Allowed Avg EV": None if ev is None else round(ev, 1),
+            "Pitcher Allowed HardHit%": None if hardhit is None else round(hardhit, 1),
+            "Pitcher Allowed Barrel%": None if barrel is None else round(barrel, 1),
+            "Pitcher Allowed xwOBA": None if xwoba is None else round(xwoba, 3),
+            "Pitcher Allowed xBA": None if xba is None else round(xba, 3),
+            "Pitcher Allowed xSLG": None if xslg is None else round(xslg, 3),
+            "Slider/Sweeper Usage %": round(slider_usage, 1) if slider_usage else None,
+            "Slider/Sweeper Whiff%": None if slider_whiff is None else round(slider_whiff, 1),
+            "Primary Pitch": primary,
+            "Pitcher Stuff Factor HRR": round(float(clamp(hrr_factor, 0.90, 1.08)), 3),
+            "Pitcher Stuff Factor HR": round(float(clamp(hr_factor, 0.88, 1.10)), 3),
+            "Pitcher Stuff Note": ", ".join(notes) if notes else "Local Savant pitcher profile neutral",
+            "Pitcher Pitch Type Profile": profiles,
+        })
+        return out
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -30684,6 +31073,14 @@ def _ow_pitcher_matchup_factors(team):
             pctx[key] = value
     stuff = _ow_pitcher_stuff_context(pctx.get("Pitcher ID"))
     pctx.update(stuff)
+    recent_ctx = _ow_local_pitcher_recent_log_context(pctx.get("Opp Pitcher"))
+    for key, value in recent_ctx.items():
+        if value not in (None, "", "—", "MISSING"):
+            pctx[key] = value
+    grade_ctx = _ow_local_pitcher_graded_history_context(pctx.get("Opp Pitcher"))
+    for key, value in grade_ctx.items():
+        if value not in (None, "", "—", "MISSING"):
+            pctx[key] = value
     hr9 = _v3_safe_num(pctx.get("Pitcher HR9"), None)
     kp = _v3_safe_num(pctx.get("Pitcher K%"), None)
     era = _v3_safe_num(pctx.get("Pitcher ERA"), None)
@@ -31087,6 +31484,223 @@ def _ow_pitcher_contact_leash_context(pctx, bpctx=None, lineup_ctx=None, market=
     except Exception:
         pass
     return out
+
+
+def _ow_pitcher_run_contact_damage_context(pctx, pitcher_split_ctx=None, market="HRR"):
+    """Pitcher profile for batter overs/unders: hits, traffic, run damage, contact, and power."""
+    out = {
+        "Pitcher Run/Contact Factor HRR": 1.0,
+        "Pitcher Run/Contact Factor HR": 1.0,
+        "Pitcher Allows Hits Score": 50,
+        "Pitcher Run/RBI Traffic Score": 50,
+        "Pitcher Contact Allowed Score": 50,
+        "Pitcher Power Damage Score": 50,
+        "Pitcher Under Suppression Score": 50,
+        "Pitcher Run/Contact Score": 50,
+        "Pitcher Run/Contact Label": "NEUTRAL",
+        "Pitcher Run/Contact Note": "Pitcher run/contact profile neutral",
+        "Pitcher Line Opportunity Class": "STANDARD",
+    }
+    try:
+        p = pctx or {}
+        sp = pitcher_split_ctx or {}
+        h9 = _v3_safe_num(p.get("Pitcher H/9"), None)
+        whip = _v3_safe_num(p.get("Pitcher WHIP"), None)
+        baa = _v3_safe_num(p.get("Pitcher BAA"), None)
+        era = _v3_safe_num(p.get("Pitcher ERA"), None)
+        fip = _v3_safe_num(p.get("Pitcher FIP"), None)
+        xfip = _v3_safe_num(p.get("Pitcher xFIP"), None)
+        siera = _v3_safe_num(p.get("Pitcher SIERA"), None)
+        bb9 = _v3_safe_num(p.get("Pitcher BB/9"), None)
+        hr9 = _v3_safe_num(p.get("Pitcher HR9"), None)
+        kp = _v3_safe_num(p.get("Pitcher K%"), None)
+        csw = _v3_safe_num(p.get("Pitcher CSW%"), None)
+        whiff = _v3_safe_num(p.get("Pitcher Whiff%"), None)
+        zone_contact = _v3_safe_num(p.get("Pitcher Zone Contact%"), None)
+        xwoba = _v3_safe_num(p.get("Pitcher Allowed xwOBA"), None)
+        xba = _v3_safe_num(p.get("Pitcher Allowed xBA"), None)
+        xslg = _v3_safe_num(p.get("Pitcher Allowed xSLG"), None)
+        hardhit = _v3_safe_num(p.get("Pitcher Allowed HardHit%"), None)
+        barrel = _v3_safe_num(p.get("Pitcher Allowed Barrel%"), None)
+        recent_score = _v3_safe_num(p.get("Pitcher Recent Contact Damage Score"), None)
+        recent_h9 = _v3_safe_num(p.get("Pitcher Recent H/9"), None)
+        recent_er9 = _v3_safe_num(p.get("Pitcher Recent ER/9"), None)
+        recent_whip = _v3_safe_num(p.get("Pitcher Recent WHIP"), None)
+        recent_kp = _v3_safe_num(p.get("Pitcher Recent K%"), None)
+        k_app_avg = _v3_safe_num(p.get("Pitcher K App Avg Actual K"), None)
+        k_app_label = str(p.get("Pitcher K App Reliability Label") or "").upper()
+        split_baa = _v3_safe_num(sp.get("Pitcher Split BAA"), None)
+        split_obp = _v3_safe_num(sp.get("Pitcher Split OBP"), None)
+        split_ops = _v3_safe_num(sp.get("Pitcher Split OPS"), None)
+        split_k = _v3_safe_num(sp.get("Pitcher Split K%"), None)
+        split_hrp = _v3_safe_num(sp.get("Pitcher Split HR%"), None)
+
+        hits_score = 50.0
+        traffic_score = 50.0
+        contact_score = 50.0
+        power_score = 50.0
+        notes = []
+
+        if h9 is not None:
+            hits_score += clamp((h9 - 8.2) * 5.5, -14, 18)
+            if h9 >= 9.2:
+                notes.append(f"H/9 attack {h9:.1f}")
+            elif h9 <= 7.1:
+                notes.append(f"H/9 suppressor {h9:.1f}")
+        if baa is not None:
+            hits_score += clamp((baa - 0.245) * 155, -16, 18)
+            if baa >= 0.270:
+                notes.append(f"BAA hit-friendly {baa:.3f}")
+            elif baa <= 0.215:
+                notes.append(f"BAA under-friendly {baa:.3f}")
+        if xba is not None:
+            hits_score += clamp((xba - 0.245) * 115, -10, 13)
+        if split_baa is not None:
+            hits_score += clamp((split_baa - 0.245) * 95, -9, 12)
+            notes.append(f"split BAA {split_baa:.3f}")
+
+        if whip is not None:
+            traffic_score += clamp((whip - 1.28) * 38, -16, 20)
+            if whip >= 1.38:
+                notes.append(f"WHIP traffic {whip:.2f}")
+            elif whip <= 1.08:
+                notes.append(f"low traffic WHIP {whip:.2f}")
+        if era is not None:
+            traffic_score += clamp((era - 4.15) * 5.5, -13, 16)
+            if era >= 5.00:
+                notes.append(f"ERA run damage {era:.2f}")
+        run_estimates = [v for v in [fip, xfip, siera] if v is not None]
+        if run_estimates:
+            run_est = float(np.mean(run_estimates))
+            traffic_score += clamp((run_est - 4.10) * 4.2, -9, 12)
+            if run_est >= 4.70:
+                notes.append(f"run estimators weak {run_est:.2f}")
+            elif run_est <= 3.45:
+                notes.append(f"run estimators strong {run_est:.2f}")
+        if bb9 is not None:
+            traffic_score += clamp((bb9 - 2.8) * 4.4, -8, 12)
+            if bb9 >= 3.7:
+                notes.append(f"BB/9 traffic {bb9:.1f}")
+        if split_obp is not None:
+            traffic_score += clamp((split_obp - 0.315) * 70, -7, 10)
+
+        if kp is not None:
+            contact_score += clamp((21.5 - kp) * 1.9, -17, 16)
+            if kp <= 18:
+                notes.append(f"low K balls-in-play {kp:.1f}%")
+            elif kp >= 27:
+                notes.append(f"K suppressor {kp:.1f}%")
+        if whiff is not None:
+            contact_score += clamp((25.0 - whiff) * 1.45, -13, 13)
+            if whiff <= 22:
+                notes.append(f"low whiff {whiff:.1f}%")
+        if csw is not None:
+            contact_score += clamp((28.0 - csw) * 1.45, -12, 11)
+            if csw <= 25:
+                notes.append(f"low CSW {csw:.1f}%")
+        if zone_contact is not None:
+            contact_score += clamp((zone_contact - 84.5) * 1.75, -10, 12)
+            if zone_contact >= 88:
+                notes.append(f"high zone contact {zone_contact:.1f}%")
+        if split_k is not None:
+            contact_score += clamp((21.5 - split_k) * 1.05, -7, 8)
+
+        if hr9 is not None:
+            power_score += clamp((hr9 - 1.05) * 14, -15, 22)
+            if hr9 >= 1.45:
+                notes.append(f"HR/9 damage {hr9:.2f}")
+        if xwoba is not None:
+            hits_score += clamp((xwoba - 0.320) * 60, -9, 11)
+            traffic_score += clamp((xwoba - 0.320) * 52, -8, 10)
+            if xwoba >= 0.365:
+                notes.append(f"xwOBA allowed {xwoba:.3f}")
+        if xslg is not None:
+            power_score += clamp((xslg - 0.410) * 70, -13, 18)
+            if xslg >= 0.470:
+                notes.append(f"xSLG allowed {xslg:.3f}")
+        if hardhit is not None:
+            power_score += clamp((hardhit - 39.0) * 0.85, -8, 11)
+            if hardhit >= 45:
+                notes.append(f"hard-hit allowed {hardhit:.1f}%")
+        if barrel is not None:
+            power_score += clamp((barrel - 7.5) * 2.1, -8, 13)
+            if barrel >= 9:
+                notes.append(f"barrel allowed {barrel:.1f}%")
+        if split_ops is not None:
+            power_score += clamp((split_ops - 0.720) * 24, -7, 10)
+            traffic_score += clamp((split_ops - 0.720) * 16, -5, 7)
+        if split_hrp is not None:
+            power_score += clamp((split_hrp - 2.7) * 2.2, -5, 8)
+        if recent_score is not None:
+            recent_adj = clamp((recent_score - 50) * 0.22, -8, 10)
+            hits_score += recent_adj * 0.40
+            traffic_score += recent_adj * 0.38
+            contact_score += recent_adj * 0.22
+            notes.append(f"recent log damage {recent_score:.0f}/100")
+        if recent_h9 is not None and recent_h9 >= 9.5:
+            hits_score += 4
+        if recent_er9 is not None and recent_er9 >= 5.2:
+            traffic_score += 4
+        if recent_whip is not None and recent_whip >= 1.42:
+            traffic_score += 4
+            hits_score += 2
+        if recent_kp is not None:
+            if recent_kp <= 18:
+                contact_score += 4
+            elif recent_kp >= 28:
+                contact_score -= 4
+        if k_app_avg is not None:
+            if k_app_avg >= 6.8 or "K_SUPPRESSOR" in k_app_label:
+                contact_score -= 3
+                hits_score -= 2
+                notes.append(f"K app suppressor avg {k_app_avg:.1f} K")
+            elif k_app_avg <= 4.2 or "CONTACT_FRIENDLY" in k_app_label:
+                contact_score += 3
+                notes.append(f"K app contact-friendly avg {k_app_avg:.1f} K")
+
+        hits_score = float(clamp(hits_score, 8, 94))
+        traffic_score = float(clamp(traffic_score, 8, 94))
+        contact_score = float(clamp(contact_score, 8, 94))
+        power_score = float(clamp(power_score, 8, 96))
+        hrr_score = (hits_score * 0.34) + (traffic_score * 0.30) + (contact_score * 0.28) + (power_score * 0.08)
+        hr_score = (power_score * 0.46) + (contact_score * 0.22) + (traffic_score * 0.16) + (hits_score * 0.16)
+        suppress_score = (100 - hrr_score) * 0.62 + max(0, 50 - power_score) * 0.18 + max(0, (kp or 21.5) - 24) * 1.1
+
+        hrr_factor = 1 + ((hrr_score - 50) / 100.0 * 0.135)
+        hr_factor = 1 + ((hr_score - 50) / 100.0 * 0.170)
+        if hrr_score >= 72:
+            label = "OVER ATTACK"
+            opp_class = "EXPAND_OVER_OPPORTUNITIES"
+        elif hrr_score >= 62:
+            label = "OVER FRIENDLY"
+            opp_class = "OPPORTUNITY"
+        elif hrr_score <= 34:
+            label = "UNDER FRIENDLY"
+            opp_class = "UNDER_OR_PASS"
+        elif hrr_score <= 43:
+            label = "CONTACT SUPPRESSOR"
+            opp_class = "CAUTION"
+        else:
+            label = "NEUTRAL"
+            opp_class = "STANDARD"
+        if str(market or "").upper() == "HR" and hr_score >= 70:
+            opp_class = "HR_EXPAND_OVER"
+        out.update({
+            "Pitcher Run/Contact Factor HRR": round(float(clamp(hrr_factor, 0.925, 1.095)), 3),
+            "Pitcher Run/Contact Factor HR": round(float(clamp(hr_factor, 0.900, 1.130)), 3),
+            "Pitcher Allows Hits Score": int(round(hits_score)),
+            "Pitcher Run/RBI Traffic Score": int(round(traffic_score)),
+            "Pitcher Contact Allowed Score": int(round(contact_score)),
+            "Pitcher Power Damage Score": int(round(power_score)),
+            "Pitcher Under Suppression Score": int(round(clamp(suppress_score, 0, 100))),
+            "Pitcher Run/Contact Score": int(round(hrr_score if str(market or "").upper() != "HR" else hr_score)),
+            "Pitcher Run/Contact Label": label,
+            "Pitcher Run/Contact Note": ", ".join(notes[:9]) if notes else "Pitcher run/contact profile neutral",
+            "Pitcher Line Opportunity Class": opp_class,
+        })
+        return out
+    except Exception:
+        return out
 
 
 def _ow_profile_context_with_fallback(profile_ctx, key_stats_ctx, savant_ctx=None, logs=None):
@@ -32978,7 +33592,9 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         blowout_factor = _v3_safe_num(blowout_ctx.get("Blowout Environment Factor HRR"), 1.0) or 1.0
         contact_leash_ctx = _ow_pitcher_contact_leash_context(pctx, bpctx, lineup_ctx, "HRR")
         contact_leash_factor = _v3_safe_num(contact_leash_ctx.get("Pitcher Contact/Leash Factor HRR"), 1.0) or 1.0
-        proj = round(float(proj) * park_factor * weather_factor * pa_factor * lineup_quality_factor * pitcher_factor * split_factor * pitcher_split_factor * key_stats_factor * batter_quality_factor * profile_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_factor * bullpen_leash_factor * bullpen_hand_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * run_factor * blowout_factor * contact_leash_factor * batter_learning_factor * guard_factor, 2)
+        run_contact_ctx = _ow_pitcher_run_contact_damage_context(pctx, pitcher_split_ctx, "HRR")
+        run_contact_factor = _v3_safe_num(run_contact_ctx.get("Pitcher Run/Contact Factor HRR"), 1.0) or 1.0
+        proj = round(float(proj) * park_factor * weather_factor * pa_factor * lineup_quality_factor * pitcher_factor * split_factor * pitcher_split_factor * key_stats_factor * batter_quality_factor * profile_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_factor * bullpen_leash_factor * bullpen_hand_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * run_factor * blowout_factor * contact_leash_factor * run_contact_factor * batter_learning_factor * guard_factor, 2)
         edge = round(proj - float(line), 2)
         recent_vals = vals[-30:] if vals else []
         raw_over_rate = _ow_hit_rate_text(vals[-20:], float(line), "OVER")[1]
@@ -33238,6 +33854,8 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Pitcher Split Note": pitcher_split_ctx.get("Pitcher Split Note"),
             "Bullpen Handedness Factor": bullpen_hand_factor,
             "Bullpen Handedness Note": bullpen_hand_ctx.get("Bullpen Handedness Note"),
+            "Pitcher Run/Contact Factor": run_contact_factor,
+            "Pitcher Run/Contact Note": run_contact_ctx.get("Pitcher Run/Contact Note"),
             "Split Factor": round(split_factor, 3),
             "Split Note": split_note,
             "Key Matchup Stats Factor": key_stats_factor,
@@ -33339,6 +33957,36 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Pitcher Contact/Leash Score": contact_leash_ctx.get("Pitcher Contact/Leash Score"),
             "Pitcher Contact/Leash Label": contact_leash_ctx.get("Pitcher Contact/Leash Label"),
             "Pitcher Contact/Leash Note": contact_leash_ctx.get("Pitcher Contact/Leash Note"),
+            "Pitcher Run/Contact Factor": run_contact_factor,
+            "Pitcher Run/Contact Score": run_contact_ctx.get("Pitcher Run/Contact Score"),
+            "Pitcher Run/Contact Label": run_contact_ctx.get("Pitcher Run/Contact Label"),
+            "Pitcher Run/Contact Note": run_contact_ctx.get("Pitcher Run/Contact Note"),
+            "Pitcher Allows Hits Score": run_contact_ctx.get("Pitcher Allows Hits Score"),
+            "Pitcher Run/RBI Traffic Score": run_contact_ctx.get("Pitcher Run/RBI Traffic Score"),
+            "Pitcher Contact Allowed Score": run_contact_ctx.get("Pitcher Contact Allowed Score"),
+            "Pitcher Power Damage Score": run_contact_ctx.get("Pitcher Power Damage Score"),
+            "Pitcher Under Suppression Score": run_contact_ctx.get("Pitcher Under Suppression Score"),
+            "Pitcher Line Opportunity Class": run_contact_ctx.get("Pitcher Line Opportunity Class"),
+            "Pitcher Recent Log Source": pctx.get("Pitcher Recent Log Source"),
+            "Pitcher Recent Games": pctx.get("Pitcher Recent Games"),
+            "Pitcher Recent IP/G": pctx.get("Pitcher Recent IP/G"),
+            "Pitcher Recent BF/G": pctx.get("Pitcher Recent BF/G"),
+            "Pitcher Recent H/9": pctx.get("Pitcher Recent H/9"),
+            "Pitcher Recent ER/9": pctx.get("Pitcher Recent ER/9"),
+            "Pitcher Recent HR/9": pctx.get("Pitcher Recent HR/9"),
+            "Pitcher Recent BB/9": pctx.get("Pitcher Recent BB/9"),
+            "Pitcher Recent WHIP": pctx.get("Pitcher Recent WHIP"),
+            "Pitcher Recent K%": pctx.get("Pitcher Recent K%"),
+            "Pitcher Recent Contact Damage Score": pctx.get("Pitcher Recent Contact Damage Score"),
+            "Pitcher Recent Leash Label": pctx.get("Pitcher Recent Leash Label"),
+            "Pitcher Recent Note": pctx.get("Pitcher Recent Note"),
+            "Pitcher K App Grade Source": pctx.get("Pitcher K App Grade Source"),
+            "Pitcher K App Samples": pctx.get("Pitcher K App Samples"),
+            "Pitcher K App Win Rate %": pctx.get("Pitcher K App Win Rate %"),
+            "Pitcher K App Avg Actual K": pctx.get("Pitcher K App Avg Actual K"),
+            "Pitcher K App Avg IP": pctx.get("Pitcher K App Avg IP"),
+            "Pitcher K App Reliability Label": pctx.get("Pitcher K App Reliability Label"),
+            "Pitcher K App Note": pctx.get("Pitcher K App Note"),
             "Batter Hand": batter_hand,
             "Pitcher Split vs Batter Hand": pitcher_split_ctx.get("Pitcher Split vs Batter Hand"),
             "Pitcher Split BF": pitcher_split_ctx.get("Pitcher Split BF"),
@@ -33589,7 +34237,9 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         blowout_factor = _v3_safe_num(blowout_ctx.get("Blowout Environment Factor HR"), 1.0) or 1.0
         contact_leash_ctx = _ow_pitcher_contact_leash_context(pctx, bpctx, lineup_ctx, "HR")
         contact_leash_factor = _v3_safe_num(contact_leash_ctx.get("Pitcher Contact/Leash Factor HR"), 1.0) or 1.0
-        proj_hr = round(float(clamp(proj_hr * park_factor * weather_factor * pitcher_factor * split_factor * pitcher_split_factor * key_stats_factor * lineup_quality_factor * batter_quality_factor * profile_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_leash_factor * bullpen_hand_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * pa_factor * blowout_factor * contact_leash_factor * batter_learning_factor * guard_factor, 0.01, 0.95)), 3)
+        run_contact_ctx = _ow_pitcher_run_contact_damage_context(pctx, pitcher_split_ctx, "HR")
+        run_contact_factor = _v3_safe_num(run_contact_ctx.get("Pitcher Run/Contact Factor HR"), 1.0) or 1.0
+        proj_hr = round(float(clamp(proj_hr * park_factor * weather_factor * pitcher_factor * split_factor * pitcher_split_factor * key_stats_factor * lineup_quality_factor * batter_quality_factor * profile_factor * pitch_mix_factor * protection_factor * umpire_factor_hitter * defense_factor * bullpen_leash_factor * bullpen_hand_factor * pitcher_confirmation_factor * availability_factor * slot_trend_factor * pa_factor * blowout_factor * contact_leash_factor * run_contact_factor * batter_learning_factor * guard_factor, 0.01, 0.95)), 3)
         threshold = int(math.floor(float(line))) + 1
         p_over = 1.0 - sum(math.exp(-proj_hr) * proj_hr**k / math.factorial(k) for k in range(threshold))
         prob_pct = round(float(clamp(p_over * 100, 1, 75)), 1)
@@ -33839,6 +34489,8 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Pitcher Split Note": pitcher_split_ctx.get("Pitcher Split Note"),
             "Bullpen Handedness Factor": bullpen_hand_factor,
             "Bullpen Handedness Note": bullpen_hand_ctx.get("Bullpen Handedness Note"),
+            "Pitcher Run/Contact Factor": run_contact_factor,
+            "Pitcher Run/Contact Note": run_contact_ctx.get("Pitcher Run/Contact Note"),
             "Split Factor": round(split_factor, 3),
             "Split Note": split_note,
             "Key Matchup Stats Factor": key_stats_factor,
@@ -33938,6 +34590,36 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Pitcher Contact/Leash Score": contact_leash_ctx.get("Pitcher Contact/Leash Score"),
             "Pitcher Contact/Leash Label": contact_leash_ctx.get("Pitcher Contact/Leash Label"),
             "Pitcher Contact/Leash Note": contact_leash_ctx.get("Pitcher Contact/Leash Note"),
+            "Pitcher Run/Contact Factor": run_contact_factor,
+            "Pitcher Run/Contact Score": run_contact_ctx.get("Pitcher Run/Contact Score"),
+            "Pitcher Run/Contact Label": run_contact_ctx.get("Pitcher Run/Contact Label"),
+            "Pitcher Run/Contact Note": run_contact_ctx.get("Pitcher Run/Contact Note"),
+            "Pitcher Allows Hits Score": run_contact_ctx.get("Pitcher Allows Hits Score"),
+            "Pitcher Run/RBI Traffic Score": run_contact_ctx.get("Pitcher Run/RBI Traffic Score"),
+            "Pitcher Contact Allowed Score": run_contact_ctx.get("Pitcher Contact Allowed Score"),
+            "Pitcher Power Damage Score": run_contact_ctx.get("Pitcher Power Damage Score"),
+            "Pitcher Under Suppression Score": run_contact_ctx.get("Pitcher Under Suppression Score"),
+            "Pitcher Line Opportunity Class": run_contact_ctx.get("Pitcher Line Opportunity Class"),
+            "Pitcher Recent Log Source": pctx.get("Pitcher Recent Log Source"),
+            "Pitcher Recent Games": pctx.get("Pitcher Recent Games"),
+            "Pitcher Recent IP/G": pctx.get("Pitcher Recent IP/G"),
+            "Pitcher Recent BF/G": pctx.get("Pitcher Recent BF/G"),
+            "Pitcher Recent H/9": pctx.get("Pitcher Recent H/9"),
+            "Pitcher Recent ER/9": pctx.get("Pitcher Recent ER/9"),
+            "Pitcher Recent HR/9": pctx.get("Pitcher Recent HR/9"),
+            "Pitcher Recent BB/9": pctx.get("Pitcher Recent BB/9"),
+            "Pitcher Recent WHIP": pctx.get("Pitcher Recent WHIP"),
+            "Pitcher Recent K%": pctx.get("Pitcher Recent K%"),
+            "Pitcher Recent Contact Damage Score": pctx.get("Pitcher Recent Contact Damage Score"),
+            "Pitcher Recent Leash Label": pctx.get("Pitcher Recent Leash Label"),
+            "Pitcher Recent Note": pctx.get("Pitcher Recent Note"),
+            "Pitcher K App Grade Source": pctx.get("Pitcher K App Grade Source"),
+            "Pitcher K App Samples": pctx.get("Pitcher K App Samples"),
+            "Pitcher K App Win Rate %": pctx.get("Pitcher K App Win Rate %"),
+            "Pitcher K App Avg Actual K": pctx.get("Pitcher K App Avg Actual K"),
+            "Pitcher K App Avg IP": pctx.get("Pitcher K App Avg IP"),
+            "Pitcher K App Reliability Label": pctx.get("Pitcher K App Reliability Label"),
+            "Pitcher K App Note": pctx.get("Pitcher K App Note"),
             "Batter Hand": batter_hand,
             "Pitcher Split vs Batter Hand": pitcher_split_ctx.get("Pitcher Split vs Batter Hand"),
             "Pitcher Split BF": pitcher_split_ctx.get("Pitcher Split BF"),
@@ -34205,6 +34887,36 @@ def build_v3_batter_upside_board_final():
                     "Pitcher Contact/Leash Score": rd.get("Pitcher Contact/Leash Score", d.get("Pitcher Contact/Leash Score")),
                     "Pitcher Contact/Leash Label": rd.get("Pitcher Contact/Leash Label", d.get("Pitcher Contact/Leash Label")),
                     "Pitcher Contact/Leash Note": rd.get("Pitcher Contact/Leash Note", d.get("Pitcher Contact/Leash Note")),
+                    "Pitcher Run/Contact Factor": rd.get("Pitcher Run/Contact Factor", d.get("Pitcher Run/Contact Factor")),
+                    "Pitcher Run/Contact Score": rd.get("Pitcher Run/Contact Score", d.get("Pitcher Run/Contact Score")),
+                    "Pitcher Run/Contact Label": rd.get("Pitcher Run/Contact Label", d.get("Pitcher Run/Contact Label")),
+                    "Pitcher Run/Contact Note": rd.get("Pitcher Run/Contact Note", d.get("Pitcher Run/Contact Note")),
+                    "Pitcher Allows Hits Score": rd.get("Pitcher Allows Hits Score", d.get("Pitcher Allows Hits Score")),
+                    "Pitcher Run/RBI Traffic Score": rd.get("Pitcher Run/RBI Traffic Score", d.get("Pitcher Run/RBI Traffic Score")),
+                    "Pitcher Contact Allowed Score": rd.get("Pitcher Contact Allowed Score", d.get("Pitcher Contact Allowed Score")),
+                    "Pitcher Power Damage Score": rd.get("Pitcher Power Damage Score", d.get("Pitcher Power Damage Score")),
+                    "Pitcher Under Suppression Score": rd.get("Pitcher Under Suppression Score", d.get("Pitcher Under Suppression Score")),
+                    "Pitcher Line Opportunity Class": rd.get("Pitcher Line Opportunity Class", d.get("Pitcher Line Opportunity Class")),
+                    "Pitcher Recent Log Source": rd.get("Pitcher Recent Log Source", d.get("Pitcher Recent Log Source")),
+                    "Pitcher Recent Games": rd.get("Pitcher Recent Games", d.get("Pitcher Recent Games")),
+                    "Pitcher Recent IP/G": rd.get("Pitcher Recent IP/G", d.get("Pitcher Recent IP/G")),
+                    "Pitcher Recent BF/G": rd.get("Pitcher Recent BF/G", d.get("Pitcher Recent BF/G")),
+                    "Pitcher Recent H/9": rd.get("Pitcher Recent H/9", d.get("Pitcher Recent H/9")),
+                    "Pitcher Recent ER/9": rd.get("Pitcher Recent ER/9", d.get("Pitcher Recent ER/9")),
+                    "Pitcher Recent HR/9": rd.get("Pitcher Recent HR/9", d.get("Pitcher Recent HR/9")),
+                    "Pitcher Recent BB/9": rd.get("Pitcher Recent BB/9", d.get("Pitcher Recent BB/9")),
+                    "Pitcher Recent WHIP": rd.get("Pitcher Recent WHIP", d.get("Pitcher Recent WHIP")),
+                    "Pitcher Recent K%": rd.get("Pitcher Recent K%", d.get("Pitcher Recent K%")),
+                    "Pitcher Recent Contact Damage Score": rd.get("Pitcher Recent Contact Damage Score", d.get("Pitcher Recent Contact Damage Score")),
+                    "Pitcher Recent Leash Label": rd.get("Pitcher Recent Leash Label", d.get("Pitcher Recent Leash Label")),
+                    "Pitcher Recent Note": rd.get("Pitcher Recent Note", d.get("Pitcher Recent Note")),
+                    "Pitcher K App Grade Source": rd.get("Pitcher K App Grade Source", d.get("Pitcher K App Grade Source")),
+                    "Pitcher K App Samples": rd.get("Pitcher K App Samples", d.get("Pitcher K App Samples")),
+                    "Pitcher K App Win Rate %": rd.get("Pitcher K App Win Rate %", d.get("Pitcher K App Win Rate %")),
+                    "Pitcher K App Avg Actual K": rd.get("Pitcher K App Avg Actual K", d.get("Pitcher K App Avg Actual K")),
+                    "Pitcher K App Avg IP": rd.get("Pitcher K App Avg IP", d.get("Pitcher K App Avg IP")),
+                    "Pitcher K App Reliability Label": rd.get("Pitcher K App Reliability Label", d.get("Pitcher K App Reliability Label")),
+                    "Pitcher K App Note": rd.get("Pitcher K App Note", d.get("Pitcher K App Note")),
                     "Team Run Environment": rd.get("Team Run Environment", d.get("Team Run Environment")),
                     "Park": rd.get("Park", d.get("Park")),
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
@@ -34281,6 +34993,36 @@ def build_v3_batter_upside_board_final():
                     "Pitcher Contact/Leash Score": rd.get("Pitcher Contact/Leash Score", d.get("Pitcher Contact/Leash Score")),
                     "Pitcher Contact/Leash Label": rd.get("Pitcher Contact/Leash Label", d.get("Pitcher Contact/Leash Label")),
                     "Pitcher Contact/Leash Note": rd.get("Pitcher Contact/Leash Note", d.get("Pitcher Contact/Leash Note")),
+                    "Pitcher Run/Contact Factor": rd.get("Pitcher Run/Contact Factor", d.get("Pitcher Run/Contact Factor")),
+                    "Pitcher Run/Contact Score": rd.get("Pitcher Run/Contact Score", d.get("Pitcher Run/Contact Score")),
+                    "Pitcher Run/Contact Label": rd.get("Pitcher Run/Contact Label", d.get("Pitcher Run/Contact Label")),
+                    "Pitcher Run/Contact Note": rd.get("Pitcher Run/Contact Note", d.get("Pitcher Run/Contact Note")),
+                    "Pitcher Allows Hits Score": rd.get("Pitcher Allows Hits Score", d.get("Pitcher Allows Hits Score")),
+                    "Pitcher Run/RBI Traffic Score": rd.get("Pitcher Run/RBI Traffic Score", d.get("Pitcher Run/RBI Traffic Score")),
+                    "Pitcher Contact Allowed Score": rd.get("Pitcher Contact Allowed Score", d.get("Pitcher Contact Allowed Score")),
+                    "Pitcher Power Damage Score": rd.get("Pitcher Power Damage Score", d.get("Pitcher Power Damage Score")),
+                    "Pitcher Under Suppression Score": rd.get("Pitcher Under Suppression Score", d.get("Pitcher Under Suppression Score")),
+                    "Pitcher Line Opportunity Class": rd.get("Pitcher Line Opportunity Class", d.get("Pitcher Line Opportunity Class")),
+                    "Pitcher Recent Log Source": rd.get("Pitcher Recent Log Source", d.get("Pitcher Recent Log Source")),
+                    "Pitcher Recent Games": rd.get("Pitcher Recent Games", d.get("Pitcher Recent Games")),
+                    "Pitcher Recent IP/G": rd.get("Pitcher Recent IP/G", d.get("Pitcher Recent IP/G")),
+                    "Pitcher Recent BF/G": rd.get("Pitcher Recent BF/G", d.get("Pitcher Recent BF/G")),
+                    "Pitcher Recent H/9": rd.get("Pitcher Recent H/9", d.get("Pitcher Recent H/9")),
+                    "Pitcher Recent ER/9": rd.get("Pitcher Recent ER/9", d.get("Pitcher Recent ER/9")),
+                    "Pitcher Recent HR/9": rd.get("Pitcher Recent HR/9", d.get("Pitcher Recent HR/9")),
+                    "Pitcher Recent BB/9": rd.get("Pitcher Recent BB/9", d.get("Pitcher Recent BB/9")),
+                    "Pitcher Recent WHIP": rd.get("Pitcher Recent WHIP", d.get("Pitcher Recent WHIP")),
+                    "Pitcher Recent K%": rd.get("Pitcher Recent K%", d.get("Pitcher Recent K%")),
+                    "Pitcher Recent Contact Damage Score": rd.get("Pitcher Recent Contact Damage Score", d.get("Pitcher Recent Contact Damage Score")),
+                    "Pitcher Recent Leash Label": rd.get("Pitcher Recent Leash Label", d.get("Pitcher Recent Leash Label")),
+                    "Pitcher Recent Note": rd.get("Pitcher Recent Note", d.get("Pitcher Recent Note")),
+                    "Pitcher K App Grade Source": rd.get("Pitcher K App Grade Source", d.get("Pitcher K App Grade Source")),
+                    "Pitcher K App Samples": rd.get("Pitcher K App Samples", d.get("Pitcher K App Samples")),
+                    "Pitcher K App Win Rate %": rd.get("Pitcher K App Win Rate %", d.get("Pitcher K App Win Rate %")),
+                    "Pitcher K App Avg Actual K": rd.get("Pitcher K App Avg Actual K", d.get("Pitcher K App Avg Actual K")),
+                    "Pitcher K App Avg IP": rd.get("Pitcher K App Avg IP", d.get("Pitcher K App Avg IP")),
+                    "Pitcher K App Reliability Label": rd.get("Pitcher K App Reliability Label", d.get("Pitcher K App Reliability Label")),
+                    "Pitcher K App Note": rd.get("Pitcher K App Note", d.get("Pitcher K App Note")),
                     "Team Run Environment": rd.get("Team Run Environment", d.get("Team Run Environment")),
                     "Park": rd.get("Park", d.get("Park")),
                     "Data Confidence": rd.get("Data Confidence", d.get("Data Confidence")),
@@ -34327,6 +35069,10 @@ def build_v3_batter_upside_board_final():
         contact_score = _v3_final_num(d.get("Pitcher Contact/Leash Score"), 50) or 50
         contact_boost = min(5, max(0, contact_score - 60) * 0.18)
         contact_label = str(d.get("Pitcher Contact/Leash Label") or "").upper()
+        run_contact_score = _v3_final_num(d.get("Pitcher Run/Contact Score"), 50) or 50
+        run_contact_boost = min(7, max(0, run_contact_score - 60) * 0.25)
+        run_contact_label = str(d.get("Pitcher Run/Contact Label") or "").upper()
+        under_suppress_score = _v3_final_num(d.get("Pitcher Under Suppression Score"), 50) or 50
         clean_flags = str(d.get("No-Bet Risk Flags") or "").strip()
         matchup_ok = bool(d.get("Pitcher Matchup Verified"))
         pitcher_confirmed = bool(d.get("Pitcher Confirmed"))
@@ -34344,6 +35090,10 @@ def build_v3_batter_upside_board_final():
             risk_penalty += 3
         if "STRIKEOUT RISK" in contact_label:
             risk_penalty += 5
+        if any(x in run_contact_label for x in ["UNDER", "SUPPRESSOR"]):
+            risk_penalty += 5
+        if under_suppress_score >= 68:
+            risk_penalty += 4
         if bool(d.get("Daily Data Hard Stop")):
             risk_penalty += 22
         elif daily_score < 70:
@@ -34360,6 +35110,7 @@ def build_v3_batter_upside_board_final():
                 + min(10, max(0, pa - 3.5) * 6)
                 + blowout_boost
                 + contact_boost
+                + run_contact_boost
             )
             hrr_likely = clamp(42 + hrr_likely - risk_penalty, 0, 100)
         hr_likely = 0
@@ -34373,6 +35124,7 @@ def build_v3_batter_upside_board_final():
                 + min(10, max(0, pa - 3.5) * 4)
                 + min(3.5, blowout_boost * 0.55)
                 + min(2.5, contact_boost * 0.45)
+                + min(4.0, run_contact_boost * 0.60)
             )
             if str(d.get("HR Grade") or "").startswith("A+"):
                 hr_likely += 8
@@ -34426,7 +35178,7 @@ def build_v3_batter_upside_board_final():
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
     df = df.sort_values(["Likely Score", "Upside Score", "Best Hit Rate %"], ascending=[False, False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
-    cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Batter Hand", "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split OPS", "Pitcher Split K%", "Pitcher Split HR%", "Bullpen Handedness Label", "Bullpen Handedness Score", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher H/9", "Pitcher Contact Factor", "Team Run Environment", "Blowout Environment Factor", "Pitcher Contact/Leash Factor", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
+    cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Line Opportunity Class", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Recent Contact Damage Score", "Pitcher Recent H/9", "Pitcher Recent ER/9", "Pitcher Recent HR/9", "Pitcher Recent WHIP", "Pitcher Recent K%", "Pitcher Recent Leash Label", "Pitcher K App Reliability Label", "Pitcher K App Avg Actual K", "Pitcher K App Win Rate %", "Pitcher Run/Contact Note", "Pitcher Contact/Leash Note", "Pitcher Recent Note", "Pitcher K App Note", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Batter Hand", "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split OPS", "Pitcher Split K%", "Pitcher Split HR%", "Bullpen Handedness Label", "Bullpen Handedness Score", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher H/9", "Pitcher Contact Factor", "Team Run Environment", "Blowout Environment Factor", "Pitcher Contact/Leash Factor", "Pitcher Run/Contact Factor", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix MatchupFactor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
     return df[[c for c in cols if c in df.columns]]
 
 
