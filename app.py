@@ -27749,6 +27749,76 @@ def render_v3_settings_tab():
         "Home Runs": "Underdog line required to display",
         "Cleanup version": V3_CLEAN_UD_LEARNING_VERSION,
     })
+    with st.expander("Daily CSV uploads", expanded=True):
+        st.caption("Upload your daily files here. The app saves them into data/raw and uses them as matchup context; Underdog active lines still control which players show.")
+        expected = [
+            "Batter.csv",
+            "Pitch.csv",
+            "savant_pitcher_stats.csv",
+            "savant_pitch_level_heatmap_foul.csv",
+            "savant_data (3).csv",
+            "pitch_mix_matchups.csv",
+            "graded_history.csv",
+        ]
+        st.write({"Recommended file names": expected, "Save location": "data/raw"})
+        uploads = st.file_uploader(
+            "Upload batter/pitcher CSV files",
+            type=["csv"],
+            accept_multiple_files=True,
+            key=_v3_unique_widget_key("ow_daily_csv_uploads"),
+        )
+        if uploads:
+            saved_rows = []
+            data_dir = Path(os.getcwd()) / "data" / "raw"
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            for up in uploads:
+                name = os.path.basename(str(getattr(up, "name", "") or "uploaded.csv"))
+                if not name.lower().endswith(".csv"):
+                    continue
+                target = data_dir / name
+                try:
+                    payload = up.getvalue()
+                    target.write_bytes(payload)
+                    rows = None
+                    cols = None
+                    try:
+                        sample = pd.read_csv(io.BytesIO(payload), nrows=5, low_memory=False)
+                        rows = "uploaded"
+                        cols = len(sample.columns)
+                    except Exception:
+                        pass
+                    saved_rows.append({
+                        "File": name,
+                        "Saved To": str(target),
+                        "Columns": cols,
+                        "Status": "SAVED",
+                    })
+                except Exception as e:
+                    saved_rows.append({
+                        "File": name,
+                        "Saved To": str(target),
+                        "Columns": None,
+                        "Status": f"ERROR: {str(e)[:120]}",
+                    })
+            if saved_rows:
+                st.dataframe(pd.DataFrame(saved_rows), use_container_width=True, hide_index=True)
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success("CSV files saved. Cache cleared, so Refresh Live Board will use the newest data.")
+        existing_rows = []
+        for nm in expected:
+            p = Path(os.getcwd()) / "data" / "raw" / nm
+            existing_rows.append({
+                "Expected CSV": nm,
+                "Found": "YES" if p.exists() else "NO",
+                "Location": str(p),
+            })
+        st.dataframe(pd.DataFrame(existing_rows), use_container_width=True, hide_index=True)
     with st.expander("CSV / matchup data audit", expanded=True):
         try:
             csv_summary, csv_issues = _ow_csv_data_audit()
