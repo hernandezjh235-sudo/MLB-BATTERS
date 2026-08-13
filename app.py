@@ -27738,18 +27738,18 @@ def render_v3_settings_tab():
     c1.metric("App", "Batter V3")
     c2.metric("Brand", "ONE WAY PICKZ")
     c3.metric("Mode", "UD Lines Only")
-    st.info("Visible tabs: Batter Upside, H+R+RBI, Home Runs, Batter Learning Lab, Official Plays, Calibration Audit.")
+    st.info("Visible tabs: Batter Upside, H+R+RBI, Home Runs, Batter Fantasy, Batter Learning Lab, Official Plays, Poster, Calibration Audit.")
     st.write({
         "K engine visible in V3": "No",
         "Pitcher FS visible in V3": "No",
         "Research Hub visible in V3": "No",
         "Moneyline visible in V3": "No",
-        "Batter FS visible": "Removed",
+        "Batter FS visible": "Active — Underdog Event Model V2",
         "H+R+RBI line source": "Underdog only",
         "Home Runs": "Underdog line required to display",
         "Cleanup version": V3_CLEAN_UD_LEARNING_VERSION,
     })
-    with st.expander("Daily CSV uploads", expanded=True):
+    with st.expander("Legacy Daily CSV uploads", expanded=False):
         st.caption("Upload your daily files here. The app saves them into data/raw and uses them as matchup context; Underdog active lines still control which players show.")
         expected = [
             "Batter.csv",
@@ -35547,11 +35547,3985 @@ def render_v3_discord_poster_studio_tab():
                 use_container_width=True,
             )
 
-# Clean V3 batter-only tab layout. Removed visible Pitcher K, Batter FS, Pitcher FS, Research Hub, and Moneyline tabs.
-tab_top, tab_hrr, tab_hr, tab_learning, tab_official, tab_poster, tab_calibration, tab_settings = st.tabs([
+
+# ============================================================
+# BATTER FANTASY V1 — UNDERDOG LINES + EVENT-LEVEL MONTE CARLO
+# Added 2026-08-12.
+#
+# Design goals:
+# - Keep H+R+RBI and Home Run projection logic untouched.
+# - Pull Underdog Fantasy Points rows with the existing relationship-aware parser.
+# - Classify BATTER / PITCHER / UNKNOWN before any hitter projection.
+# - Project PA -> 1B/2B/3B/HR/BB/HBP/K/OUT, then R/RBI/SB.
+# - Score the simulated outcomes with one centralized, configurable scoring profile.
+# - Surface mean/P50/P20/P80, Higher/Lower probability, fair line, volatility,
+#   Skill / Match / Form / Contact, and matchup flags.
+# - Build only on explicit refresh so this heavy Statcast layer does not slow every
+#   Streamlit rerun/tab.
+# ============================================================
+OW_BATTER_FS_VERSION = "OW_BATTER_FS_EVENT_MC_V1_2026_08_12"
+OW_BATTER_FS_SIM_PASSES = 12000
+OW_BATTER_FS_MAX_ROWS = 36
+
+# Centralized scoring profile. These are the hitter fantasy values used by the
+# existing app's Underdog fantasy module and the current Underdog daily hitter
+# scoring profile. Keeping them in one dict prevents scoring logic from being
+# duplicated across the model.
+OW_BATTER_FS_SCORING = {
+    "1B": 3.0,
+    "2B": 6.0,
+    "3B": 8.0,
+    "HR": 10.0,
+    "BB": 3.0,
+    "HBP": 3.0,
+    "R": 2.0,
+    "RBI": 2.0,
+    "SB": 4.0,
+}
+
+_OW_BFS_HITTER_POS = {
+    "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF", "DH", "IF",
+    "PH", "PR", "UTIL", "UT", "TWP",
+}
+_OW_BFS_PITCHER_POS = {"P", "SP", "RP", "CP", "CL"}
+
+
+def _ow_bfs_num(x, default=None):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _ow_bfs_pct(x, default=None):
+    v = _ow_bfs_num(x, default)
+    if v is None:
+        return None
+    return v / 100.0 if abs(v) > 1.0 else v
+
+
+def _ow_bfs_cap(x, lo, hi, default=None):
+    try:
+        return max(float(lo), min(float(hi), float(x)))
+    except Exception:
+        return default
+
+
+def _ow_bfs_weighted_factor(pairs, lo=0.85, hi=1.15):
+    """Blend multiplicative matchup factors without double-counting them."""
+    value = 1.0
+    for factor, exponent in pairs:
+        f = _ow_bfs_num(factor, 1.0) or 1.0
+        try:
+            value *= max(0.65, min(1.35, f)) ** float(exponent)
+        except Exception:
+            continue
+    return float(clamp(value, lo, hi))
+
+
+def _ow_bfs_score_components(one_b=0, two_b=0, three_b=0, hr=0, bb=0, hbp=0, runs=0, rbi=0, sb=0):
+    s = OW_BATTER_FS_SCORING
+    return (
+        np.asarray(one_b, dtype=float) * s["1B"]
+        + np.asarray(two_b, dtype=float) * s["2B"]
+        + np.asarray(three_b, dtype=float) * s["3B"]
+        + np.asarray(hr, dtype=float) * s["HR"]
+        + np.asarray(bb, dtype=float) * s["BB"]
+        + np.asarray(hbp, dtype=float) * s["HBP"]
+        + np.asarray(runs, dtype=float) * s["R"]
+        + np.asarray(rbi, dtype=float) * s["RBI"]
+        + np.asarray(sb, dtype=float) * s["SB"]
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_bfs_primary_role(player_name):
+    """MLB-backed role lookup used as the final safety gate on mixed UD FS markets."""
+    out = {
+        "Player ID": None,
+        "Primary Position": "—",
+        "Position Type": "—",
+        "Role": "UNKNOWN",
+        "Role Source": "MLB role unavailable",
+        "Bats": "—",
+    }
+    try:
+        pid = _mlb_search_player_id_by_name(player_name)
+        out["Player ID"] = pid
+        if not pid:
+            return out
+        data = safe_get_json(f"{MLB_BASE}/people/{pid}", timeout=10) or {}
+        people = data.get("people") or []
+        if not people:
+            return out
+        person = people[0] or {}
+        pos = person.get("primaryPosition") or {}
+        abbr = str(pos.get("abbreviation") or pos.get("code") or "").upper().strip()
+        ptype = str(pos.get("type") or "").upper().strip()
+        bats = str((person.get("batSide") or {}).get("code") or (person.get("batSide") or {}).get("description") or "—").upper()
+        out.update({
+            "Primary Position": abbr or "—",
+            "Position Type": ptype or "—",
+            "Bats": bats[:1] if bats else "—",
+        })
+        if abbr in _OW_BFS_PITCHER_POS or "PITCHER" in ptype:
+            out.update({"Role": "PITCHER", "Role Source": f"MLB primaryPosition={abbr or ptype}"})
+        elif abbr in _OW_BFS_HITTER_POS or any(k in ptype for k in ["CATCHER", "INFIELDER", "OUTFIELDER", "DESIGNATED"]):
+            # TWP is held for the row-level line/evidence check below.
+            role = "TWO_WAY" if abbr == "TWP" else "BATTER"
+            out.update({"Role": role, "Role Source": f"MLB primaryPosition={abbr or ptype}"})
+        return out
+    except Exception:
+        return out
+
+
+def _ow_bfs_classify_ud_row(row):
+    """Classify mixed Underdog Fantasy Points rows before hitter model execution."""
+    player = str((row or {}).get("Player") or "").strip()
+    line = _ow_bfs_num((row or {}).get("Line"), None)
+    evidence = str((row or {}).get("Evidence") or "")
+    low = f" {evidence.lower()} "
+    role_info = _ow_bfs_primary_role(player)
+    role = role_info.get("Role", "UNKNOWN")
+    source = role_info.get("Role Source", "unknown")
+
+    # Strong structured/text pitcher evidence wins.
+    if re.search(r"\b(starting pitcher|relief pitcher|pitcher|pitching)\b", low, re.I):
+        role, source = "PITCHER", "Underdog evidence says pitcher"
+    elif re.search(r"\b(SP|RP|CP)\b", evidence):
+        role, source = "PITCHER", "Underdog position evidence"
+    elif re.search(r"\b(DH|LF|CF|RF|OF|1B|2B|3B|SS|C)\b", evidence):
+        # A hitter position is enough unless MLB specifically says pitcher-only.
+        if role != "PITCHER":
+            role, source = "BATTER", "Underdog hitter position evidence"
+
+    # Two-way / unresolved rows: use line scale only as a final fallback, never as
+    # the first classifier. Hitter FS lines in this feed are materially lower than
+    # pitcher FS lines; ambiguous middle values remain UNKNOWN rather than forced.
+    if role in {"TWO_WAY", "UNKNOWN"} and line is not None:
+        if line <= 17.5:
+            role, source = "BATTER", f"{role_info.get('Role','UNKNOWN')} + hitter-scale FS line"
+        elif line >= 18.5:
+            role, source = "PITCHER", f"{role_info.get('Role','UNKNOWN')} + pitcher-scale FS line"
+        else:
+            role, source = "UNKNOWN", "Ambiguous two-way/unknown FS line"
+
+    return {
+        **role_info,
+        "Role": role,
+        "Role Source": source,
+        "UD Line": line,
+    }
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _ow_fetch_ud_batter_fantasy_lines():
+    """Use the app's relationship-aware UD parser, then hard-filter to hitters."""
+    raw = []
+    status = "OK"
+    try:
+        raw = _v3_fetch_ud_batter_fs_rows() or []
+    except Exception as e:
+        return [], {"status": f"Underdog FS parser error: {e}", "raw": 0, "batters": 0, "pitchers": 0, "unknown": 0}
+
+    batters, pitchers, unknown = [], [], []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        info = _ow_bfs_classify_ud_row(r)
+        merged = dict(r)
+        merged.update(info)
+        if info.get("Role") == "BATTER":
+            batters.append(merged)
+        elif info.get("Role") == "PITCHER":
+            pitchers.append(merged)
+        else:
+            unknown.append(merged)
+
+    # Deduplicate after role resolution. Prefer exact MLB-backed names if duplicates exist.
+    dedup = {}
+    for r in batters:
+        key = _v3_norm_name(r.get("Player"))
+        if not key:
+            continue
+        prev = dedup.get(key)
+        if prev is None or (prev.get("Player ID") is None and r.get("Player ID") is not None):
+            dedup[key] = r
+    batters = list(dedup.values())
+
+    meta = {
+        "status": status,
+        "raw": len(raw),
+        "batters": len(batters),
+        "pitchers": len(pitchers),
+        "unknown": len(unknown),
+        "pitcher_examples": [f"{x.get('Player')} {x.get('Line')}" for x in pitchers[:8]],
+        "unknown_examples": [f"{x.get('Player')} {x.get('Line')}" for x in unknown[:8]],
+        "version": OW_BATTER_FS_VERSION,
+    }
+    return batters, meta
+
+
+def _ow_bfs_event_counts(stat):
+    """Normalize an MLB hitting stat object into event counts."""
+    stat = stat or {}
+    pa = _ow_stat_num(stat, "plateAppearances", "PA", default=0.0)
+    ab = _ow_stat_num(stat, "atBats", "AB", default=0.0)
+    h = _ow_stat_num(stat, "hits", "H", default=0.0)
+    d2 = _ow_stat_num(stat, "doubles", "2B", default=0.0)
+    d3 = _ow_stat_num(stat, "triples", "3B", default=0.0)
+    hr = _ow_stat_num(stat, "homeRuns", "HR", default=0.0)
+    bb = _ow_stat_num(stat, "baseOnBalls", "walks", "BB", default=0.0)
+    hbp = _ow_stat_num(stat, "hitByPitch", "HBP", default=0.0)
+    runs = _ow_stat_num(stat, "runs", "R", default=0.0)
+    rbi = _ow_stat_num(stat, "rbi", "RBI", default=0.0)
+    sb = _ow_stat_num(stat, "stolenBases", "SB", default=0.0)
+    kk = _ow_stat_num(stat, "strikeOuts", "SO", "K", default=0.0)
+    if pa <= 0:
+        pa = max(ab + bb + hbp, 0.0)
+    one_b = max(0.0, h - d2 - d3 - hr)
+    fs = float(_ow_bfs_score_components(one_b, d2, d3, hr, bb, hbp, runs, rbi, sb))
+    return {
+        "PA": pa, "AB": ab, "H": h, "1B": one_b, "2B": d2, "3B": d3, "HR": hr,
+        "BB": bb, "HBP": hbp, "R": runs, "RBI": rbi, "SB": sb, "K": kk, "FS": fs,
+    }
+
+
+def _ow_bfs_add_counts(a, b):
+    keys = ["PA", "AB", "H", "1B", "2B", "3B", "HR", "BB", "HBP", "R", "RBI", "SB", "K", "FS"]
+    out = {}
+    for k in keys:
+        out[k] = float(_ow_bfs_num((a or {}).get(k), 0.0) or 0.0) + float(_ow_bfs_num((b or {}).get(k), 0.0) or 0.0)
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_bfs_event_profile(player_name):
+    """Season + game-log event profile for 1B/2B/3B/HR/BB/HBP/R/RBI/SB/K."""
+    pid = _mlb_search_player_id_by_name(player_name)
+    out = {
+        "player_id": pid,
+        "season_year": None,
+        "season": {},
+        "season_counts": {},
+        "logs": [],
+        "status": "No MLB player id matched" if not pid else "No hitting data",
+    }
+    if not pid:
+        return out
+
+    for season in _ow_projection_seasons():
+        season_stat = {}
+        try:
+            data = safe_get_json(
+                f"{MLB_BASE}/people/{pid}/stats",
+                params={"stats": "season", "group": "hitting", "season": season},
+                timeout=12,
+            ) or {}
+            for block in data.get("stats") or []:
+                splits = block.get("splits") or []
+                if splits:
+                    season_stat = splits[0].get("stat") or {}
+                    break
+        except Exception:
+            season_stat = {}
+
+        game_logs = []
+        try:
+            data = safe_get_json(
+                f"{MLB_BASE}/people/{pid}/stats",
+                params={"stats": "gameLog", "group": "hitting", "season": season},
+                timeout=12,
+            ) or {}
+            splits = []
+            for block in data.get("stats") or []:
+                splits.extend(block.get("splits") or [])
+            for sp in splits:
+                stat = sp.get("stat") or {}
+                cnt = _ow_bfs_event_counts(stat)
+                cnt.update({
+                    "date": sp.get("date"),
+                    "game_pk": ((sp.get("game") or {}).get("gamePk") or sp.get("gamePk")),
+                    "team": ((sp.get("team") or {}).get("abbreviation") or (sp.get("team") or {}).get("name") or "—"),
+                    "opponent": ((sp.get("opponent") or {}).get("abbreviation") or (sp.get("opponent") or {}).get("name") or "—"),
+                })
+                if cnt.get("PA", 0) > 0:
+                    game_logs.append(cnt)
+        except Exception:
+            game_logs = []
+
+        if season_stat or game_logs:
+            out.update({
+                "season_year": season,
+                "season": season_stat,
+                "season_counts": _ow_bfs_event_counts(season_stat) if season_stat else {},
+                "logs": sorted(game_logs, key=lambda x: str(x.get("date") or "")),
+                "status": "OK",
+            })
+            return out
+    return out
+
+
+def _ow_bfs_aggregate_logs(logs, n=None):
+    use = list(logs or [])
+    if n:
+        use = use[-int(n):]
+    total = {}
+    for g in use:
+        total = _ow_bfs_add_counts(total, g)
+    return total
+
+
+def _ow_bfs_blended_rate(season_counts, logs, key, default=0.0):
+    """Season anchor + sample-aware L30/L15 form; recent samples cannot dominate."""
+    season_counts = season_counts or {}
+    spa = _ow_bfs_num(season_counts.get("PA"), 0.0) or 0.0
+    sr = (_ow_bfs_num(season_counts.get(key), 0.0) or 0.0) / spa if spa > 0 else None
+
+    a30 = _ow_bfs_aggregate_logs(logs, 30)
+    a15 = _ow_bfs_aggregate_logs(logs, 15)
+    p30 = _ow_bfs_num(a30.get("PA"), 0.0) or 0.0
+    p15 = _ow_bfs_num(a15.get("PA"), 0.0) or 0.0
+    r30 = (_ow_bfs_num(a30.get(key), 0.0) or 0.0) / p30 if p30 > 0 else None
+    r15 = (_ow_bfs_num(a15.get(key), 0.0) or 0.0) / p15 if p15 > 0 else None
+
+    pieces = []
+    if sr is not None:
+        pieces.append((sr, 0.64))
+    if r30 is not None:
+        pieces.append((r30, 0.22 * min(1.0, p30 / 90.0)))
+    if r15 is not None:
+        pieces.append((r15, 0.14 * min(1.0, p15 / 48.0)))
+    if not pieces:
+        return float(default)
+    w = sum(x[1] for x in pieces) or 1.0
+    return float(sum(v * wt for v, wt in pieces) / w)
+
+
+def _ow_bfs_recent_fs_summary(profile):
+    logs = list((profile or {}).get("logs") or [])
+    vals = [float(_ow_bfs_num(g.get("FS"), 0.0) or 0.0) for g in logs]
+    def avg(n):
+        x = vals[-n:] if vals else []
+        return float(np.mean(x)) if x else None
+    return {
+        "L5 FS": avg(5),
+        "L10 FS": avg(10),
+        "L20 FS": avg(20),
+        "Season FS/G": float(np.mean(vals)) if vals else None,
+        "L10 FS Values": vals[-10:],
+    }
+
+
+def _ow_bfs_build_context(player, raw, profile):
+    pid = (profile or {}).get("player_id")
+    logs = list((profile or {}).get("logs") or [])
+    raw_team = logs[-1].get("team", "—") if logs else "—"
+    current_team_ctx = _ow_current_batter_team_context(pid)
+    team = _ow_team_abbr(current_team_ctx.get("Current Team") or raw_team)
+    team_ctx = _ow_team_context(team)
+    raw_opp = logs[-1].get("opponent", "—") if logs else "—"
+    opp = _ow_team_abbr((team_ctx or {}).get("Opponent") or raw_opp)
+    lineup_ctx = _ow_lineup_context(player, team)
+    lineup_ctx = _ow_upgrade_lineup_context_with_pre_fallback(lineup_ctx, player, logs, (profile or {}).get("season"))
+    pctx = _ow_pitcher_matchup_factors(team)
+    matchup_ctx = _ow_matchup_integrity_context(player, team, opp, pctx, raw)
+    opp = _ow_team_abbr(matchup_ctx.get("Today Opponent") or opp)
+    team_runs, team_run_note = _v3_team_run_environment(team_ctx)
+    projected_pa = lineup_ctx.get("Projected PA") or _ow_projected_pa_from_logs(logs, (profile or {}).get("season"))
+    projected_pa = float(clamp(_ow_bfs_num(projected_pa, 4.15) or 4.15, 3.0, 5.4))
+    batter_hand = _ow_mlb_batter_hand(pid)
+    key_stats = _ow_batter_key_matchup_stats_context(pid, pctx.get("Pitcher Hand"))
+    bctx = _ow_batter_quality_context(pid)
+    pitch_hrr = _ow_pitch_type_batter_matchup_context(pid, pctx, "HRR")
+    pitch_hr = _ow_pitch_type_batter_matchup_context(pid, pctx, "HR")
+    pitcher_split_hrr = _ow_pitcher_allowed_split_context(pctx.get("Pitcher ID"), batter_hand, "HRR")
+    pitcher_split_hr = _ow_pitcher_allowed_split_context(pctx.get("Pitcher ID"), batter_hand, "HR")
+    bpctx = _v3_bullpen_weakness_context_from_team(team)
+    run_contact = _ow_pitcher_run_contact_damage_context(pctx, pitcher_split_hrr, "HRR")
+    weather_hrr = _ow_weather_hitter_context(team, "HRR")
+    weather_hr = _ow_weather_hitter_context(team, "HR")
+    park_hrr, venue = _ow_park_factor(team, "HRR")
+    park_hr, _ = _ow_park_factor(team, "HR")
+    protection = _ow_lineup_protection_context(player, team, pctx.get("Pitcher Hand"))
+    pitcher_confirm = _ow_pitcher_confirmation_context(team, pctx, "HRR")
+    bullpen_hand = _ow_bullpen_handedness_context(team, batter_hand, "HRR")
+    availability = _ow_batter_availability_context(player, logs, lineup_ctx, "HRR")
+    component = _ow_hrr_moneyball_component_context(
+        projected_pa,
+        key_stats,
+        profile_ctx={},
+        team_runs=team_runs,
+        team_ctx={**(team_ctx or {}), "Lineup Slot": lineup_ctx.get("Lineup Slot")},
+    )
+    return {
+        "Player": player,
+        "Player ID": pid,
+        "Team": team,
+        "Opponent": opp,
+        "Matchup": f"{team} vs {opp}" if team != "—" and opp != "—" else "—",
+        "Current Team Context": current_team_ctx,
+        "Team Context": team_ctx,
+        "Team Runs": team_runs,
+        "Team Run Note": team_run_note,
+        "Projected PA": projected_pa,
+        "Lineup": lineup_ctx,
+        "Pitcher": pctx,
+        "Matchup Integrity": matchup_ctx,
+        "Pitcher Confirm": pitcher_confirm,
+        "Batter Hand": batter_hand,
+        "Key Stats": key_stats,
+        "Batter Quality": bctx,
+        "Pitch HRR": pitch_hrr,
+        "Pitch HR": pitch_hr,
+        "Pitcher Split HRR": pitcher_split_hrr,
+        "Pitcher Split HR": pitcher_split_hr,
+        "Bullpen": bpctx,
+        "Bullpen Hand": bullpen_hand,
+        "Run Contact": run_contact,
+        "Weather HRR": weather_hrr,
+        "Weather HR": weather_hr,
+        "Park HRR": park_hrr,
+        "Park HR": park_hr,
+        "Park": venue,
+        "Protection": protection,
+        "Availability": availability,
+        "Component": component,
+    }
+
+
+def _ow_bfs_event_model(profile, ctx):
+    sc = (profile or {}).get("season_counts") or {}
+    logs = list((profile or {}).get("logs") or [])
+    pa = float(_ow_bfs_num((ctx or {}).get("Projected PA"), 4.15) or 4.15)
+
+    # Baseline per-PA event probabilities.
+    p1 = _ow_bfs_blended_rate(sc, logs, "1B", 0.145)
+    p2 = _ow_bfs_blended_rate(sc, logs, "2B", 0.045)
+    p3 = _ow_bfs_blended_rate(sc, logs, "3B", 0.004)
+    phr = _ow_bfs_blended_rate(sc, logs, "HR", 0.030)
+    pbb = _ow_bfs_blended_rate(sc, logs, "BB", 0.082)
+    phbp = _ow_bfs_blended_rate(sc, logs, "HBP", 0.011)
+    pk_batter = _ow_bfs_blended_rate(sc, logs, "K", 0.220)
+    pr = _ow_bfs_blended_rate(sc, logs, "R", 0.115)
+    prbi = _ow_bfs_blended_rate(sc, logs, "RBI", 0.110)
+    psb = _ow_bfs_blended_rate(sc, logs, "SB", 0.018)
+
+    ks = ctx.get("Key Stats") or {}
+    pctx = ctx.get("Pitcher") or {}
+    phrr = ctx.get("Pitch HRR") or {}
+    phrctx = ctx.get("Pitch HR") or {}
+    ps_hrr = ctx.get("Pitcher Split HRR") or {}
+    ps_hr = ctx.get("Pitcher Split HR") or {}
+    bctx = ctx.get("Batter Quality") or {}
+    run_contact = ctx.get("Run Contact") or {}
+
+    split_hrr = _ow_bfs_num(ks.get("Key Matchup Stats Factor HRR"), 1.0) or 1.0
+    split_hr = _ow_bfs_num(ks.get("Key Matchup Stats Factor HR"), 1.0) or 1.0
+    p_split_hrr = _ow_bfs_num(ps_hrr.get("Pitcher Split Factor HRR"), 1.0) or 1.0
+    p_split_hr = _ow_bfs_num(ps_hr.get("Pitcher Split Factor HR"), 1.0) or 1.0
+    pitch_hrr = _ow_bfs_num(phrr.get("Pitch Mix Matchup Factor"), 1.0) or 1.0
+    pitch_hr = _ow_bfs_num(phrctx.get("Pitch Mix Matchup Factor"), 1.0) or 1.0
+    bq_hrr = _ow_bfs_num(bctx.get("Batter Quality Factor HRR"), 1.0) or 1.0
+    bq_hr = _ow_bfs_num(bctx.get("Batter Quality Factor HR"), 1.0) or 1.0
+    rc_factor = _ow_bfs_num(run_contact.get("Pitcher Run/Contact Factor HRR"), 1.0) or 1.0
+    park_hrr = _ow_bfs_num(ctx.get("Park HRR"), 1.0) or 1.0
+    park_hr = _ow_bfs_num(ctx.get("Park HR"), 1.0) or 1.0
+    weather_hrr = _ow_bfs_num((ctx.get("Weather HRR") or {}).get("Weather Factor"), 1.0) or 1.0
+    weather_hr = _ow_bfs_num((ctx.get("Weather HR") or {}).get("Weather Factor"), 1.0) or 1.0
+
+    hit_adj = _ow_bfs_weighted_factor([
+        (split_hrr, 0.50), (p_split_hrr, 0.50), (pitch_hrr, 0.55),
+        (bq_hrr, 0.35), (rc_factor, 0.35), (park_hrr, 0.22), (weather_hrr, 0.12),
+    ], 0.84, 1.17)
+    hr_adj = _ow_bfs_weighted_factor([
+        (split_hr, 0.55), (p_split_hr, 0.55), (pitch_hr, 0.65),
+        (bq_hr, 0.45), (park_hr, 0.60), (weather_hr, 0.35),
+    ], 0.72, 1.35)
+
+    # Pitcher HR/BB characteristics add a small independent nudge.
+    phr9 = _ow_bfs_num(pctx.get("Pitcher HR9"), None)
+    if phr9 is not None:
+        hr_adj *= float(clamp(1.0 + (phr9 - 1.10) * 0.055, 0.94, 1.08))
+    pbb9 = _ow_bfs_num(pctx.get("Pitcher BB/9"), None)
+    bb_adj = 1.0 if pbb9 is None else float(clamp(1.0 + (pbb9 - 3.10) * 0.035, 0.90, 1.12))
+
+    p1 *= hit_adj
+    p2 *= hit_adj
+    p3 *= hit_adj
+    phr *= hr_adj
+    pbb *= bb_adj
+
+    # Strikeout probability is modeled separately from hit quality.
+    pitcher_k = _ow_bfs_pct(pctx.get("Pitcher K%"), None)
+    pitch_k = _ow_bfs_pct(phrr.get("Batter Pitch K%"), None)
+    k_parts = [(pk_batter, 0.58)]
+    if pitcher_k is not None:
+        k_parts.append((pitcher_k, 0.24))
+    if pitch_k is not None:
+        k_parts.append((pitch_k, 0.18))
+    kw = sum(w for _, w in k_parts) or 1.0
+    pk = sum(v * w for v, w in k_parts) / kw
+
+    # Productive contact / K interaction: very high pitch-specific whiff modestly
+    # suppresses non-HR hits; excellent contact does the opposite.
+    pitch_contact = _ow_bfs_pct(phrr.get("Batter Pitch Contact%"), None)
+    if pitch_contact is not None:
+        contact_adj = float(clamp(1.0 + (pitch_contact - 0.75) * 0.16, 0.96, 1.04))
+        p1 *= contact_adj
+        p2 *= contact_adj
+        p3 *= contact_adj
+
+    # Normalize with conservative bounds. K is an out outcome, not an extra PA.
+    probs = {
+        "1B": max(0.005, p1),
+        "2B": max(0.001, p2),
+        "3B": max(0.0002, p3),
+        "HR": max(0.0005, phr),
+        "BB": max(0.005, pbb),
+        "HBP": max(0.001, phbp),
+        "K": float(clamp(pk, 0.060, 0.410)),
+    }
+    non_out = sum(probs.values())
+    if non_out > 0.94:
+        scale = 0.94 / non_out
+        for k in probs:
+            probs[k] *= scale
+    probs["OUT"] = max(0.01, 1.0 - sum(probs.values()))
+
+    # Target R/RBI/SB expectations. Team environment and lineup position affect
+    # run creation, but are capped to prevent stacking the same signal repeatedly.
+    team_runs = _ow_bfs_num(ctx.get("Team Runs"), 4.35) or 4.35
+    team_factor = float(clamp((team_runs / 4.35) ** 0.45, 0.87, 1.16))
+    slot = int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"), 4) or 4))
+    run_slot = 1.08 if slot <= 2 else 1.03 if slot <= 4 else 0.96 if slot >= 7 else 1.0
+    rbi_slot = 1.10 if 3 <= slot <= 5 else 0.92 if slot <= 2 else 0.94 if slot >= 7 else 1.0
+    run_target = pa * pr * team_factor * run_slot
+    rbi_target = pa * prbi * team_factor * rbi_slot
+
+    component = ctx.get("Component") or {}
+    cr = _ow_bfs_num(component.get("Projected Runs"), None)
+    crbi = _ow_bfs_num(component.get("Projected RBI"), None)
+    if cr is not None:
+        run_target = 0.72 * run_target + 0.28 * cr
+    if crbi is not None:
+        rbi_target = 0.72 * rbi_target + 0.28 * crbi
+
+    sb_target = pa * psb
+    return {
+        "probs": probs,
+        "Projected Runs": float(clamp(run_target, 0.05, 1.65)),
+        "Projected RBI": float(clamp(rbi_target, 0.05, 1.85)),
+        "Projected SB": float(clamp(sb_target, 0.0, 0.85)),
+        "Hit Adj": hit_adj,
+        "HR Adj": hr_adj,
+        "BB Adj": bb_adj,
+        "Batter K/PA": pk_batter,
+        "Modeled K/PA": probs["K"],
+    }
+
+
+def _ow_bfs_simulate(player, line, profile, ctx, model, passes=OW_BATTER_FS_SIM_PASSES):
+    pa_mean = float(_ow_bfs_num(ctx.get("Projected PA"), 4.15) or 4.15)
+    pass_n = int(clamp(_ow_bfs_num(passes, OW_BATTER_FS_SIM_PASSES) or OW_BATTER_FS_SIM_PASSES, 5000, 50000))
+    seed = _ow_seed_from_text(player, "BFS", line, round(pa_mean, 2), OW_BATTER_FS_VERSION)
+    rng = np.random.default_rng(seed)
+
+    # Starters cluster around 4-5 PA. A normal/discrete PA draw is more realistic
+    # than a raw Poisson, which puts too much mass on 1-2 PA for a posted hitter.
+    lineup_confirmed = bool((ctx.get("Lineup") or {}).get("Lineup Confirmed"))
+    pa_sd = 0.48 if lineup_confirmed else 0.62
+    pa_counts = np.rint(rng.normal(pa_mean, pa_sd, size=pass_n)).astype(int)
+    pa_counts = np.clip(pa_counts, 3, 7)
+
+    order = ["1B", "2B", "3B", "HR", "BB", "HBP", "K", "OUT"]
+    probs = np.array([float(model["probs"][k]) for k in order], dtype=float)
+    probs = probs / probs.sum()
+
+    draws = np.zeros((pass_n, len(order)), dtype=int)
+    for n in np.unique(pa_counts):
+        idx = np.where(pa_counts == n)[0]
+        if len(idx):
+            draws[idx] = rng.multinomial(int(n), probs, size=len(idx))
+
+    one_b, two_b, three_b, hr, bb, hbp, kk, other_out = [draws[:, i].astype(float) for i in range(len(order))]
+    hits = one_b + two_b + three_b + hr
+    non_hr_onbase = one_b + two_b + three_b + bb + hbp
+
+    exp_hr = pa_mean * model["probs"]["HR"]
+    exp_nonhr_ob = max(0.12, pa_mean * sum(model["probs"][k] for k in ["1B", "2B", "3B", "BB", "HBP"]))
+    extra_run_target = max(0.0, float(model.get("Projected Runs", 0.5)) - exp_hr)
+    run_p = float(clamp(extra_run_target / exp_nonhr_ob, 0.0, 0.82))
+    extra_runs = rng.binomial(non_hr_onbase.astype(int), run_p)
+    runs = hr.astype(int) + extra_runs
+
+    # RBI are correlated with damage events. Home runs guarantee at least one RBI;
+    # remaining RBI volume is scaled to the model's projected RBI target.
+    nonhr_hit = one_b + two_b + three_b
+    exp_nonhr_hit = max(0.10, pa_mean * sum(model["probs"][k] for k in ["1B", "2B", "3B"]))
+    extra_rbi_target = max(0.0, float(model.get("Projected RBI", 0.5)) - exp_hr)
+    hit_scale = np.clip(nonhr_hit / exp_nonhr_hit, 0.0, 2.75)
+    rbi_lambda = np.clip(extra_rbi_target * (0.35 + 0.65 * hit_scale), 0.0, 3.5)
+    extra_rbi = rng.poisson(rbi_lambda)
+    rbi = hr.astype(int) + extra_rbi
+
+    exp_onbase = max(0.12, pa_mean * sum(model["probs"][k] for k in ["1B", "2B", "3B", "HR", "BB", "HBP"]))
+    onbase = hits + bb + hbp
+    sb_scale = np.clip(onbase / exp_onbase, 0.0, 2.5)
+    sb_lambda = np.clip(float(model.get("Projected SB", 0.08)) * (0.45 + 0.55 * sb_scale), 0.0, 1.25)
+    sb = rng.poisson(sb_lambda)
+
+    fs = _ow_bfs_score_components(one_b, two_b, three_b, hr, bb, hbp, runs, rbi, sb)
+    line_num = float(_ow_bfs_num(line, 0.0) or 0.0)
+    higher = fs > line_num
+    lower = fs < line_num
+    push = fs == line_num
+
+    mean = float(np.mean(fs))
+    median = float(np.median(fs))
+    std = float(np.std(fs))
+    cv = std / max(1.0, mean)
+    return {
+        "Simulation Passes": pass_n,
+        "FS Projection": round(mean, 2),
+        "FS Median": round(median, 2),
+        "FS P20": round(float(np.percentile(fs, 20)), 2),
+        "FS P80": round(float(np.percentile(fs, 80)), 2),
+        "FS P90": round(float(np.percentile(fs, 90)), 2),
+        "FS StdDev": round(std, 2),
+        "FS CV": round(cv, 3),
+        "Higher %": round(float(np.mean(higher)) * 100, 1),
+        "Lower %": round(float(np.mean(lower)) * 100, 1),
+        "Push %": round(float(np.mean(push)) * 100, 1),
+        "Fair Line": round(median, 2),
+        "H/G": round(float(np.mean(hits)), 2),
+        "1B/G": round(float(np.mean(one_b)), 2),
+        "2B/G": round(float(np.mean(two_b)), 2),
+        "3B/G": round(float(np.mean(three_b)), 3),
+        "HR/G": round(float(np.mean(hr)), 3),
+        "BB/G": round(float(np.mean(bb)), 2),
+        "HBP/G": round(float(np.mean(hbp)), 3),
+        "R/G": round(float(np.mean(runs)), 2),
+        "RBI/G": round(float(np.mean(rbi)), 2),
+        "SB/G": round(float(np.mean(sb)), 3),
+        "K/G": round(float(np.mean(kk)), 2),
+        "_raw_fs": fs,
+    }
+
+
+def _ow_bfs_skill_score(ctx, profile):
+    ks = ctx.get("Key Stats") or {}
+    b = ctx.get("Batter Quality") or {}
+    sc = (profile or {}).get("season_counts") or {}
+    pa = _ow_bfs_num(sc.get("PA"), 0.0) or 0.0
+    k_pct = ((_ow_bfs_num(sc.get("K"), 0.0) or 0.0) / pa * 100.0) if pa else 22.0
+    bb_pct = ((_ow_bfs_num(sc.get("BB"), 0.0) or 0.0) / pa * 100.0) if pa else 8.0
+    score = 50.0
+    xwoba = _ow_bfs_num(b.get("Batter xwOBA"), None)
+    xslg = _ow_bfs_num(b.get("Batter xSLG"), None)
+    hard = _ow_bfs_num(b.get("Batter HardHit%"), None)
+    barrel = _ow_bfs_num(b.get("Batter Barrel%"), None)
+    ops = _ow_bfs_num(ks.get("Season OPS"), None)
+    if xwoba is not None: score += (xwoba - 0.320) * 170
+    if xslg is not None: score += (xslg - 0.410) * 55
+    if hard is not None: score += (hard - 40.0) * 0.55
+    if barrel is not None: score += (barrel - 7.0) * 0.95
+    if ops is not None: score += (ops - 0.720) * 48
+    score += (22.0 - k_pct) * 0.40 + (bb_pct - 8.0) * 0.30
+    return int(round(clamp(score, 15, 99)))
+
+
+def _ow_bfs_match_score(ctx):
+    p = ctx.get("Pitcher") or {}
+    ph = ctx.get("Pitch HRR") or {}
+    ps = ctx.get("Pitcher Split HRR") or {}
+    rc = ctx.get("Run Contact") or {}
+    bp = ctx.get("Bullpen") or {}
+    score = 50.0
+    score += ((_ow_bfs_num(ph.get("Pitch Mix Matchup Factor"), 1.0) or 1.0) - 1.0) * 250
+    score += ((_ow_bfs_num(ps.get("Pitcher Split Factor HRR"), 1.0) or 1.0) - 1.0) * 210
+    score += ((_ow_bfs_num(rc.get("Pitcher Run/Contact Factor HRR"), 1.0) or 1.0) - 1.0) * 170
+    score += ((_ow_bfs_num(ctx.get("Park HRR"), 1.0) or 1.0) - 1.0) * 70
+    score += ((_ow_bfs_num((ctx.get("Weather HRR") or {}).get("Weather Factor"), 1.0) or 1.0) - 1.0) * 55
+    pk = _ow_bfs_num(p.get("Pitcher K%"), None)
+    if pk is not None: score += (22.0 - pk) * 0.45
+    pxba = _ow_bfs_num(p.get("Pitcher Allowed xBA"), None)
+    if pxba is not None: score += (pxba - 0.245) * 75
+    bp_score = _ow_bfs_num(bp.get("Bullpen Weakness Score"), None)
+    if bp_score is not None: score += (bp_score - 50.0) * 0.18
+    return int(round(clamp(score, 10, 99)))
+
+
+def _ow_bfs_form_score(ctx, profile):
+    b = ctx.get("Batter Quality") or {}
+    recent = _ow_bfs_recent_fs_summary(profile)
+    score = 50.0
+    r15_x = _ow_bfs_num(b.get("Recent 15d xwOBA"), None)
+    base_x = _ow_bfs_num(b.get("Batter xwOBA"), None)
+    r15_hh = _ow_bfs_num(b.get("Recent 15d HardHit%"), None)
+    base_hh = _ow_bfs_num(b.get("Batter HardHit%"), None)
+    r15_barrel = _ow_bfs_num(b.get("Recent 15d Barrel%"), None)
+    base_barrel = _ow_bfs_num(b.get("Batter Barrel%"), None)
+    if r15_x is not None and base_x is not None: score += (r15_x - base_x) * 170
+    elif r15_x is not None: score += (r15_x - 0.320) * 100
+    if r15_hh is not None and base_hh is not None: score += (r15_hh - base_hh) * 0.45
+    if r15_barrel is not None and base_barrel is not None: score += (r15_barrel - base_barrel) * 0.65
+    l10 = _ow_bfs_num(recent.get("L10 FS"), None)
+    sg = _ow_bfs_num(recent.get("Season FS/G"), None)
+    if l10 is not None and sg is not None:
+        score += clamp((l10 - sg) * 1.5, -15, 15)
+    return int(round(clamp(score, 10, 99)))
+
+
+def _ow_bfs_contact_score(ctx, profile, model):
+    b = ctx.get("Batter Quality") or {}
+    p = ctx.get("Pitcher") or {}
+    ph = ctx.get("Pitch HRR") or {}
+    sc = (profile or {}).get("season_counts") or {}
+    pa = _ow_bfs_num(sc.get("PA"), 0.0) or 0.0
+    batter_k = ((_ow_bfs_num(sc.get("K"), 0.0) or 0.0) / pa * 100.0) if pa else 22.0
+    whiff = _ow_bfs_num(b.get("Batter Whiff%"), None)
+    pitch_contact = _ow_bfs_num(ph.get("Batter Pitch Contact%"), None)
+    pitch_whiff = _ow_bfs_num(ph.get("Batter Pitch Whiff%"), None)
+    pk = _ow_bfs_num(p.get("Pitcher K%"), None)
+    pwhiff = _ow_bfs_num(p.get("Pitcher Whiff%"), None)
+    pzone_contact = _ow_bfs_num(p.get("Pitcher Zone Contact%"), None)
+    pxba = _ow_bfs_num(p.get("Pitcher Allowed xBA"), None)
+    hard = _ow_bfs_num(b.get("Batter HardHit%"), None)
+    score = 50.0
+    score += (22.0 - batter_k) * 0.70
+    if whiff is not None: score += (24.0 - whiff) * 0.75
+    if pitch_contact is not None: score += (pitch_contact - 75.0) * 0.50
+    if pitch_whiff is not None: score += (25.0 - pitch_whiff) * 0.35
+    if pk is not None: score += (22.0 - pk) * 0.45
+    if pwhiff is not None: score += (25.0 - pwhiff) * 0.28
+    if pzone_contact is not None: score += (82.0 - pzone_contact) * -0.20  # higher allowed contact helps hitter
+    if pxba is not None: score += (pxba - 0.245) * 90
+    if hard is not None: score += (hard - 40.0) * 0.25
+    score += ((_ow_bfs_num(model.get("Hit Adj"), 1.0) or 1.0) - 1.0) * 70
+    return int(round(clamp(score, 8, 99)))
+
+
+def _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict=False):
+    checks = [
+        bool((profile or {}).get("player_id")),
+        (_ow_bfs_num((profile or {}).get("season_counts", {}).get("PA"), 0) or 0) >= 80,
+        bool((profile or {}).get("logs")),
+        _ow_bfs_num((ctx.get("Batter Quality") or {}).get("Batter xwOBA"), None) is not None,
+        _ow_bfs_num((ctx.get("Pitch HRR") or {}).get("Pitch Mix Matchup Factor"), None) is not None,
+        _ow_bfs_num((ctx.get("Pitcher") or {}).get("Pitcher K%"), None) is not None,
+        _ow_bfs_num((ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Factor HRR"), None) is not None,
+        ctx.get("Team") not in (None, "", "—"),
+    ]
+    coverage = sum(bool(x) for x in checks) / len(checks)
+    best_prob = max(_ow_bfs_num(sim.get("Higher %"), 50) or 50, _ow_bfs_num(sim.get("Lower %"), 50) or 50)
+    score = 42 + coverage * 28 + min(16, max(0, best_prob - 50) * 0.65)
+    if bool((ctx.get("Lineup") or {}).get("Lineup Confirmed")): score += 4
+    if bool((ctx.get("Pitcher Confirm") or {}).get("Pitcher Confirmed")): score += 3
+    cv = _ow_bfs_num(sim.get("FS CV"), 0.8) or 0.8
+    if cv >= 1.0: score -= 7
+    elif cv <= 0.70: score += 3
+    if distribution_conflict: score -= 8
+    return int(round(clamp(score, 35, 92))), int(round(coverage * 100))
+
+
+def _ow_bfs_flags(ctx, profile, model, sim, skill, match, form, contact, distribution_conflict):
+    flags = []
+    ph = ctx.get("Pitch HRR") or {}
+    ps = ctx.get("Pitcher Split HRR") or {}
+    b = ctx.get("Batter Quality") or {}
+    p = ctx.get("Pitcher") or {}
+    bp = ctx.get("Bullpen") or {}
+    slot = int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"), 4) or 4))
+    if contact >= 76: flags.append("🔥 Elite contact matchup")
+    elif contact <= 35: flags.append("⚠️ Contact risk")
+    if (_ow_bfs_num(ph.get("Pitch Mix Matchup Factor"), 1.0) or 1.0) >= 1.025: flags.append("🟢 Pitch-mix advantage")
+    elif (_ow_bfs_num(ph.get("Pitch Mix Matchup Factor"), 1.0) or 1.0) <= 0.975: flags.append("⚠️ Pitch-mix risk")
+    if (_ow_bfs_num(ps.get("Pitcher Split Factor HRR"), 1.0) or 1.0) >= 1.025: flags.append("🔥 Pitcher weak vs batter hand")
+    r15 = _ow_bfs_num(b.get("Recent 15d xwOBA"), None)
+    bx = _ow_bfs_num(b.get("Batter xwOBA"), None)
+    if r15 is not None and bx is not None and r15 - bx >= 0.035: flags.append("⚡ Hot quality-contact form")
+    if (_ow_bfs_num(model.get("Modeled K/PA"), 0.22) or 0.22) >= 0.285: flags.append("⚠️ High K matchup")
+    if slot >= 7: flags.append("⚠️ Lower lineup position")
+    bp_score = _ow_bfs_num(bp.get("Bullpen Weakness Score"), None)
+    if bp_score is not None and bp_score <= 42: flags.append("⚠️ Strong opposing bullpen")
+    if distribution_conflict: flags.append("⚠️ Mean/P50 distribution conflict")
+    if not bool((ctx.get("Lineup") or {}).get("Lineup Confirmed")): flags.append("⚠️ Projected lineup")
+    if not bool((ctx.get("Matchup Integrity") or {}).get("Pitcher Matchup Verified")): flags.append("⚠️ Verify starting pitcher")
+    if (_ow_bfs_num(sim.get("FS CV"), 0.8) or 0.8) >= 1.0: flags.append("🟠 Volatile distribution")
+    return flags[:8]
+
+
+def _ow_build_batter_fantasy_row(raw):
+    player = str((raw or {}).get("Player") or "").strip()
+    line = _ow_bfs_num((raw or {}).get("Line"), None)
+    if not player or line is None:
+        return None
+    role_info = _ow_bfs_classify_ud_row(raw)
+    if role_info.get("Role") != "BATTER":
+        return None
+
+    profile = _ow_bfs_event_profile(player)
+    if not profile.get("player_id"):
+        return None
+    ctx = _ow_bfs_build_context(player, raw, profile)
+    model = _ow_bfs_event_model(profile, ctx)
+    sim = _ow_bfs_simulate(player, line, profile, ctx, model)
+
+    mean = _ow_bfs_num(sim.get("FS Projection"), 0.0) or 0.0
+    median = _ow_bfs_num(sim.get("FS Median"), 0.0) or 0.0
+    higher = _ow_bfs_num(sim.get("Higher %"), 50.0) or 50.0
+    lower = _ow_bfs_num(sim.get("Lower %"), 50.0) or 50.0
+    mean_side = "HIGHER" if mean > line else "LOWER" if mean < line else "PUSH"
+    prob_side = "HIGHER" if higher > lower else "LOWER" if lower > higher else "PASS"
+    distribution_conflict = prob_side in {"HIGHER", "LOWER"} and mean_side in {"HIGHER", "LOWER"} and prob_side != mean_side
+
+    skill = _ow_bfs_skill_score(ctx, profile)
+    match = _ow_bfs_match_score(ctx)
+    form = _ow_bfs_form_score(ctx, profile)
+    contact = _ow_bfs_contact_score(ctx, profile, model)
+    conf, data_score = _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict)
+
+    best_prob = max(higher, lower)
+    if best_prob < 52.0:
+        pick = "PASS"
+    else:
+        pick = prob_side
+    edge = round(mean - float(line), 2)
+    median_edge = round(median - float(line), 2)
+
+    cv = _ow_bfs_num(sim.get("FS CV"), 0.8) or 0.8
+    volatility = "STABLE" if cv <= 0.70 else "VOLATILE" if cv >= 1.0 else "NORMAL"
+    flags = _ow_bfs_flags(ctx, profile, model, sim, skill, match, form, contact, distribution_conflict)
+    ks = ctx.get("Key Stats") or {}
+    pctx = ctx.get("Pitcher") or {}
+    bctx = ctx.get("Batter Quality") or {}
+    ph = ctx.get("Pitch HRR") or {}
+    recent = _ow_bfs_recent_fs_summary(profile)
+    season_avg = _ow_bfs_num(ks.get("Season AVG"), None)
+    season_slg = _ow_bfs_num(ks.get("Season SLG"), None)
+    iso = (season_slg - season_avg) if season_slg is not None and season_avg is not None else None
+    woba = _ow_bfs_num(bctx.get("Batter xwOBA"), None)
+    if woba is None:
+        woba = _ow_bfs_num(ks.get("Season OBP"), None)
+
+    row = {
+        "Player": player,
+        "UD Player": raw.get("Player"),
+        "Player ID": profile.get("player_id"),
+        "Role": role_info.get("Role"),
+        "Role Source": role_info.get("Role Source"),
+        "Position": role_info.get("Primary Position"),
+        "Bats": role_info.get("Bats") or ctx.get("Batter Hand"),
+        "Team": ctx.get("Team"),
+        "Opponent": ctx.get("Opponent"),
+        "Matchup": ctx.get("Matchup"),
+        "Opp Pitcher": pctx.get("Opp Pitcher"),
+        "Pitcher Hand": pctx.get("Pitcher Hand"),
+        "Pitcher ERA": pctx.get("Pitcher ERA"),
+        "Pitcher K%": pctx.get("Pitcher K%"),
+        "Pitcher Whiff%": pctx.get("Pitcher Whiff%"),
+        "Pitcher Allowed xBA": pctx.get("Pitcher Allowed xBA"),
+        "Pitcher Allowed xwOBA": pctx.get("Pitcher Allowed xwOBA"),
+        "Pitcher Split Factor": (ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Factor HRR"),
+        "Pitcher Split Note": (ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Note"),
+        "Primary Pitch": pctx.get("Primary Pitch"),
+        "Pitch Mix Matchup Factor": ph.get("Pitch Mix Matchup Factor"),
+        "Pitch Mix Matchup Pitch": ph.get("Pitch Mix Matchup Pitch"),
+        "Batter Pitch Contact%": ph.get("Batter Pitch Contact%"),
+        "Batter Pitch Whiff%": ph.get("Batter Pitch Whiff%"),
+        "Batter Pitch wOBA": ph.get("Batter Pitch wOBA"),
+        "Line": float(line),
+        "Projection": round(mean, 2),
+        "Mean Projection": round(mean, 2),
+        "Median": round(median, 2),
+        "Fair Line": sim.get("Fair Line"),
+        "P20": sim.get("FS P20"),
+        "P80": sim.get("FS P80"),
+        "P90": sim.get("FS P90"),
+        "Edge": edge,
+        "Median Edge": median_edge,
+        "Pick": pick,
+        "Higher %": higher,
+        "Lower %": lower,
+        "Push %": sim.get("Push %"),
+        "Win Probability %": round(best_prob, 1),
+        "Distribution Conflict": "YES" if distribution_conflict else "NO",
+        "Confidence": conf,
+        "Data Score": data_score,
+        "Skill": skill,
+        "Match": match,
+        "Form": form,
+        "Contact": contact,
+        "Volatility": volatility,
+        "FS CV": sim.get("FS CV"),
+        "Projected PA": round(float(ctx.get("Projected PA") or 0), 2),
+        "Lineup Slot": (ctx.get("Lineup") or {}).get("Lineup Slot"),
+        "Lineup Status": (ctx.get("Lineup") or {}).get("Lineup Status"),
+        "Lineup Confirmed": (ctx.get("Lineup") or {}).get("Lineup Confirmed"),
+        "Pitcher Matchup Verified": (ctx.get("Matchup Integrity") or {}).get("Pitcher Matchup Verified"),
+        "H/G": sim.get("H/G"),
+        "1B/G": sim.get("1B/G"),
+        "2B/G": sim.get("2B/G"),
+        "3B/G": sim.get("3B/G"),
+        "HR/G": sim.get("HR/G"),
+        "BB/G": sim.get("BB/G"),
+        "HBP/G": sim.get("HBP/G"),
+        "R/G": sim.get("R/G"),
+        "RBI/G": sim.get("RBI/G"),
+        "SB/G": sim.get("SB/G"),
+        "K/G": sim.get("K/G"),
+        "AVG": season_avg,
+        "OPS": ks.get("Season OPS"),
+        "wOBA/xwOBA": woba,
+        "ISO": None if iso is None else round(float(iso), 3),
+        "Batter HardHit%": bctx.get("Batter HardHit%"),
+        "Batter Barrel%": bctx.get("Batter Barrel%"),
+        "Batter Whiff%": bctx.get("Batter Whiff%"),
+        "Recent 15d xwOBA": bctx.get("Recent 15d xwOBA"),
+        "Recent 15d HardHit%": bctx.get("Recent 15d HardHit%"),
+        "Recent 15d Barrel%": bctx.get("Recent 15d Barrel%"),
+        "L5 FS": None if recent.get("L5 FS") is None else round(recent.get("L5 FS"), 2),
+        "L10 FS": None if recent.get("L10 FS") is None else round(recent.get("L10 FS"), 2),
+        "Season FS/G": None if recent.get("Season FS/G") is None else round(recent.get("Season FS/G"), 2),
+        "Flags": " | ".join(flags) if flags else "No major flags",
+        "Model Hit Adj": round(float(model.get("Hit Adj", 1.0)), 3),
+        "Model HR Adj": round(float(model.get("HR Adj", 1.0)), 3),
+        "Modeled K/PA %": round(float(model.get("Modeled K/PA", 0.22)) * 100, 1),
+        "Team Run Environment": ctx.get("Team Run Note"),
+        "Park": ctx.get("Park"),
+        "Scoring Profile": "UD Hitter: 1B3 2B6 3B8 HR10 BB3 HBP3 R2 RBI2 SB4",
+        "Simulation Passes": sim.get("Simulation Passes"),
+        "Source": "Underdog Fantasy Points line + MLB/Statcast event model",
+        "Evidence": str(raw.get("Evidence", ""))[:350],
+        "Projection Version": OW_BATTER_FS_VERSION,
+    }
+    return row
+
+
+def build_v3_batter_fantasy_table():
+    raw_rows, source_meta = _ow_fetch_ud_batter_fantasy_lines()
+    if not raw_rows:
+        return pd.DataFrame(), source_meta
+    rows = []
+    errors = []
+    for raw in list(raw_rows)[:OW_BATTER_FS_MAX_ROWS]:
+        try:
+            row = _ow_build_batter_fantasy_row(raw)
+            if row:
+                rows.append(row)
+        except Exception as e:
+            errors.append(f"{raw.get('Player')}: {e}")
+    if not rows:
+        meta = dict(source_meta)
+        meta.update({"built": 0, "errors": errors[:10], "status": "No batter fantasy projections built"})
+        return pd.DataFrame(), meta
+    df = pd.DataFrame(rows)
+    df["_sort_prob"] = pd.to_numeric(df.get("Win Probability %"), errors="coerce").fillna(0)
+    df["_sort_conf"] = pd.to_numeric(df.get("Confidence"), errors="coerce").fillna(0)
+    df = df.sort_values(["_sort_prob", "_sort_conf"], ascending=[False, False]).drop(columns=["_sort_prob", "_sort_conf"])
+    meta = dict(source_meta)
+    meta.update({"built": len(df), "errors": errors[:10], "status": "OK", "version": OW_BATTER_FS_VERSION})
+    return df, meta
+
+
+def _ow_bfs_html_num(v, digits=2, suffix=""):
+    x = _ow_bfs_num(v, None)
+    if x is None:
+        return "—"
+    return f"{x:.{digits}f}{suffix}"
+
+
+def _ow_bfs_card_html(row):
+    esc = html.escape
+    player = esc(str(row.get("Player") or "—"))
+    team = esc(str(row.get("Team") or "—"))
+    pos = esc(str(row.get("Position") or "—"))
+    bats = esc(str(row.get("Bats") or "—"))
+    opp_pitcher = esc(str(row.get("Opp Pitcher") or "—"))
+    p_hand = esc(str(row.get("Pitcher Hand") or "—"))
+    p_era = _ow_bfs_html_num(row.get("Pitcher ERA"), 2)
+    p_k = _ow_bfs_html_num(row.get("Pitcher K%"), 1, "%")
+    proj = _ow_bfs_html_num(row.get("Projection"), 1)
+    p20 = _ow_bfs_html_num(row.get("P20"), 1)
+    p80 = _ow_bfs_html_num(row.get("P80"), 1)
+    line = _ow_bfs_html_num(row.get("Line"), 1)
+    pick = str(row.get("Pick") or "PASS").upper()
+    winp = _ow_bfs_num(row.get("Win Probability %"), 50) or 50
+    conf = int(round(_ow_bfs_num(row.get("Confidence"), 50) or 50))
+    skill = int(round(_ow_bfs_num(row.get("Skill"), 50) or 50))
+    match = int(round(_ow_bfs_num(row.get("Match"), 50) or 50))
+    form = int(round(_ow_bfs_num(row.get("Form"), 50) or 50))
+    contact = int(round(_ow_bfs_num(row.get("Contact"), 50) or 50))
+    vol = esc(str(row.get("Volatility") or "NORMAL"))
+    flags = [x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()][:4]
+    flag_html = "".join(f"<span class='ow-bfs-flag'>{esc(x)}</span>" for x in flags)
+    if pick == "HIGHER":
+        badge = "🔥 HIGHER"
+        badge_class = "higher"
+    elif pick == "LOWER":
+        badge = "⬇ LOWER"
+        badge_class = "lower"
+    else:
+        badge = "⚠ PASS"
+        badge_class = "pass"
+
+    def score_block(label, val):
+        return f"<div class='ow-bfs-score'><div><span>{label}</span><b>{val}</b></div><div class='ow-bfs-track'><i style='width:{max(0,min(100,val))}%'></i></div></div>"
+
+    def mini(label, value, digits=2):
+        return f"<div class='ow-bfs-mini'><strong>{_ow_bfs_html_num(value,digits)}</strong><span>{label}</span></div>"
+
+    return f"""
+    <div class="ow-bfs-card">
+      <div class="ow-bfs-head">
+        <div class="ow-bfs-player-wrap">
+          <div class="ow-bfs-player">{player}</div>
+          <div class="ow-bfs-meta">{team} {pos} · {bats}HB</div>
+          <div class="ow-bfs-opp">vs {opp_pitcher} {p_hand}HP · ERA {p_era} · K {p_k}</div>
+        </div>
+        <div class="ow-bfs-proj">
+          <span>PROJ FPTS</span>
+          <strong>{proj}</strong>
+          <small>{p20}–{p80}</small>
+        </div>
+      </div>
+      <div class="ow-bfs-pick-row">
+        <span class="ow-bfs-badge {badge_class}">{badge} {line}</span>
+        <span class="ow-bfs-prob">{winp:.0f}%</span>
+      </div>
+      <div class="ow-bfs-conf"><div><span>CONFIDENCE</span><b>{conf}/100</b></div><div class="ow-bfs-conf-track"><i style="width:{conf}%"></i></div></div>
+      <div class="ow-bfs-scores">
+        {score_block("SKILL", skill)}
+        {score_block("MATCH", match)}
+        {score_block("FORM", form)}
+        {score_block("CONTACT", contact)}
+      </div>
+      <div class="ow-bfs-minis">
+        {mini("H/G", row.get("H/G"))}
+        {mini("HR/G", row.get("HR/G"))}
+        {mini("2B/G", row.get("2B/G"))}
+        {mini("R/G", row.get("R/G"))}
+        {mini("RBI/G", row.get("RBI/G"))}
+        {mini("BB/G", row.get("BB/G"))}
+        {mini("SB/G", row.get("SB/G"),3)}
+        {mini("K/G", row.get("K/G"))}
+      </div>
+      <div class="ow-bfs-bottom">
+        <span>AVG {_ow_bfs_html_num(row.get("AVG"),3)}</span>
+        <span>OPS {_ow_bfs_html_num(row.get("OPS"),3)}</span>
+        <span>xwOBA {_ow_bfs_html_num(row.get("wOBA/xwOBA"),3)}</span>
+        <span>ISO {_ow_bfs_html_num(row.get("ISO"),3)}</span>
+        <b>{vol}</b>
+      </div>
+      <div class="ow-bfs-flags">{flag_html}</div>
+    </div>
+    """
+
+
+def _ow_bfs_render_cards(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    css = """
+    <style>
+    .ow-bfs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(355px,1fr));gap:14px;margin-top:10px}
+    .ow-bfs-card{background:linear-gradient(180deg,#0b0b16 0%,#090910 100%);border:1px solid #29233d;border-radius:18px;padding:17px 18px;box-shadow:0 9px 26px rgba(0,0,0,.28);color:#f5f5fb;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .ow-bfs-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .ow-bfs-player{font-size:22px;font-weight:900;line-height:1.05;letter-spacing:-.35px}
+    .ow-bfs-meta{font-size:13px;color:#aaa9b6;margin-top:5px;font-weight:700}
+    .ow-bfs-opp{font-size:12px;color:#777687;margin-top:3px}
+    .ow-bfs-proj{text-align:right;min-width:92px}
+    .ow-bfs-proj span{display:block;font-size:9px;color:#777687;font-weight:900;letter-spacing:.8px}
+    .ow-bfs-proj strong{display:block;font-size:39px;line-height:1;color:#f1c84c;font-weight:850;margin-top:3px}
+    .ow-bfs-proj small{font-size:11px;color:#747383}
+    .ow-bfs-pick-row{display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px}
+    .ow-bfs-badge{display:inline-block;border-radius:9px;padding:5px 9px;font-size:11px;font-weight:900;border:1px solid}
+    .ow-bfs-badge.higher{color:#59e6a9;border-color:#277b5b;background:#0b2d22}
+    .ow-bfs-badge.lower{color:#ff6c87;border-color:#79334a;background:#30111a}
+    .ow-bfs-badge.pass{color:#f0ca55;border-color:#786528;background:#2f290d}
+    .ow-bfs-prob{font-size:12px;font-weight:900;color:#ececf3}
+    .ow-bfs-conf>div:first-child{display:flex;justify-content:space-between;font-size:10px;color:#888798;font-weight:900}
+    .ow-bfs-conf-track,.ow-bfs-track{height:6px;background:#222130;border-radius:99px;overflow:hidden;margin-top:5px}
+    .ow-bfs-conf-track i{display:block;height:100%;background:linear-gradient(90deg,#44d8a6,#77e8c3);border-radius:99px}
+    .ow-bfs-scores{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:11px}
+    .ow-bfs-score>div:first-child{display:flex;justify-content:space-between;gap:4px;font-size:9px;color:#777687;font-weight:850}
+    .ow-bfs-score b{color:#deddea}
+    .ow-bfs-score:nth-child(1) .ow-bfs-track i{display:block;height:100%;background:#a783ff}
+    .ow-bfs-score:nth-child(2) .ow-bfs-track i{display:block;height:100%;background:#f1c84c}
+    .ow-bfs-score:nth-child(3) .ow-bfs-track i{display:block;height:100%;background:#49d69e}
+    .ow-bfs-score:nth-child(4) .ow-bfs-track i{display:block;height:100%;background:#65c9f2}
+    .ow-bfs-minis{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:13px}
+    .ow-bfs-mini{background:#10101c;border:1px solid #1c1b2a;border-radius:10px;text-align:center;padding:7px 3px}
+    .ow-bfs-mini strong{display:block;font-size:16px;color:#63dfa7;font-weight:900}
+    .ow-bfs-mini span{display:block;font-size:9px;color:#727180;font-weight:800;margin-top:1px}
+    .ow-bfs-bottom{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;font-size:10px;color:#858493}
+    .ow-bfs-bottom b{margin-left:auto;color:#e6a85e;border:1px solid #7f5c31;border-radius:7px;padding:1px 5px}
+    .ow-bfs-flags{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
+    .ow-bfs-flag{font-size:9px;color:#c9c8d4;background:#151422;border:1px solid #25243a;border-radius:7px;padding:3px 6px}
+    @media(max-width:700px){
+      .ow-bfs-grid{grid-template-columns:1fr;gap:10px}
+      .ow-bfs-card{padding:14px;border-radius:15px}
+      .ow-bfs-player{font-size:20px}
+      .ow-bfs-proj strong{font-size:35px}
+      .ow-bfs-scores{gap:6px}
+      .ow-bfs-minis{grid-template-columns:repeat(4,1fr);gap:5px}
+      .ow-bfs-mini strong{font-size:14px}
+    }
+    </style>
+    """
+    cards = "".join(_ow_bfs_card_html(r.to_dict()) for _, r in df.iterrows())
+    st.markdown(css + f"<div class='ow-bfs-grid'>{cards}</div>", unsafe_allow_html=True)
+
+
+def render_v3_batter_fantasy_tab():
+    st.markdown('<div class="section-title-pro">⚾ Batter Fantasy — Underdog Event Model</div>', unsafe_allow_html=True)
+    st.caption(
+        "Underdog Fantasy Points → BATTER/PITCHER safety gate → PA/event probabilities → "
+        "12,000-game Monte Carlo → Higher/Lower probability. H+R+RBI logic is untouched."
+    )
+
+    # IMPORTANT: Streamlit executes every tab body on every rerun. Do not do the
+    # expensive mixed-market role/Statcast pull merely because another tab reran.
+    # The Batter Fantasy source and model are intentionally refreshed only by the
+    # explicit build button below, then persisted in session_state.
+    source_meta = st.session_state.get("ow_bfs_source_meta", {})
+
+    c1, c2 = st.columns([2, 1])
+    build_now = c1.button(
+        "🔄 Pull Underdog + Build Batter Fantasy",
+        key=_v3_unique_widget_key("ow_bfs_build"),
+        use_container_width=True,
+        type="primary",
+    )
+    clear_now = c2.button(
+        "Clear FS cache",
+        key=_v3_unique_widget_key("ow_bfs_clear"),
+        use_container_width=True,
+    )
+
+    if clear_now:
+        for key in ["ow_bfs_df", "ow_bfs_meta", "ow_bfs_source_meta", "ow_bfs_built_at"]:
+            st.session_state.pop(key, None)
+        # Clear only Batter Fantasy-related caches plus the existing UD FS feed so
+        # the next explicit build really is a fresh board pull.
+        for fn in [
+            _ow_bfs_event_profile,
+            _ow_bfs_primary_role,
+            _ow_fetch_ud_batter_fantasy_lines,
+            _v3_fetch_ud_batter_fs_rows,
+        ]:
+            try:
+                fn.clear()
+            except Exception:
+                pass
+        st.success("Batter Fantasy board + source caches cleared.")
+        source_meta = {}
+
+    if build_now:
+        # Force a fresh sportsbook board for an explicit user refresh, while
+        # leaving all HRR/HR caches and projection logic untouched.
+        for fn in [_ow_fetch_ud_batter_fantasy_lines, _v3_fetch_ud_batter_fs_rows]:
+            try:
+                fn.clear()
+            except Exception:
+                pass
+        with st.spinner("Building Batter Fantasy event model from Underdog + MLB/Statcast..."):
+            df_new, meta_new = build_v3_batter_fantasy_table()
+            st.session_state["ow_bfs_df"] = df_new
+            st.session_state["ow_bfs_meta"] = meta_new
+            st.session_state["ow_bfs_source_meta"] = meta_new
+            st.session_state["ow_bfs_built_at"] = now_iso()
+            source_meta = meta_new
+
+    # Source diagnostics are from the most recent explicit pull; no hidden network
+    # work is triggered just to draw these metrics.
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("UD Fantasy Rows", source_meta.get("raw", 0))
+    m2.metric("Batters", source_meta.get("batters", 0))
+    m3.metric("Pitchers Filtered", source_meta.get("pitchers", 0))
+    m4.metric("Unknown Held Out", source_meta.get("unknown", 0))
+
+    if source_meta.get("pitcher_examples"):
+        st.caption("Pitcher rows filtered: " + ", ".join(source_meta.get("pitcher_examples", [])[:5]))
+    if source_meta.get("unknown_examples"):
+        st.warning("Held out ambiguous FS rows: " + ", ".join(source_meta.get("unknown_examples", [])[:5]))
+
+    df = st.session_state.get("ow_bfs_df")
+    meta = st.session_state.get("ow_bfs_meta", {})
+    built_at = st.session_state.get("ow_bfs_built_at")
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        if source_meta.get("raw", 0) and not source_meta.get("batters", 0):
+            st.warning("Underdog Fantasy Points rows were found, but no safe batter rows passed classification.")
+        else:
+            st.info(
+                "Tap **Pull Underdog + Build Batter Fantasy** to fetch the current Fantasy Points board "
+                "and run the heavier Statcast/contact model."
+            )
+        with st.expander("Batter Fantasy source/debug", expanded=False):
+            st.write(source_meta or {"status": "Not pulled in this session"})
+            try:
+                st.write("Existing UD parser debug:", st.session_state.get("fs_ud_debug", {}))
+            except Exception:
+                pass
+        return
+
+    if built_at:
+        st.caption(f"Built: {built_at} · Model {OW_BATTER_FS_VERSION}")
+
+    # Board controls.
+    a, b, c = st.columns([1.4, 1.2, 1.0])
+    search = a.text_input("Search player", "", key=_v3_unique_widget_key("ow_bfs_search"))
+    sort_mode = b.selectbox(
+        "Sort",
+        ["Win Probability", "Projection", "Contact", "Skill", "Edge"],
+        key=_v3_unique_widget_key("ow_bfs_sort"),
+    )
+    min_conf = c.slider("Min confidence", 35, 90, 45, 1, key=_v3_unique_widget_key("ow_bfs_min_conf"))
+
+    view = df.copy()
+    if search.strip():
+        view = view[view["Player"].astype(str).str.contains(search.strip(), case=False, na=False)]
+    view = view[pd.to_numeric(view.get("Confidence"), errors="coerce").fillna(0) >= min_conf]
+    sort_map = {
+        "Win Probability": "Win Probability %",
+        "Projection": "Projection",
+        "Contact": "Contact",
+        "Skill": "Skill",
+        "Edge": "Edge",
+    }
+    sort_col = sort_map.get(sort_mode, "Win Probability %")
+    if sort_col in view.columns:
+        if sort_mode == "Edge":
+            view["_abs_edge"] = pd.to_numeric(view["Edge"], errors="coerce").abs()
+            view = view.sort_values("_abs_edge", ascending=False).drop(columns=["_abs_edge"])
+        else:
+            view = view.sort_values(sort_col, ascending=False, na_position="last")
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Projected", len(view))
+    k2.metric("Higher", int((view.get("Pick", pd.Series(dtype=str)).astype(str) == "HIGHER").sum()))
+    k3.metric("Lower", int((view.get("Pick", pd.Series(dtype=str)).astype(str) == "LOWER").sum()))
+    k4.metric("60%+ Prob", int((pd.to_numeric(view.get("Win Probability %"), errors="coerce") >= 60).sum()))
+
+    _ow_bfs_render_cards(view)
+
+    with st.expander("Full Batter Fantasy data table", expanded=False):
+        front = [c for c in [
+            "Player","Team","Position","Bats","Opponent","Opp Pitcher","Pitcher Hand",
+            "Line","Projection","Median","P20","P80","Fair Line","Edge","Median Edge",
+            "Pick","Higher %","Lower %","Win Probability %","Distribution Conflict",
+            "Confidence","Data Score","Skill","Match","Form","Contact","Volatility",
+            "Projected PA","Lineup Slot","Lineup Status","H/G","1B/G","2B/G","3B/G",
+            "HR/G","BB/G","R/G","RBI/G","SB/G","K/G","AVG","OPS","wOBA/xwOBA","ISO",
+            "Batter HardHit%","Batter Barrel%","Batter Whiff%","Pitch Mix Matchup Factor",
+            "Batter Pitch Contact%","Pitcher ERA","Pitcher K%","Pitcher Allowed xBA",
+            "Flags","Role Source","Scoring Profile","Projection Version"
+        ] if c in view.columns]
+        rest = [c for c in view.columns if c not in front]
+        st.dataframe(view[front + rest], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download Batter Fantasy CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name="batter_fantasy_underdog_board.csv",
+        mime="text/csv",
+        key=_v3_unique_widget_key("ow_bfs_download"),
+        use_container_width=True,
+    )
+
+    with st.expander("Model / source audit", expanded=False):
+        st.write(meta)
+        st.code(
+            "PA → 1B / 2B / 3B / HR / BB / HBP / K / OUT\n"
+            "→ conditional Runs / RBI / SB\n"
+            "→ 12,000 simulated games\n"
+            "→ Underdog hitter fantasy scoring\n"
+            "→ Mean + P50 + P20/P80 + Higher/Lower probability"
+        )
+        st.caption("Mean-vs-probability conflicts are explicitly flagged instead of forcing the mean projection side.")
+
+
+
+
+# ============================================================
+# BATTER FANTASY V2 — FULL BOARD / BAYES / STARTER-BULLPEN / LEARNING
+# Added 2026-08-12.
+#
+# V2 is intentionally isolated from the existing H+R+RBI and Home Run engines.
+# It overrides only Batter Fantasy + generic batter snapshot grading helpers so
+# the fantasy market can be persisted/graded alongside HRR/HR.
+# ============================================================
+OW_BATTER_FS_VERSION = "OW_BATTER_FS_EVENT_MC_V2_FULL_BOARD_2026_08_12"
+OW_BATTER_FS_SIM_PASSES = 12000
+OW_BATTER_FS_MAX_ROWS = None  # FULL Underdog hitter board; no silent 36-player truncation.
+OW_BATTER_FS_MIN_PLAY_PROB = 55.0
+OW_BATTER_FS_MIN_DATA_SCORE = 65
+OW_BATTER_FS_XGB_MIN_GRADED = 120
+OW_BATTER_FS_XGB_MAX_ADJ = 0.75
+
+# Preserve V1 functions for safe fallbacks/auditing.
+_ow_bfs_event_profile_v1 = _ow_bfs_event_profile
+_ow_bfs_build_context_v1 = _ow_bfs_build_context
+_ow_bfs_event_model_v1 = _ow_bfs_event_model
+_ow_bfs_simulate_v1 = _ow_bfs_simulate
+_ow_bfs_contact_score_v1 = _ow_bfs_contact_score
+_ow_bfs_match_score_v1 = _ow_bfs_match_score
+_ow_batter_pick_side_v1 = _ow_batter_pick_side
+_ow_batter_result_key_v1 = _ow_batter_result_key
+_ow_get_actual_batter_boxscore_v1 = _ow_get_actual_batter_boxscore
+_ow_grade_batter_snapshots_v1 = _ow_grade_batter_snapshots
+_ow_save_batter_snapshots_v1 = _ow_save_batter_snapshots
+
+
+def _ow_bfs_market_type(raw):
+    """Best-effort MAIN/ALT/PROMO classification from the Underdog evidence blob."""
+    ev = str((raw or {}).get("Evidence") or "").lower()
+    if any(x in ev for x in ["promo", "promotion", "boost", "discount", "special line", "special pick"]):
+        return "PROMO"
+    if any(x in ev for x in ["alternate", " alt ", "alt-line", "alt line"]):
+        return "ALT"
+    return "MAIN/UNVERIFIED"
+
+
+def _ow_bfs_line_validation(raw):
+    """Validate that the row is an active Underdog hitter Fantasy Points-style line.
+
+    The upstream relationship parser already enforces active-line state. This second
+    gate keeps obvious alt/promo/non-FS rows out of official decisions while still
+    allowing them to render for audit.
+    """
+    r = raw or {}
+    source = str(r.get("Source") or "").lower()
+    evidence = str(r.get("Evidence") or "").lower()
+    market = str(r.get("Market") or "").lower()
+    line = _ow_bfs_num(r.get("Line"), None)
+    mt = _ow_bfs_market_type(r)
+    fantasy_evidence = any(x in (evidence + " " + market) for x in [
+        "fantasy points", "fantasy score", "batter fantasy", "hitter fantasy", "batter fs"
+    ])
+    valid_scale = line is not None and 0.5 <= float(line) <= 17.5
+    source_ok = ("underdog" in source) or source == ""
+    main_ok = mt not in {"ALT", "PROMO"}
+    valid = bool(source_ok and fantasy_evidence and valid_scale and main_ok)
+    reasons = []
+    if not source_ok: reasons.append("non-Underdog source")
+    if not fantasy_evidence: reasons.append("Fantasy Points market text not verified")
+    if not valid_scale: reasons.append("hitter FS line scale invalid")
+    if mt == "ALT": reasons.append("alternate line")
+    if mt == "PROMO": reasons.append("promo/boost line")
+    return {
+        "Line Validated": valid,
+        "Line Validation Note": "MAIN/ACTIVE FS evidence verified" if valid else "; ".join(reasons) or "line not verified",
+        "Market Type": mt,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _ow_bfs_game_feed_context(game_pk):
+    out = {
+        "Game PK": game_pk,
+        "Game Status": "UNKNOWN",
+        "Game Started": False,
+        "Game Final": False,
+        "Game Time": None,
+        "Game Time PT": None,
+    }
+    if not game_pk:
+        return out
+    try:
+        feed = safe_get_json(f"{MLB_LIVE}/game/{int(game_pk)}/feed/live", timeout=12) or {}
+        status = ((feed.get("gameData") or {}).get("status") or {})
+        dt = ((feed.get("gameData") or {}).get("datetime") or {})
+        abstract = str(status.get("abstractGameState") or status.get("detailedState") or "UNKNOWN")
+        detailed = str(status.get("detailedState") or abstract)
+        low = f"{abstract} {detailed}".lower()
+        started = any(x in low for x in ["live", "in progress", "final", "game over", "completed"])
+        final = any(x in low for x in ["final", "game over", "completed"])
+        game_time = dt.get("dateTime") or dt.get("officialDate")
+        game_time_pt = None
+        if game_time:
+            try:
+                ts = pd.to_datetime(game_time, utc=True)
+                game_time_pt = ts.tz_convert("America/Los_Angeles").strftime("%m/%d %I:%M %p PT")
+            except Exception:
+                game_time_pt = str(game_time)
+        out.update({
+            "Game Status": detailed or abstract,
+            "Game Started": bool(started),
+            "Game Final": bool(final),
+            "Game Time": game_time,
+            "Game Time PT": game_time_pt,
+        })
+    except Exception:
+        pass
+    return out
+
+
+def _ow_bfs_today_game_context(team, opponent=None):
+    game_pk = _ow_today_game_pk_for_team(team, opponent)
+    return _ow_bfs_game_feed_context(game_pk)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_bfs_contact_detail(player_id, days=365):
+    """BFS-only Statcast contact detail: contact, zone contact, chase contact, sweet spot, xBA/xwOBA."""
+    out = {
+        "Contact Detail Available": False,
+        "Contact%": None,
+        "Zone Contact%": None,
+        "Chase Contact%": None,
+        "Whiff%": None,
+        "Chase%": None,
+        "Sweet Spot%": None,
+        "Avg EV": None,
+        "xBA": None,
+        "xwOBA": None,
+        "Contact Detail Rows": 0,
+    }
+    if not player_id:
+        return out
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=int(days))
+        url = "https://baseballsavant.mlb.com/statcast_search/csv"
+        params = {
+            "all": "true",
+            "player_type": "batter",
+            "batters_lookup[]": str(player_id),
+            "game_date_gt": start.strftime("%Y-%m-%d"),
+            "game_date_lt": end.strftime("%Y-%m-%d"),
+            "type": "details",
+        }
+        r = requests.get(url, params=params, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.text.strip():
+            return out
+        df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return out
+        desc = df.get("description", pd.Series([""] * len(df))).astype(str).str.lower()
+        swing = desc.isin(["swinging_strike", "swinging_strike_blocked", "foul_tip", "foul", "foul_bunt", "missed_bunt", "hit_into_play", "hit_into_play_no_out", "hit_into_play_score"])
+        whiff = desc.isin(["swinging_strike", "swinging_strike_blocked", "foul_tip"])
+        contact = swing & ~whiff
+        swings = int(swing.sum())
+        contact_pct = float(contact.sum() / swings) if swings else None
+        whiff_pct = float(whiff.sum() / swings) if swings else None
+        zone_contact = chase_contact = chase_rate = None
+        if "zone" in df.columns:
+            zone = pd.to_numeric(df["zone"], errors="coerce")
+            inz = zone.isin([1,2,3,4,5,6,7,8,9])
+            outz = zone.isin([11,12,13,14])
+            zsw = int((inz & swing).sum())
+            osw = int((outz & swing).sum())
+            opz = int(outz.sum())
+            if zsw:
+                zone_contact = float((inz & contact).sum() / zsw)
+            if osw:
+                chase_contact = float((outz & contact).sum() / osw)
+            if opz:
+                chase_rate = float((outz & swing).sum() / opz)
+        ev = pd.to_numeric(df.get("launch_speed"), errors="coerce") if "launch_speed" in df.columns else pd.Series(dtype=float)
+        la = pd.to_numeric(df.get("launch_angle"), errors="coerce") if "launch_angle" in df.columns else pd.Series(dtype=float)
+        bbe = ev.notna()
+        avg_ev = float(ev[bbe].mean()) if int(bbe.sum()) >= 10 else None
+        sweet = float(((la[bbe] >= 8) & (la[bbe] <= 32)).mean()) if int((bbe & la.notna()).sum()) >= 10 else None
+        xba = None
+        if "estimated_ba_using_speedangle" in df.columns:
+            x = pd.to_numeric(df["estimated_ba_using_speedangle"], errors="coerce")
+            if int(x.notna().sum()) >= 10:
+                xba = float(x.dropna().mean())
+        xwoba = None
+        if "estimated_woba_using_speedangle" in df.columns:
+            x = pd.to_numeric(df["estimated_woba_using_speedangle"], errors="coerce")
+            if int(x.notna().sum()) >= 10:
+                xwoba = float(x.dropna().mean())
+        out.update({
+            "Contact Detail Available": True,
+            "Contact%": None if contact_pct is None else round(contact_pct * 100, 1),
+            "Zone Contact%": None if zone_contact is None else round(zone_contact * 100, 1),
+            "Chase Contact%": None if chase_contact is None else round(chase_contact * 100, 1),
+            "Whiff%": None if whiff_pct is None else round(whiff_pct * 100, 1),
+            "Chase%": None if chase_rate is None else round(chase_rate * 100, 1),
+            "Sweet Spot%": None if sweet is None else round(sweet * 100, 1),
+            "Avg EV": None if avg_ev is None else round(avg_ev, 1),
+            "xBA": None if xba is None else round(xba, 3),
+            "xwOBA": None if xwoba is None else round(xwoba, 3),
+            "Contact Detail Rows": int(len(df)),
+        })
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_bfs_opponent_running_context(team):
+    """Opponent catcher/pitcher hold proxy from team pitching SB/CS/pickoff totals."""
+    out = {
+        "SB Opportunity Factor": 1.0,
+        "Opponent SB Allowed": None,
+        "Opponent CS": None,
+        "Opponent Pickoffs": None,
+        "Running Note": "Opponent running-control data unavailable",
+    }
+    try:
+        tctx = _ow_team_context(team) or {}
+        opp = _ow_team_abbr(tctx.get("Opponent") or "")
+        tid = ml_resolve_team_id(opp, {}) if opp and opp != "—" else None
+        if not tid:
+            return out
+        data = safe_get_json(f"{MLB_BASE}/teams/{int(tid)}/stats", params={"stats":"season", "group":"pitching"}, timeout=12) or {}
+        split = get_first_stat_split(data) if "get_first_stat_split" in globals() else None
+        stat = (split or {}).get("stat", {}) if isinstance(split, dict) else {}
+        sb = _ow_stat_num(stat, "stolenBases", "stolenBasesAllowed", default=None)
+        cs = _ow_stat_num(stat, "caughtStealing", default=None)
+        po = _ow_stat_num(stat, "pickoffs", default=None)
+        factor = 1.0
+        note = []
+        if sb is not None and cs is not None and (sb + cs) >= 20:
+            succ = sb / max(1.0, sb + cs)
+            factor *= float(clamp(1.0 + (succ - 0.75) * 0.75, 0.88, 1.12))
+            note.append(f"opp SB success allowed {succ*100:.1f}%")
+        if po is not None and po >= 6:
+            factor *= 0.96
+            note.append(f"{int(po)} pickoffs")
+        out.update({
+            "SB Opportunity Factor": round(float(clamp(factor, 0.86, 1.14)), 3),
+            "Opponent SB Allowed": sb,
+            "Opponent CS": cs,
+            "Opponent Pickoffs": po,
+            "Running Note": ", ".join(note) if note else "Opponent running-control profile neutral",
+        })
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_bfs_event_profile(player_name):
+    """V2 event profile: V1 current season/logs + prior-year history for Bayesian shrinkage."""
+    base = dict(_ow_bfs_event_profile_v1(player_name) or {})
+    pid = base.get("player_id")
+    base.setdefault("prior_counts", {})
+    base.setdefault("prior_seasons", [])
+    if not pid:
+        return base
+    cur = int(base.get("season_year") or california_now().year)
+    prior_total = {}
+    priors = []
+    try:
+        data = safe_get_json(
+            f"{MLB_BASE}/people/{pid}/stats",
+            params={"stats":"yearByYear", "group":"hitting"},
+            timeout=15,
+        ) or {}
+        for block in data.get("stats") or []:
+            for sp in block.get("splits") or []:
+                season_raw = sp.get("season")
+                if isinstance(season_raw, dict):
+                    season_raw = season_raw.get("seasonId") or season_raw.get("id") or season_raw.get("name")
+                try:
+                    sy = int(str(season_raw)[:4])
+                except Exception:
+                    sy = None
+                if not sy or sy >= cur or sy < cur - 4:
+                    continue
+                cnt = _ow_bfs_event_counts(sp.get("stat") or {})
+                if cnt.get("PA", 0) <= 0:
+                    continue
+                # Recency decay: prior year 0.55, then 0.38, 0.26, 0.18.
+                decay = {1:0.55, 2:0.38, 3:0.26, 4:0.18}.get(cur - sy, 0.12)
+                weighted = {k: float(v) * decay for k, v in cnt.items() if isinstance(v, (int, float, np.number))}
+                prior_total = _ow_bfs_add_counts(prior_total, weighted)
+                priors.append({"season": sy, "raw": cnt, "decay": decay})
+    except Exception:
+        pass
+    base["prior_counts"] = prior_total
+    base["prior_seasons"] = priors
+    cur_pa = _ow_bfs_num((base.get("season_counts") or {}).get("PA"), 0.0) or 0.0
+    prior_pa = _ow_bfs_num(prior_total.get("PA"), 0.0) or 0.0
+    base["Bayes Sample Label"] = "ROOKIE/SMALL" if cur_pa < 120 and prior_pa < 80 else "SMALL" if cur_pa < 120 else "ESTABLISHED"
+    return base
+
+
+_OW_BFS_LEAGUE_EVENT_PRIORS = {
+    "1B": 0.145, "2B": 0.045, "3B": 0.004, "HR": 0.030,
+    "BB": 0.082, "HBP": 0.011, "K": 0.220, "R": 0.115,
+    "RBI": 0.110, "SB": 0.018,
+}
+
+
+def _ow_bfs_bayesian_rate(profile, key, default=None):
+    """Current season + decayed prior seasons + league pseudo-PA + capped recent-form shift."""
+    if default is None:
+        default = _OW_BFS_LEAGUE_EVENT_PRIORS.get(key, 0.0)
+    sc = (profile or {}).get("season_counts") or {}
+    pc = (profile or {}).get("prior_counts") or {}
+    logs = list((profile or {}).get("logs") or [])
+    spa = float(_ow_bfs_num(sc.get("PA"), 0.0) or 0.0)
+    ppa = float(_ow_bfs_num(pc.get("PA"), 0.0) or 0.0)
+    sev = float(_ow_bfs_num(sc.get(key), 0.0) or 0.0)
+    pev = float(_ow_bfs_num(pc.get(key), 0.0) or 0.0)
+    # More league shrinkage for rookies; less for established hitters.
+    league_pa = 230.0 if spa < 60 and ppa < 40 else 150.0 if spa < 120 else 85.0
+    den = spa + ppa + league_pa
+    base = (sev + pev + float(default) * league_pa) / den if den > 0 else float(default)
+
+    # Recent form is a controlled delta, not a duplicate full weight of current season.
+    a30 = _ow_bfs_aggregate_logs(logs, 30)
+    a15 = _ow_bfs_aggregate_logs(logs, 15)
+    r30 = None
+    r15 = None
+    pa30 = float(_ow_bfs_num(a30.get("PA"), 0.0) or 0.0)
+    pa15 = float(_ow_bfs_num(a15.get("PA"), 0.0) or 0.0)
+    if pa30 > 0:
+        r30 = float(_ow_bfs_num(a30.get(key), 0.0) or 0.0) / pa30
+    if pa15 > 0:
+        r15 = float(_ow_bfs_num(a15.get(key), 0.0) or 0.0) / pa15
+    recent_delta = 0.0
+    if r30 is not None:
+        recent_delta += (r30 - base) * 0.10 * min(1.0, pa30 / 100.0)
+    if r15 is not None:
+        recent_delta += (r15 - base) * 0.06 * min(1.0, pa15 / 55.0)
+    return float(max(0.0, base + recent_delta))
+
+
+def _ow_bfs_build_context(player, raw, profile):
+    ctx = dict(_ow_bfs_build_context_v1(player, raw, profile) or {})
+    pid = (profile or {}).get("player_id")
+    team = ctx.get("Team")
+    opp = ctx.get("Opponent")
+    try:
+        ctx["Savant Hitter"] = _ow_baseball_savant_hitter_context(player)
+    except Exception:
+        ctx["Savant Hitter"] = {}
+    try:
+        ctx["Contact Detail"] = _ow_bfs_contact_detail(pid)
+    except Exception:
+        ctx["Contact Detail"] = {}
+    try:
+        ctx["Bullpen Leash"] = _ow_bullpen_leash_context(team, ctx.get("Pitcher") or {}, ctx.get("Bullpen") or {}, "HRR")
+    except Exception:
+        ctx["Bullpen Leash"] = {}
+    try:
+        ctx["Running Context"] = _ow_bfs_opponent_running_context(team)
+    except Exception:
+        ctx["Running Context"] = {}
+    try:
+        ctx["Game"] = _ow_bfs_today_game_context(team, opp)
+    except Exception:
+        ctx["Game"] = {}
+    try:
+        ctx["Line Movement"] = _ow_batter_line_movement_context(player, "BATTER FANTASY", (raw or {}).get("Line"))
+    except Exception:
+        ctx["Line Movement"] = {}
+    try:
+        ctx["Umpire"] = _ow_umpire_hitter_context(team, "HRR")
+    except Exception:
+        ctx["Umpire"] = {}
+    try:
+        ctx["Defense"] = _ow_defense_framing_context(opp, "HRR")
+    except Exception:
+        ctx["Defense"] = {}
+    ctx["Line Validation"] = _ow_bfs_line_validation(raw)
+    _mt = (ctx.get("Line Validation") or {}).get("Market Type") or _ow_bfs_market_type(raw)
+    if bool((ctx.get("Line Validation") or {}).get("Line Validated")) and str(_mt).upper() == "MAIN/UNVERIFIED":
+        _mt = "MAIN"
+    ctx["UD Market Type"] = _mt
+    return ctx
+
+
+def _ow_bfs_starter_share(ctx):
+    p = (ctx or {}).get("Pitcher") or {}
+    ip = _ow_bfs_num(p.get("Pitcher IP") or p.get("IP"), None)
+    starts = _ow_bfs_num(p.get("Pitcher Starts") or p.get("GS"), None)
+    avg_ip = ip / max(starts, 1.0) if ip is not None and starts and starts > 0 else 5.25
+    # Hitters disproportionately see the starter in their first 2-3 PA.
+    share = float(clamp((avg_ip / 9.0) + 0.075, 0.46, 0.78))
+    slot = int(round(_ow_bfs_num(((ctx or {}).get("Lineup") or {}).get("Lineup Slot"), 4) or 4))
+    if slot <= 3:
+        share += 0.015
+    elif slot >= 8:
+        share -= 0.015
+    leash = str(((ctx or {}).get("Bullpen Leash") or {}).get("Starter Leash Label") or "").upper()
+    if "SHORT" in leash:
+        share -= 0.045
+    elif "LONG" in leash:
+        share += 0.035
+    return float(clamp(share, 0.42, 0.82)), float(avg_ip)
+
+
+def _ow_bfs_event_model(profile, ctx):
+    """V2: Bayesian event rates + separate starter/bullpen outcome distributions."""
+    pa = float(_ow_bfs_num((ctx or {}).get("Projected PA"), 4.15) or 4.15)
+    # Bayesian baseline protects rookies/small samples.
+    p1 = _ow_bfs_bayesian_rate(profile, "1B", 0.145)
+    p2 = _ow_bfs_bayesian_rate(profile, "2B", 0.045)
+    p3 = _ow_bfs_bayesian_rate(profile, "3B", 0.004)
+    phr = _ow_bfs_bayesian_rate(profile, "HR", 0.030)
+    pbb = _ow_bfs_bayesian_rate(profile, "BB", 0.082)
+    phbp = _ow_bfs_bayesian_rate(profile, "HBP", 0.011)
+    pk_batter = _ow_bfs_bayesian_rate(profile, "K", 0.220)
+    pr = _ow_bfs_bayesian_rate(profile, "R", 0.115)
+    prbi = _ow_bfs_bayesian_rate(profile, "RBI", 0.110)
+    psb = _ow_bfs_bayesian_rate(profile, "SB", 0.018)
+
+    ks = ctx.get("Key Stats") or {}
+    pctx = ctx.get("Pitcher") or {}
+    phrr = ctx.get("Pitch HRR") or {}
+    phrctx = ctx.get("Pitch HR") or {}
+    ps_hrr = ctx.get("Pitcher Split HRR") or {}
+    ps_hr = ctx.get("Pitcher Split HR") or {}
+    bctx = ctx.get("Batter Quality") or {}
+    sav = ctx.get("Savant Hitter") or {}
+    run_contact = ctx.get("Run Contact") or {}
+
+    split_hrr = _ow_bfs_num(ks.get("Key Matchup Stats Factor HRR"), 1.0) or 1.0
+    split_hr = _ow_bfs_num(ks.get("Key Matchup Stats Factor HR"), 1.0) or 1.0
+    p_split_hrr = _ow_bfs_num(ps_hrr.get("Pitcher Split Factor HRR"), 1.0) or 1.0
+    p_split_hr = _ow_bfs_num(ps_hr.get("Pitcher Split Factor HR"), 1.0) or 1.0
+    pitch_hrr = _ow_bfs_num(phrr.get("Pitch Mix Matchup Factor"), 1.0) or 1.0
+    pitch_hr = _ow_bfs_num(phrctx.get("Pitch Mix Matchup Factor"), 1.0) or 1.0
+    bq_hrr = _ow_bfs_num(bctx.get("Batter Quality Factor HRR"), 1.0) or 1.0
+    bq_hr = _ow_bfs_num(bctx.get("Batter Quality Factor HR"), 1.0) or 1.0
+    sav_hrr = _ow_bfs_num(sav.get("Savant Factor HRR"), 1.0) or 1.0
+    sav_hr = _ow_bfs_num(sav.get("Savant Factor HR"), 1.0) or 1.0
+    rc_factor = _ow_bfs_num(run_contact.get("Pitcher Run/Contact Factor HRR"), 1.0) or 1.0
+    park_hrr = _ow_bfs_num(ctx.get("Park HRR"), 1.0) or 1.0
+    park_hr = _ow_bfs_num(ctx.get("Park HR"), 1.0) or 1.0
+    weather_hrr = _ow_bfs_num((ctx.get("Weather HRR") or {}).get("Weather Factor"), 1.0) or 1.0
+    weather_hr = _ow_bfs_num((ctx.get("Weather HR") or {}).get("Weather Factor"), 1.0) or 1.0
+    ump_hitter = _ow_bfs_num((ctx.get("Umpire") or {}).get("Umpire Hitter Factor"), 1.0) or 1.0
+    defense_hitter = _ow_bfs_num((ctx.get("Defense") or {}).get("Defense/Framing Factor"), 1.0) or 1.0
+
+    hit_adj = _ow_bfs_weighted_factor([
+        (split_hrr, 0.46), (p_split_hrr, 0.48), (pitch_hrr, 0.55),
+        (bq_hrr, 0.34), (sav_hrr, 0.32), (rc_factor, 0.30),
+        (park_hrr, 0.20), (weather_hrr, 0.10), (ump_hitter, 0.16),
+        (defense_hitter, 0.28),
+    ], 0.83, 1.18)
+    hr_adj = _ow_bfs_weighted_factor([
+        (split_hr, 0.50), (p_split_hr, 0.52), (pitch_hr, 0.64),
+        (bq_hr, 0.40), (sav_hr, 0.38), (park_hr, 0.56), (weather_hr, 0.30),
+        (ump_hitter, 0.08), (defense_hitter, 0.10),
+    ], 0.70, 1.36)
+
+    pbb9 = _ow_bfs_num(pctx.get("Pitcher BB/9"), None)
+    bb_adj = 1.0 if pbb9 is None else float(clamp(1.0 + (pbb9 - 3.10) * 0.035, 0.90, 1.12))
+    bb_adj *= float(clamp(ump_hitter ** 0.20, 0.995, 1.005))
+    p1 *= hit_adj; p2 *= hit_adj; p3 *= hit_adj; phr *= hr_adj; pbb *= bb_adj
+
+    pitcher_k = _ow_bfs_pct(pctx.get("Pitcher K%"), None)
+    pitch_k = _ow_bfs_pct(phrr.get("Batter Pitch K%"), None)
+    k_parts = [(pk_batter, 0.55)]
+    if pitcher_k is not None: k_parts.append((pitcher_k, 0.27))
+    if pitch_k is not None: k_parts.append((pitch_k, 0.18))
+    kw = sum(w for _, w in k_parts) or 1.0
+    pk = sum(v*w for v,w in k_parts) / kw
+    pk *= float(clamp((1.0 / max(0.97, ump_hitter)) ** 0.25, 0.992, 1.008))
+
+    # Contact V2 affects non-HR hit conversion only, with a conservative cap.
+    cd = ctx.get("Contact Detail") or {}
+    contact_pct = _ow_bfs_num(cd.get("Contact%"), None)
+    zc = _ow_bfs_num(cd.get("Zone Contact%"), None)
+    xba = _ow_bfs_num(cd.get("xBA"), None)
+    contact_nudge = 1.0
+    if contact_pct is not None:
+        contact_nudge *= float(clamp(1.0 + (contact_pct - 76.0) * 0.0030, 0.95, 1.05))
+    if zc is not None:
+        contact_nudge *= float(clamp(1.0 + (zc - 83.0) * 0.0018, 0.97, 1.03))
+    if xba is not None:
+        contact_nudge *= float(clamp(1.0 + (xba - 0.245) * 0.30, 0.97, 1.04))
+    p1 *= contact_nudge; p2 *= contact_nudge; p3 *= contact_nudge
+
+    # Reuse the already-successful HRR component model as a restrained hit prior.
+    # This does NOT modify HRR itself; it only lets Fantasy borrow 22% of its expected-hit
+    # signal while preserving our pitch-mix/HR/event-specific structure.
+    component = ctx.get("Component") or {}
+    component_hits = _ow_bfs_num(component.get("Projected Hits"), None)
+    modeled_hit_mean = pa * (p1 + p2 + p3 + phr)
+    component_hit_factor = 1.0
+    if component_hits is not None and modeled_hit_mean > 0.05:
+        blended_hit_mean = 0.78 * modeled_hit_mean + 0.22 * float(component_hits)
+        desired_nonhr = max(0.01, blended_hit_mean - pa * phr)
+        current_nonhr = max(0.01, pa * (p1 + p2 + p3))
+        component_hit_factor = float(clamp(desired_nonhr / current_nonhr, 0.93, 1.07))
+        p1 *= component_hit_factor; p2 *= component_hit_factor; p3 *= component_hit_factor
+
+    starter_probs = {
+        "1B": max(0.005, p1), "2B": max(0.001, p2), "3B": max(0.0002, p3),
+        "HR": max(0.0005, phr), "BB": max(0.005, pbb), "HBP": max(0.001, phbp),
+        "K": float(clamp(pk, 0.055, 0.420)),
+    }
+    non_out = sum(starter_probs.values())
+    if non_out > 0.94:
+        scale = 0.94 / non_out
+        for k in starter_probs: starter_probs[k] *= scale
+    starter_probs["OUT"] = max(0.01, 1.0 - sum(starter_probs.values()))
+
+    # Bullpen-specific distribution: use handedness/strength context rather than carrying
+    # the starting pitcher's exact arsenal across all projected PA.
+    bh = ctx.get("Bullpen Hand") or {}
+    bp = ctx.get("Bullpen") or {}
+    bp_hrr = _ow_bfs_num(bh.get("Bullpen Handedness Factor HRR"), 1.0) or 1.0
+    bp_hr = _ow_bfs_num(bh.get("Bullpen Handedness Factor HR"), 1.0) or 1.0
+    bp_score = _ow_bfs_num(bp.get("Bullpen Weakness Score"), 50.0) or 50.0
+    bp_general = float(clamp(1.0 + (bp_score - 50.0) * 0.0018, 0.94, 1.07))
+    bullpen_probs = dict(starter_probs)
+    for k in ["1B","2B","3B"]:
+        bullpen_probs[k] *= float(clamp((bp_hrr ** 0.75) * bp_general, 0.90, 1.12))
+    bullpen_probs["HR"] *= float(clamp((bp_hr ** 0.80) * bp_general, 0.86, 1.18))
+    bullpen_probs["BB"] *= float(clamp(1.0 + (bp_score - 50) * 0.0015, 0.94, 1.08))
+    # Weak bullpen generally lowers K pressure; strong bullpen increases it modestly.
+    bullpen_probs["K"] *= float(clamp(1.0 - (bp_score - 50) * 0.0015, 0.92, 1.08))
+    bp_non_out = sum(v for k,v in bullpen_probs.items() if k != "OUT")
+    if bp_non_out > 0.94:
+        scale = 0.94 / bp_non_out
+        for k in ["1B","2B","3B","HR","BB","HBP","K"]:
+            bullpen_probs[k] *= scale
+    bullpen_probs["OUT"] = max(0.01, 1.0 - sum(v for k,v in bullpen_probs.items() if k != "OUT"))
+
+    starter_share, avg_ip = _ow_bfs_starter_share(ctx)
+    team_runs = _ow_bfs_num(ctx.get("Team Runs"), 4.35) or 4.35
+    team_factor = float(clamp((team_runs / 4.35) ** 0.45, 0.87, 1.16))
+    slot = int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"), 4) or 4))
+    run_slot = 1.08 if slot <= 2 else 1.03 if slot <= 4 else 0.96 if slot >= 7 else 1.0
+    rbi_slot = 1.10 if 3 <= slot <= 5 else 0.92 if slot <= 2 else 0.94 if slot >= 7 else 1.0
+    run_target = pa * pr * team_factor * run_slot
+    rbi_target = pa * prbi * team_factor * rbi_slot
+    component = ctx.get("Component") or {}
+    cr = _ow_bfs_num(component.get("Projected Runs"), None)
+    crbi = _ow_bfs_num(component.get("Projected RBI"), None)
+    if cr is not None: run_target = 0.70 * run_target + 0.30 * cr
+    if crbi is not None: rbi_target = 0.70 * rbi_target + 0.30 * crbi
+    sb_factor = _ow_bfs_num((ctx.get("Running Context") or {}).get("SB Opportunity Factor"), 1.0) or 1.0
+    sb_target = pa * psb * sb_factor
+
+    return {
+        "probs": starter_probs,  # backward-compatible display
+        "starter_probs": starter_probs,
+        "bullpen_probs": bullpen_probs,
+        "Starter PA Share": starter_share,
+        "Starter Avg IP": avg_ip,
+        "Projected Runs": float(clamp(run_target, 0.05, 1.70)),
+        "Projected RBI": float(clamp(rbi_target, 0.05, 1.95)),
+        "Projected SB": float(clamp(sb_target, 0.0, 0.90)),
+        "Hit Adj": hit_adj,
+        "HR Adj": hr_adj,
+        "BB Adj": bb_adj,
+        "Contact Nudge": contact_nudge,
+        "HRR Component Hits": component_hits,
+        "HRR Hit Blend Factor": component_hit_factor,
+        "Batter K/PA": pk_batter,
+        "Modeled K/PA": starter_probs["K"] * starter_share + bullpen_probs["K"] * (1-starter_share),
+        "Bayes Sample Label": (profile or {}).get("Bayes Sample Label"),
+    }
+
+
+def _ow_bfs_summarize_fs_array(fs, line, base=None):
+    base = dict(base or {})
+    arr = np.asarray(fs, dtype=float)
+    line_num = float(_ow_bfs_num(line, 0.0) or 0.0)
+    higher = arr > line_num
+    lower = arr < line_num
+    push = arr == line_num
+    mean = float(np.mean(arr)); median = float(np.median(arr)); std = float(np.std(arr))
+    base.update({
+        "FS Projection": round(mean, 2), "FS Median": round(median, 2),
+        "FS P20": round(float(np.percentile(arr, 20)), 2), "FS P80": round(float(np.percentile(arr, 80)), 2),
+        "FS P90": round(float(np.percentile(arr, 90)), 2), "FS StdDev": round(std, 2),
+        "FS CV": round(std / max(1.0, mean), 3),
+        "Higher %": round(float(np.mean(higher))*100, 1), "Lower %": round(float(np.mean(lower))*100, 1),
+        "Push %": round(float(np.mean(push))*100, 1), "Fair Line": round(median, 2), "_raw_fs": arr,
+    })
+    return base
+
+
+def _ow_bfs_simulate(player, line, profile, ctx, model, passes=OW_BATTER_FS_SIM_PASSES):
+    """V2 simulation: separate starter/bullpen PA + base-state run/RBI + opportunity-based SB."""
+    pa_mean = float(_ow_bfs_num(ctx.get("Projected PA"), 4.15) or 4.15)
+    pass_n = int(clamp(_ow_bfs_num(passes, OW_BATTER_FS_SIM_PASSES) or OW_BATTER_FS_SIM_PASSES, 5000, 50000))
+    seed = _ow_seed_from_text(player, "BFS_V2", line, round(pa_mean,2), OW_BATTER_FS_VERSION)
+    rng = np.random.default_rng(seed)
+    lineup_confirmed = bool((ctx.get("Lineup") or {}).get("Lineup Confirmed"))
+    pa_sd = 0.46 if lineup_confirmed else 0.66
+    pa_counts = np.rint(rng.normal(pa_mean, pa_sd, size=pass_n)).astype(int)
+    pa_counts = np.clip(pa_counts, 2 if not lineup_confirmed else 3, 7)
+
+    starter_share = float(_ow_bfs_num(model.get("Starter PA Share"), 0.65) or 0.65)
+    starter_pa = rng.binomial(pa_counts, starter_share)
+    bullpen_pa = pa_counts - starter_pa
+    order = ["1B","2B","3B","HR","BB","HBP","K","OUT"]
+    sp = np.array([float(model["starter_probs"][k]) for k in order], dtype=float); sp /= sp.sum()
+    bp = np.array([float(model["bullpen_probs"][k]) for k in order], dtype=float); bp /= bp.sum()
+    draws = np.zeros((pass_n, len(order)), dtype=int)
+    for n in np.unique(starter_pa):
+        idx = np.where(starter_pa == n)[0]
+        if len(idx): draws[idx] += rng.multinomial(int(n), sp, size=len(idx))
+    for n in np.unique(bullpen_pa):
+        idx = np.where(bullpen_pa == n)[0]
+        if len(idx): draws[idx] += rng.multinomial(int(n), bp, size=len(idx))
+
+    one_b,two_b,three_b,hr,bb,hbp,kk,other_out = [draws[:,i].astype(int) for i in range(len(order))]
+    hits = one_b + two_b + three_b + hr
+
+    # Base-state opportunity model. Instead of independent R/RBI Poisson draws, estimate
+    # runner occupancy before each damage event and let the hit type determine how often
+    # existing runners score. This preserves event correlation without a slow full-lineup loop.
+    team_runs = float(_ow_bfs_num(ctx.get("Team Runs"), 4.35) or 4.35)
+    slot = int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"), 4) or 4))
+    occupancy = float(clamp(0.205 + (team_runs - 4.35) * 0.018 + (0.015 if 3 <= slot <= 5 else 0.0), 0.15, 0.30))
+    # HR: batter + every occupied base scores.
+    hr_runner_rbi = rng.binomial(np.maximum(0, 3 * hr), occupancy)
+    # Singles/doubles/triples convert occupied runners at increasing rates.
+    rbi_1 = rng.binomial(np.maximum(0, 3 * one_b), occupancy * 0.22)
+    rbi_2 = rng.binomial(np.maximum(0, 3 * two_b), occupancy * 0.53)
+    rbi_3 = rng.binomial(np.maximum(0, 3 * three_b), occupancy * 0.88)
+    rbi = hr + hr_runner_rbi + rbi_1 + rbi_2 + rbi_3
+
+    # Calibrate the opportunity model toward the independent RBI target without breaking
+    # the event correlation. Add only residual RBI as a small Poisson correction.
+    current_rbi_mean = float(np.mean(rbi))
+    residual_rbi = max(0.0, float(model.get("Projected RBI", current_rbi_mean)) - current_rbi_mean)
+    if residual_rbi > 0.02:
+        rbi = rbi + rng.poisson(min(0.80, residual_rbi), size=pass_n)
+
+    # Batter run scoring: HR guaranteed; reaching 2B/3B raises conversion probability.
+    team_score_factor = float(clamp((team_runs / 4.35) ** 0.55, 0.82, 1.20))
+    protect = _ow_bfs_num((ctx.get("Protection") or {}).get("Lineup Protection Factor"), 1.0) or 1.0
+    score_p1 = float(clamp(0.29 * team_score_factor * protect, 0.18, 0.48))
+    score_p2 = float(clamp(0.46 * team_score_factor * protect, 0.28, 0.67))
+    score_p3 = float(clamp(0.67 * team_score_factor * protect, 0.42, 0.84))
+    score_pbb = float(clamp(0.27 * team_score_factor * protect, 0.16, 0.45))
+    runs = hr.copy()
+    runs += rng.binomial(one_b, score_p1)
+    runs += rng.binomial(two_b, score_p2)
+    runs += rng.binomial(three_b, score_p3)
+    runs += rng.binomial(bb + hbp, score_pbb)
+    current_run_mean = float(np.mean(runs))
+    residual_runs = max(0.0, float(model.get("Projected Runs", current_run_mean)) - current_run_mean)
+    if residual_runs > 0.02:
+        runs = runs + rng.binomial(1, min(0.65, residual_runs), size=pass_n)
+
+    # SB only comes from actual on-base opportunities (mostly 1B/BB/HBP). Opponent catcher/
+    # pitcher running control is already in Projected SB.
+    sb_opps = one_b + bb + hbp
+    exp_opps = max(0.10, float(np.mean(sb_opps)))
+    target_sb = float(model.get("Projected SB", 0.08))
+    sb_success_p = float(clamp(target_sb / exp_opps, 0.0, 0.42))
+    sb = rng.binomial(sb_opps, sb_success_p)
+
+    fs = _ow_bfs_score_components(one_b,two_b,three_b,hr,bb,hbp,runs,rbi,sb)
+    out = {
+        "Simulation Passes": pass_n,
+        "Starter PA/G": round(float(np.mean(starter_pa)), 2),
+        "Bullpen PA/G": round(float(np.mean(bullpen_pa)), 2),
+        "Starter PA Share": round(starter_share, 3),
+        "H/G": round(float(np.mean(hits)),2), "1B/G": round(float(np.mean(one_b)),2),
+        "2B/G": round(float(np.mean(two_b)),2), "3B/G": round(float(np.mean(three_b)),3),
+        "HR/G": round(float(np.mean(hr)),3), "BB/G": round(float(np.mean(bb)),2),
+        "HBP/G": round(float(np.mean(hbp)),3), "R/G": round(float(np.mean(runs)),2),
+        "RBI/G": round(float(np.mean(rbi)),2), "SB/G": round(float(np.mean(sb)),3),
+        "K/G": round(float(np.mean(kk)),2),
+        "Base State Occupancy": round(occupancy, 3),
+    }
+    return _ow_bfs_summarize_fs_array(fs, line, out)
+
+
+def _ow_bfs_skill_score_v2(ctx, profile):
+    # Use original skill score plus Savant xBA/EV as non-duplicate quality checks.
+    score = float(_ow_bfs_skill_score(ctx, profile))
+    sav = ctx.get("Savant Hitter") or {}
+    xba = _ow_bfs_num(sav.get("Savant xBA"), None)
+    ev = _ow_bfs_num(sav.get("Savant Avg EV"), None)
+    if xba is not None: score += (xba - 0.245) * 80
+    if ev is not None: score += (ev - 88.5) * 0.55
+    return int(round(clamp(score, 10, 99)))
+
+
+def _ow_bfs_match_score(ctx):
+    """Match V2: retain the proven HRR-derived matchup score and add small game-context checks."""
+    base = float(_ow_bfs_match_score_v1(ctx))
+    ump = _ow_bfs_num((ctx.get("Umpire") or {}).get("Umpire Hitter Factor"), 1.0) or 1.0
+    defense = _ow_bfs_num((ctx.get("Defense") or {}).get("Defense/Framing Factor"), 1.0) or 1.0
+    # Both upstream factors are already tightly capped; keep their card-score impact modest.
+    base += (ump - 1.0) * 220.0
+    base += (defense - 1.0) * 180.0
+    if not bool((ctx.get("Matchup Integrity") or {}).get("Pitcher Matchup Verified")):
+        base -= 5.0
+    return int(round(clamp(base, 8, 99)))
+
+
+def _ow_bfs_contact_score(ctx, profile, model):
+    """Contact V2: batter contact/zone/chase + quality + pitch matchup + pitcher allowed contact."""
+    cd = ctx.get("Contact Detail") or {}
+    sav = ctx.get("Savant Hitter") or {}
+    b = ctx.get("Batter Quality") or {}
+    p = ctx.get("Pitcher") or {}
+    ph = ctx.get("Pitch HRR") or {}
+    score = 50.0
+    vals = []
+    def add(value, center, scale, weight, higher=True):
+        nonlocal score
+        v = _ow_bfs_num(value, None)
+        if v is None: return
+        delta = (v - center) / scale
+        score += (delta if higher else -delta) * weight
+        vals.append(v)
+    add(cd.get("Contact%"), 76.0, 8.0, 13, True)
+    add(cd.get("Zone Contact%"), 83.0, 7.0, 9, True)
+    add(cd.get("Chase Contact%"), 58.0, 10.0, 5, True)
+    add(cd.get("Whiff%") if cd.get("Whiff%") is not None else sav.get("Savant Whiff%"), 24.0, 8.0, 10, False)
+    add(cd.get("Chase%") if cd.get("Chase%") is not None else sav.get("Savant Chase%"), 28.0, 9.0, 5, False)
+    add(cd.get("xBA") if cd.get("xBA") is not None else sav.get("Savant xBA"), 0.245, 0.050, 9, True)
+    add(cd.get("xwOBA") if cd.get("xwOBA") is not None else sav.get("Savant xwOBA"), 0.320, 0.070, 7, True)
+    add(cd.get("Sweet Spot%"), 33.0, 10.0, 4, True)
+    add(cd.get("Avg EV") if cd.get("Avg EV") is not None else b.get("Batter Avg EV"), 88.5, 4.0, 4, True)
+    add(b.get("Batter HardHit%") if b.get("Batter HardHit%") is not None else sav.get("Savant HardHit%"), 40.0, 10.0, 5, True)
+    add(b.get("Batter Barrel%") if b.get("Batter Barrel%") is not None else sav.get("Savant Barrel%"), 7.0, 6.0, 3, True)
+    add(ph.get("Batter Pitch Contact%"), 75.0, 10.0, 7, True)
+    add(ph.get("Batter Pitch Whiff%"), 25.0, 10.0, 5, False)
+    add(p.get("Pitcher K%"), 22.0, 8.0, 7, False)
+    add(p.get("Pitcher Whiff%"), 25.0, 9.0, 4, False)
+    add(p.get("Pitcher Zone Contact%"), 82.0, 7.0, 4, True)
+    add(p.get("Pitcher Allowed xBA"), 0.245, 0.045, 6, True)
+    add(p.get("Pitcher Allowed xwOBA"), 0.320, 0.065, 5, True)
+    add(p.get("Pitcher Allowed HardHit%"), 39.0, 9.0, 4, True)
+    add(p.get("Pitcher Allowed Barrel%"), 7.5, 5.0, 3, True)
+    score += ((_ow_bfs_num(model.get("Hit Adj"),1.0) or 1.0)-1.0) * 60
+    return int(round(clamp(score, 5, 99)))
+
+
+def _ow_bfs_calibration_profile():
+    hist = _ow_deduped_batter_results() if "_ow_deduped_batter_results" in globals() else []
+    rows = []
+    for r in hist:
+        market = str(r.get("Market") or r.get("Best Market") or "").upper()
+        if "FANTASY" not in market and "BATTER FS" not in market:
+            continue
+        if str(r.get("graded_result") or "").upper() not in {"WIN","LOSS"}:
+            continue
+        actual = _ow_bfs_num(r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None)
+        proj = _ow_bfs_num(r.get("Projection"), None)
+        prob = _ow_bfs_num(r.get("Win Probability %"), None)
+        if actual is None or proj is None:
+            continue
+        rows.append({**r, "_actual":actual, "_proj":proj, "_prob":prob})
+    n = len(rows)
+    bias = float(np.mean([r["_actual"] - r["_proj"] for r in rows])) if rows else 0.0
+    mae = float(np.mean([abs(r["_actual"] - r["_proj"]) for r in rows])) if rows else None
+    return {"rows":rows, "samples":n, "bias":bias, "mae":mae}
+
+
+
+def _ow_bfs_calibration_profile():
+    """Use honest full-board grades first; merge official Fantasy grades only when unique."""
+    rows = []
+    seen = set()
+    full = load_json(OW_BATTER_FS_BOARD_LOG, []) if "OW_BATTER_FS_BOARD_LOG" in globals() else []
+    # Calibration uses the latest CONFIRMED pregame snapshot for each player/line/version.
+    # Projected-lineup rows remain in the audit history but cannot teach the betting calibrator.
+    latest = {}
+    for r in full:
+        if str(r.get("Model Side Result") or "").upper() not in {"WIN", "LOSS"}:
+            continue
+        if (_ow_bfs_num(r.get("Data Score"), 0) or 0) < 50:
+            continue
+        lineup_ok = r.get("Lineup Confirmed") is True or str(r.get("Lineup Confirmed") or "").lower() in {"true","1","yes"}
+        pitcher_ok = r.get("Pitcher Confirmed") is True or str(r.get("Pitcher Confirmed") or "").lower() in {"true","1","yes"}
+        if not (lineup_ok and pitcher_ok):
+            continue
+        actual = _ow_bfs_num(r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None)
+        proj = _ow_bfs_num(r.get("Projection"), None)
+        if actual is None or proj is None:
+            continue
+        base_key = "|".join([
+            str(r.get("Snapshot Date") or ""), str(r.get("Game PK") or ""),
+            _v3_norm_name(r.get("Player") or r.get("UD Player")), str(r.get("Line") or ""),
+            str(r.get("Projection Version") or ""),
+        ])
+        ts = str(r.get("full_board_saved_at") or r.get("official_snapshot_saved_at") or "")
+        if base_key not in latest or ts >= latest[base_key][0]:
+            latest[base_key] = (ts, r)
+    for _, r in latest.values():
+        actual = _ow_bfs_num(r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None)
+        proj = _ow_bfs_num(r.get("Projection"), None)
+        key = _ow_bfs_full_snapshot_key(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        rr = dict(r); rr["graded_result"] = r.get("Model Side Result"); rr["_actual"] = actual; rr["_proj"] = proj; rr["_prob"] = _ow_bfs_num(r.get("Win Probability %"), None)
+        rows.append(rr)
+    # Include official log for older Fantasy rows not present in the full-board tracker.
+    for r in (_ow_deduped_batter_results() if "_ow_deduped_batter_results" in globals() else []):
+        market = str(r.get("Market") or r.get("Best Market") or "").upper()
+        if "FANTASY" not in market and "BATTER FS" not in market: continue
+        if str(r.get("graded_result") or "").upper() not in {"WIN", "LOSS"}: continue
+        actual = _ow_bfs_num(r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None); proj = _ow_bfs_num(r.get("Projection"), None)
+        if actual is None or proj is None: continue
+        key = _ow_batter_result_key(r)
+        if key in seen: continue
+        seen.add(key); rr=dict(r); rr["_actual"]=actual; rr["_proj"]=proj; rr["_prob"]=_ow_bfs_num(r.get("Win Probability %"),None); rows.append(rr)
+    n=len(rows); bias=float(np.mean([r["_actual"]-r["_proj"] for r in rows])) if rows else 0.0; mae=float(np.mean([abs(r["_actual"]-r["_proj"]) for r in rows])) if rows else None
+    return {"rows":rows,"samples":n,"bias":bias,"mae":mae}
+
+
+def _ow_bfs_xgb_residual_adjustment(features, cal):
+    rows = list((cal or {}).get("rows") or [])
+    info = {"active":False, "samples":len(rows), "adjustment":0.0, "note":"BFS XGBoost waiting for graded sample floor"}
+    if len(rows) < OW_BATTER_FS_XGB_MIN_GRADED:
+        return 0.0, info
+    # Keep training/current features symmetric. Confidence/Data Score are computed after
+    # the first calibrated simulation pass, so they are intentionally excluded here.
+    feature_names = ["Projection","Line","Skill","Match","Form","Contact","Projected PA","Starter PA Share"]
+    train = []
+    target = []
+    for r in rows[-900:]:
+        vals = []
+        ok = True
+        for k in feature_names:
+            vals.append(float(_ow_bfs_num(r.get(k), 0.0) or 0.0))
+        actual = _ow_bfs_num(r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None)
+        proj = _ow_bfs_num(r.get("Projection"), None)
+        if actual is None or proj is None:
+            ok = False
+        if ok:
+            train.append(vals); target.append(float(actual) - float(proj))
+    if len(train) < OW_BATTER_FS_XGB_MIN_GRADED:
+        return 0.0, info
+    try:
+        from xgboost import XGBRegressor
+        model = XGBRegressor(n_estimators=140, max_depth=3, learning_rate=0.035, subsample=0.82, colsample_bytree=0.85, random_state=42, objective="reg:squarederror")
+        model.fit(np.asarray(train), np.asarray(target))
+        x = np.asarray([[float(_ow_bfs_num(features.get(k),0.0) or 0.0) for k in feature_names]])
+        raw = float(model.predict(x)[0])
+        adj = float(clamp(raw, -OW_BATTER_FS_XGB_MAX_ADJ, OW_BATTER_FS_XGB_MAX_ADJ))
+        info.update({"active":True,"adjustment":round(adj,3),"note":f"BFS XGBoost residual assist {adj:+.2f} from {len(train)} graded"})
+        return adj, info
+    except Exception as e:
+        info["note"] = f"BFS XGBoost unavailable: {e}"
+        return 0.0, info
+
+
+def _ow_bfs_apply_calibration(sim, line, features):
+    cal = _ow_bfs_calibration_profile()
+    n = int(cal.get("samples",0) or 0)
+    bias = float(cal.get("bias",0.0) or 0.0)
+    # Conservative mean-bias correction only after 30 fantasy grades.
+    bias_adj = float(clamp(bias * 0.35, -0.55, 0.55)) if n >= 30 else 0.0
+    xgb_adj, xgb_info = _ow_bfs_xgb_residual_adjustment(features, cal)
+    total_adj = float(clamp(bias_adj + xgb_adj, -1.0, 1.0))
+    arr = np.asarray(sim.get("_raw_fs"), dtype=float)
+    if arr.size and abs(total_adj) > 1e-9:
+        arr = np.clip(arr + total_adj, 0, None)
+        sim = _ow_bfs_summarize_fs_array(arr, line, sim)
+    sim["Calibration Samples"] = n
+    sim["Calibration Bias"] = round(bias,3) if n else None
+    sim["Calibration MAE"] = None if cal.get("mae") is None else round(float(cal.get("mae")),3)
+    sim["Calibration Adjustment"] = round(total_adj,3)
+    sim["XGBoost Active"] = bool(xgb_info.get("active"))
+    sim["XGBoost Samples"] = int(xgb_info.get("samples",0) or 0)
+    sim["XGBoost Adjustment"] = round(float(xgb_info.get("adjustment",0.0) or 0.0),3)
+    sim["Calibration Note"] = f"bias {bias_adj:+.2f}; {xgb_info.get('note')}" if n else xgb_info.get("note")
+    return sim
+
+
+def _ow_bfs_probability_calibration(raw_prob, side, features=None):
+    cal = _ow_bfs_calibration_profile()
+    rows = cal.get("rows") or []
+    p = float(_ow_bfs_num(raw_prob,50.0) or 50.0)
+    if len(rows) < 40:
+        return p, {"samples":0,"empirical":None,"note":"Probability calibration warming up"}
+    lo = int(p // 5) * 5
+    hi = lo + 5
+    bucket = []
+    for r in rows:
+        rp = _ow_bfs_num(r.get("Win Probability %"), None)
+        if rp is None or not (lo <= rp < hi):
+            continue
+        # Full-board audit rows often have Official Pick=PASS by design. Calibrate
+        # against the saved model/evaluation side so PASS gating does not discard the
+        # rows intentionally saved for honest probability calibration.
+        saved_side = str(r.get("Evaluation Side") or r.get("Model Side") or r.get("Pick") or r.get("Pick Side") or "").upper()
+        wanted = str(side).upper()
+        aliases = {wanted}
+        if wanted == "HIGHER": aliases.add("OVER")
+        elif wanted == "LOWER": aliases.add("UNDER")
+        if saved_side not in aliases:
+            continue
+        bucket.append(r)
+    if len(bucket) < 18:
+        return p, {"samples":len(bucket),"empirical":None,"note":f"Need 18+ in {lo}-{hi}% side bucket"}
+    wr = sum(1 for r in bucket if str(r.get("graded_result") or "").upper()=="WIN") / len(bucket) * 100
+    # Blend—not replace—the simulation probability.
+    blended = float(clamp(0.72*p + 0.28*wr, 35.0, 75.0))
+    return blended, {"samples":len(bucket),"empirical":round(wr,1),"note":f"{lo}-{hi}% bucket empirical {wr:.1f}% ({len(bucket)})"}
+
+
+def _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict=False):
+    checks = [
+        bool((profile or {}).get("player_id")),
+        (_ow_bfs_num((profile or {}).get("season_counts",{}).get("PA"),0) or 0) >= 80 or (_ow_bfs_num((profile or {}).get("prior_counts",{}).get("PA"),0) or 0) >= 100,
+        bool((profile or {}).get("logs")),
+        _ow_bfs_num((ctx.get("Savant Hitter") or {}).get("Savant xwOBA"),None) is not None,
+        _ow_bfs_num((ctx.get("Contact Detail") or {}).get("Contact%"),None) is not None,
+        _ow_bfs_num((ctx.get("Pitch HRR") or {}).get("Pitch Mix Matchup Factor"),None) is not None,
+        _ow_bfs_num((ctx.get("Pitcher") or {}).get("Pitcher K%"),None) is not None,
+        _ow_bfs_num((ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Factor HRR"),None) is not None,
+        ctx.get("Team") not in (None,"","—"),
+    ]
+    coverage = sum(bool(x) for x in checks)/len(checks)
+    best_prob = max(_ow_bfs_num(sim.get("Higher %"),50) or 50, _ow_bfs_num(sim.get("Lower %"),50) or 50)
+    score = 38 + coverage*32 + min(16,max(0,best_prob-50)*0.65)
+    if bool((ctx.get("Lineup") or {}).get("Lineup Confirmed")): score += 5
+    if bool((ctx.get("Pitcher Confirm") or {}).get("Pitcher Confirmed")): score += 4
+    if (profile or {}).get("Bayes Sample Label") == "ROOKIE/SMALL": score -= 6
+    if distribution_conflict: score -= 8
+    if bool((ctx.get("Game") or {}).get("Game Started")): score -= 15
+    cv = _ow_bfs_num(sim.get("FS CV"),0.8) or 0.8
+    if cv >= 1.0: score -= 6
+    elif cv <= 0.70: score += 3
+    return int(round(clamp(score,30,94))), int(round(coverage*100))
+
+
+def _ow_bfs_decision_gate(ctx, profile, sim, data_score, distribution_conflict, market_type):
+    reasons = []
+    game = ctx.get("Game") or {}
+    lineup = ctx.get("Lineup") or {}
+    pitcher_confirm = ctx.get("Pitcher Confirm") or {}
+    availability = ctx.get("Availability") or {}
+    if game.get("Game Started"):
+        reasons.append("GAME STARTED/FINAL")
+    line_validation = ctx.get("Line Validation") or {}
+    if not bool(line_validation.get("Line Validated")):
+        reasons.append("UNDERDOG MAIN LINE NOT VERIFIED")
+    if not bool(lineup.get("Lineup Confirmed")):
+        reasons.append("LINEUP NOT CONFIRMED")
+    if not bool(pitcher_confirm.get("Pitcher Confirmed")):
+        reasons.append("STARTER NOT CONFIRMED")
+    af = _ow_bfs_num(availability.get("Availability Factor"),1.0) or 1.0
+    if af < 0.96:
+        reasons.append("AVAILABILITY/ROLE RISK")
+    if int(data_score or 0) < OW_BATTER_FS_MIN_DATA_SCORE:
+        reasons.append(f"DATA {int(data_score or 0)}<{OW_BATTER_FS_MIN_DATA_SCORE}")
+    if distribution_conflict and max(_ow_bfs_num(sim.get("Higher %"),50) or 50,_ow_bfs_num(sim.get("Lower %"),50) or 50) < 60:
+        reasons.append("MEAN/DISTRIBUTION CONFLICT")
+    mt = str(market_type).upper()
+    if mt == "ALT":
+        reasons.append("ALT LINE — VERIFY")
+    elif mt == "PROMO":
+        reasons.append("PROMO/BOOST — NOT MAIN LINE")
+    return ("PASS" if reasons else "CLEAR"), reasons
+
+
+def _ow_build_batter_fantasy_row(raw):
+    player = str((raw or {}).get("Player") or "").strip()
+    line = _ow_bfs_num((raw or {}).get("Line"),None)
+    if not player or line is None:
+        return None
+    role_info = _ow_bfs_classify_ud_row(raw)
+    if role_info.get("Role") != "BATTER":
+        return None
+    profile = _ow_bfs_event_profile(player)
+    if not profile.get("player_id"):
+        return None
+    ctx = _ow_bfs_build_context(player, raw, profile)
+    model = _ow_bfs_event_model(profile, ctx)
+    sim = _ow_bfs_simulate(player, line, profile, ctx, model)
+
+    # Scores are computed before XGB so they can be used as residual features.
+    skill = _ow_bfs_skill_score_v2(ctx, profile)
+    match = _ow_bfs_match_score(ctx)
+    form = _ow_bfs_form_score(ctx, profile)
+    contact = _ow_bfs_contact_score(ctx, profile, model)
+    preliminary_features = {
+        "Projection":sim.get("FS Projection"), "Line":line, "Skill":skill, "Match":match,
+        "Form":form, "Contact":contact,
+        "Projected PA":ctx.get("Projected PA"), "Starter PA Share":model.get("Starter PA Share"),
+    }
+    sim = _ow_bfs_apply_calibration(sim, line, preliminary_features)
+
+    mean = _ow_bfs_num(sim.get("FS Projection"),0.0) or 0.0
+    median = _ow_bfs_num(sim.get("FS Median"),0.0) or 0.0
+    higher_raw = _ow_bfs_num(sim.get("Higher %"),50.0) or 50.0
+    lower_raw = _ow_bfs_num(sim.get("Lower %"),50.0) or 50.0
+    mean_side = "HIGHER" if mean > line else "LOWER" if mean < line else "PUSH"
+    raw_prob_side = "HIGHER" if higher_raw > lower_raw else "LOWER" if lower_raw > higher_raw else "PASS"
+    raw_best_prob = max(higher_raw, lower_raw)
+    distribution_conflict = raw_prob_side in {"HIGHER","LOWER"} and mean_side in {"HIGHER","LOWER"} and raw_prob_side != mean_side
+    conf, data_score = _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict)
+
+    calibrated_best, prob_cal = _ow_bfs_probability_calibration(raw_best_prob, raw_prob_side, preliminary_features)
+    # Calibrate chosen-side probability, preserving the complementary direction.
+    higher = calibrated_best if raw_prob_side == "HIGHER" else 100-calibrated_best if raw_prob_side == "LOWER" else higher_raw
+    lower = calibrated_best if raw_prob_side == "LOWER" else 100-calibrated_best if raw_prob_side == "HIGHER" else lower_raw
+    prob_side = "HIGHER" if higher > lower else "LOWER" if lower > higher else "PASS"
+    best_prob = max(higher, lower)
+
+    market_type = ctx.get("UD Market Type") or _ow_bfs_market_type(raw)
+    gate, gate_reasons = _ow_bfs_decision_gate(ctx, profile, sim, data_score, distribution_conflict, market_type)
+    pick = prob_side if gate == "CLEAR" and best_prob >= OW_BATTER_FS_MIN_PLAY_PROB else "PASS"
+    lean_side = prob_side if prob_side in {"HIGHER","LOWER"} else "PASS"
+    edge = round(mean - float(line),2); median_edge = round(median - float(line),2)
+    cv = _ow_bfs_num(sim.get("FS CV"),0.8) or 0.8
+    volatility = "STABLE" if cv <= 0.70 else "VOLATILE" if cv >= 1.0 else "NORMAL"
+    flags = _ow_bfs_flags(ctx, profile, model, sim, skill, match, form, contact, distribution_conflict)
+    if gate_reasons: flags = gate_reasons[:4] + flags
+    if (profile or {}).get("Bayes Sample Label") in {"ROOKIE/SMALL","SMALL"}: flags.append("🧠 Bayesian small-sample protection")
+    if model.get("Starter PA Share") is not None: flags.append(f"SP/BP split {model.get('Starter PA Share')*100:.0f}/{(1-model.get('Starter PA Share'))*100:.0f}")
+    ks = ctx.get("Key Stats") or {}; pctx = ctx.get("Pitcher") or {}; bctx = ctx.get("Batter Quality") or {}; sav = ctx.get("Savant Hitter") or {}; cd = ctx.get("Contact Detail") or {}; ph = ctx.get("Pitch HRR") or {}; recent = _ow_bfs_recent_fs_summary(profile)
+    season_avg = _ow_bfs_num(ks.get("Season AVG"),None); season_slg = _ow_bfs_num(ks.get("Season SLG"),None)
+    iso = (season_slg-season_avg) if season_slg is not None and season_avg is not None else None
+    woba = _ow_bfs_num(sav.get("Savant xwOBA"),None) or _ow_bfs_num(bctx.get("Batter xwOBA"),None) or _ow_bfs_num(ks.get("Season OBP"),None)
+    lm = ctx.get("Line Movement") or {}; game = ctx.get("Game") or {}; runctx = ctx.get("Running Context") or {}
+    row = {
+        "Player":player, "UD Player":raw.get("Player"), "Player ID":profile.get("player_id"),
+        "Market":"Batter Fantasy", "Role":role_info.get("Role"), "Role Source":role_info.get("Role Source"),
+        "Position":role_info.get("Primary Position"), "Bats":role_info.get("Bats") or ctx.get("Batter Hand"),
+        "Team":ctx.get("Team"), "Opponent":ctx.get("Opponent"), "Matchup":ctx.get("Matchup"),
+        "Game PK":game.get("Game PK"), "Game Time":game.get("Game Time PT"), "Game Status":game.get("Game Status"),
+        "Game Started":game.get("Game Started"), "Opp Pitcher":pctx.get("Opp Pitcher"), "Pitcher Hand":pctx.get("Pitcher Hand"),
+        "Pitcher Confirmed":(ctx.get("Pitcher Confirm") or {}).get("Pitcher Confirmed"),
+        "Pitcher ERA":pctx.get("Pitcher ERA"), "Pitcher K%":pctx.get("Pitcher K%"), "Pitcher Whiff%":pctx.get("Pitcher Whiff%"),
+        "Pitcher Allowed xBA":pctx.get("Pitcher Allowed xBA"), "Pitcher Allowed xwOBA":pctx.get("Pitcher Allowed xwOBA"),
+        "Pitcher Allowed HardHit%":pctx.get("Pitcher Allowed HardHit%"), "Pitcher Allowed Barrel%":pctx.get("Pitcher Allowed Barrel%"),
+        "Pitcher Split Factor":(ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Factor HRR"),
+        "Pitcher Split Note":(ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Note"),
+        "Primary Pitch":pctx.get("Primary Pitch"), "Pitch Mix Matchup Factor":ph.get("Pitch Mix Matchup Factor"),
+        "Pitch Mix Matchup Pitch":ph.get("Pitch Mix Matchup Pitch"), "Batter Pitch Contact%":ph.get("Batter Pitch Contact%"),
+        "Batter Pitch Whiff%":ph.get("Batter Pitch Whiff%"), "Batter Pitch wOBA":ph.get("Batter Pitch wOBA"),
+        "Market Type":market_type, "Line Validated":(ctx.get("Line Validation") or {}).get("Line Validated"),
+        "Line Validation Note":(ctx.get("Line Validation") or {}).get("Line Validation Note"),
+        "Line":float(line), "Opening Line":lm.get("Opening Line"), "Current Line":lm.get("Current Line"),
+        "Line Move":lm.get("Line Move"), "Line Move Label":lm.get("Line Move Label"), "Line Move Note":lm.get("Line Move Note"),
+        "Projection":round(mean,2), "Mean Projection":round(mean,2), "Median":round(median,2), "Fair Line":sim.get("Fair Line"),
+        "P20":sim.get("FS P20"), "P80":sim.get("FS P80"), "P90":sim.get("FS P90"), "Edge":edge, "Median Edge":median_edge,
+        "Pick":pick, "Model Side":lean_side, "Higher %":round(higher,1), "Lower %":round(lower,1), "Raw Higher %":higher_raw, "Raw Lower %":lower_raw,
+        "Win Probability %":round(best_prob,1), "Probability Calibration Samples":prob_cal.get("samples"), "Probability Empirical %":prob_cal.get("empirical"),
+        "Probability Calibration Note":prob_cal.get("note"), "Distribution Conflict":"YES" if distribution_conflict else "NO",
+        "Decision Gate":gate, "Decision Gate Reasons":" | ".join(gate_reasons) if gate_reasons else "CLEAR",
+        "Confidence":conf, "Data Score":data_score, "Skill":skill, "Match":match, "Form":form, "Contact":contact,
+        "Volatility":volatility, "FS CV":sim.get("FS CV"), "Projected PA":round(float(ctx.get("Projected PA") or 0),2),
+        "Starter PA Share":round(float(model.get("Starter PA Share") or 0),3), "Starter PA/G":sim.get("Starter PA/G"), "Bullpen PA/G":sim.get("Bullpen PA/G"),
+        "Starter Avg IP":round(float(model.get("Starter Avg IP") or 0),2), "Lineup Slot":(ctx.get("Lineup") or {}).get("Lineup Slot"),
+        "Lineup Status":(ctx.get("Lineup") or {}).get("Lineup Status"), "Lineup Confirmed":(ctx.get("Lineup") or {}).get("Lineup Confirmed"),
+        "Availability Factor":(ctx.get("Availability") or {}).get("Availability Factor"),
+        "Availability Note":(ctx.get("Availability") or {}).get("Availability Note"),
+        "Pitcher Matchup Verified":(ctx.get("Matchup Integrity") or {}).get("Pitcher Matchup Verified"),
+        "Umpire Name":(ctx.get("Umpire") or {}).get("Umpire Name"), "Umpire Hitter Factor":(ctx.get("Umpire") or {}).get("Umpire Hitter Factor"),
+        "Umpire Note":(ctx.get("Umpire") or {}).get("Umpire Note"),
+        "Defense/Framing Factor":(ctx.get("Defense") or {}).get("Defense/Framing Factor"),
+        "Opponent Defense Score":(ctx.get("Defense") or {}).get("Opponent Defense Score"),
+        "Opponent Framing Score":(ctx.get("Defense") or {}).get("Opponent Framing Score"),
+        "Defense/Framing Note":(ctx.get("Defense") or {}).get("Defense/Framing Note"),
+        "H/G":sim.get("H/G"), "1B/G":sim.get("1B/G"), "2B/G":sim.get("2B/G"), "3B/G":sim.get("3B/G"), "HR/G":sim.get("HR/G"),
+        "BB/G":sim.get("BB/G"), "HBP/G":sim.get("HBP/G"), "R/G":sim.get("R/G"), "RBI/G":sim.get("RBI/G"), "SB/G":sim.get("SB/G"), "K/G":sim.get("K/G"),
+        "AVG":season_avg, "OPS":ks.get("Season OPS"), "wOBA/xwOBA":woba, "ISO":None if iso is None else round(float(iso),3),
+        "Batter Contact%":cd.get("Contact%"), "Batter Zone Contact%":cd.get("Zone Contact%"), "Batter Chase Contact%":cd.get("Chase Contact%"),
+        "Batter Chase%":cd.get("Chase%") if cd.get("Chase%") is not None else sav.get("Savant Chase%"), "Batter xBA":cd.get("xBA") if cd.get("xBA") is not None else sav.get("Savant xBA"),
+        "Batter Sweet Spot%":cd.get("Sweet Spot%"), "Batter Avg EV":cd.get("Avg EV") if cd.get("Avg EV") is not None else bctx.get("Batter Avg EV"),
+        "Batter HardHit%":bctx.get("Batter HardHit%") if bctx.get("Batter HardHit%") is not None else sav.get("Savant HardHit%"),
+        "Batter Barrel%":bctx.get("Batter Barrel%") if bctx.get("Batter Barrel%") is not None else sav.get("Savant Barrel%"),
+        "Batter Whiff%":cd.get("Whiff%") if cd.get("Whiff%") is not None else bctx.get("Batter Whiff%"), "Batter xwOBA":woba,
+        "Recent 15d xwOBA":bctx.get("Recent 15d xwOBA"), "Recent 15d HardHit%":bctx.get("Recent 15d HardHit%"), "Recent 15d Barrel%":bctx.get("Recent 15d Barrel%"),
+        "L5 FS":None if recent.get("L5 FS") is None else round(recent.get("L5 FS"),2), "L10 FS":None if recent.get("L10 FS") is None else round(recent.get("L10 FS"),2),
+        "Season FS/G":None if recent.get("Season FS/G") is None else round(recent.get("Season FS/G"),2),
+        "Bayes Sample Label":profile.get("Bayes Sample Label"), "Prior Weighted PA":round(float(_ow_bfs_num((profile.get("prior_counts") or {}).get("PA"),0) or 0),1),
+        "SB Opportunity Factor":runctx.get("SB Opportunity Factor"), "Running Note":runctx.get("Running Note"),
+        "Flags":" | ".join(dict.fromkeys(flags[:10])) if flags else "No major flags",
+        "Model Hit Adj":round(float(model.get("Hit Adj",1.0)),3), "Model HR Adj":round(float(model.get("HR Adj",1.0)),3),
+        "HRR Component Hits":model.get("HRR Component Hits"), "HRR Hit Blend Factor":round(float(model.get("HRR Hit Blend Factor",1.0)),3),
+        "Modeled K/PA %":round(float(model.get("Modeled K/PA",0.22))*100,1),
+        "Calibration Samples":sim.get("Calibration Samples"), "Calibration Bias":sim.get("Calibration Bias"), "Calibration MAE":sim.get("Calibration MAE"),
+        "Calibration Adjustment":sim.get("Calibration Adjustment"), "XGBoost Active":sim.get("XGBoost Active"), "XGBoost Samples":sim.get("XGBoost Samples"),
+        "XGBoost Adjustment":sim.get("XGBoost Adjustment"), "Calibration Note":sim.get("Calibration Note"),
+        "Team Run Environment":ctx.get("Team Run Note"), "Park":ctx.get("Park"),
+        "Scoring Profile":"Underdog MLB hitter: 1B3 2B6 3B8 HR10 BB3 HBP3 R2 RBI2 SB4",
+        "Simulation Passes":sim.get("Simulation Passes"), "Source":"Underdog Fantasy Points + MLB/Statcast V2 event model", "Evidence":str(raw.get("Evidence", ""))[:350],
+        "Projection Version":OW_BATTER_FS_VERSION,
+    }
+    return row
+
+
+def build_v3_batter_fantasy_table():
+    raw_rows, source_meta = _ow_fetch_ud_batter_fantasy_lines()
+    if not raw_rows:
+        return pd.DataFrame(), source_meta
+    rows=[]; errors=[]
+    # Full board: every safe batter row gets an attempt. Caches prevent repeated network work.
+    for raw in list(raw_rows):
+        try:
+            row = _ow_build_batter_fantasy_row(raw)
+            if row: rows.append(row)
+        except Exception as e:
+            errors.append(f"{raw.get('Player')}: {e}")
+    if not rows:
+        meta=dict(source_meta); meta.update({"built":0,"errors":errors[:20],"status":"No Batter Fantasy V2 projections built","version":OW_BATTER_FS_VERSION})
+        return pd.DataFrame(),meta
+    df=pd.DataFrame(rows)
+    df["_sort_prob"]=pd.to_numeric(df.get("Win Probability %"),errors="coerce").fillna(0)
+    df["_sort_conf"]=pd.to_numeric(df.get("Confidence"),errors="coerce").fillna(0)
+    df=df.sort_values(["_sort_prob","_sort_conf"],ascending=[False,False]).drop(columns=["_sort_prob","_sort_conf"])
+    meta=dict(source_meta); meta.update({"built":len(df),"errors":errors[:20],"status":"OK","version":OW_BATTER_FS_VERSION,"full_board":True,"requested_rows":len(raw_rows)})
+    return df,meta
+
+
+# ---- Fantasy persistence / grading integration ----
+def _ow_batter_pick_side(pick, market):
+    txt=str(pick or "").upper(); m=str(market or "").upper()
+    if "PASS" in txt: return None
+    if "FANTASY" in m or "BATTER FS" in m:
+        if "LOWER" in txt or "UNDER" in txt: return "LOWER"
+        if "HIGHER" in txt or "OVER" in txt: return "HIGHER"
+        return None
+    return _ow_batter_pick_side_v1(pick, market)
+
+
+def _ow_batter_result_key(row):
+    r=dict(row or {})
+    market=str(r.get("Market") or r.get("Best Market") or "").upper()
+    if "FANTASY" in market or "BATTER FS" in market:
+        market="BATTER FANTASY"
+    r["Market"]=market
+    return _ow_batter_result_key_v1(r)
+
+
+def _ow_get_actual_batter_boxscore(game_pk, player_id):
+    base=_ow_get_actual_batter_boxscore_v1(game_pk, player_id)
+    if not base: return base
+    try:
+        box=safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore",timeout=12) or {}
+        for side in ["home","away"]:
+            players=(((box.get("teams") or {}).get(side) or {}).get("players") or {})
+            for p in players.values():
+                if str((p.get("person") or {}).get("id")) != str(player_id): continue
+                stat=((p.get("stats") or {}).get("batting") or {})
+                h=_ow_stat_num(stat,"hits","H",default=0.0); d2=_ow_stat_num(stat,"doubles","2B",default=0.0); d3=_ow_stat_num(stat,"triples","3B",default=0.0); hr=_ow_stat_num(stat,"homeRuns","HR",default=0.0)
+                bb=_ow_stat_num(stat,"baseOnBalls","walks","BB",default=0.0); hbp=_ow_stat_num(stat,"hitByPitch","HBP",default=0.0); rr=_ow_stat_num(stat,"runs","R",default=0.0); rbi=_ow_stat_num(stat,"rbi","RBI",default=0.0); sb=_ow_stat_num(stat,"stolenBases","SB",default=0.0); kk=_ow_stat_num(stat,"strikeOuts","SO","K",default=0.0)
+                one=max(0.0,h-d2-d3-hr)
+                fpts=float(_ow_bfs_score_components(one,d2,d3,hr,bb,hbp,rr,rbi,sb))
+                base.update({"Actual 1B":one,"Actual 2B":d2,"Actual 3B":d3,"Actual BB":bb,"Actual HBP":hbp,"Actual SB":sb,"Actual K":kk,"Actual FPTS":round(fpts,2)})
+                return base
+    except Exception:
+        pass
+    return base
+
+
+
+OW_BATTER_FS_BOARD_LOG = os.path.join(STORAGE_DIR, "ow_batter_fs_full_board_log.json")
+
+
+def _ow_save_batter_snapshots(df, source_label="OFFICIAL"):
+    """Preserve HRR/HR snapshot behavior and add native Batter Fantasy Higher/Lower snapshots."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return 0
+    picks = load_json(OW_BATTER_PICK_LOG, [])
+    ids = {p0.get("pick_id") for p0 in picks}
+    added = 0
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        market = str(row.get("Market") or row.get("Best Market") or "").upper()
+        line = _v3_safe_num(row.get("Line") if row.get("Line") not in (None, "") else row.get("Best Line"), None)
+        pick = row.get("Pick") or row.get("Best Pick")
+        side = _ow_batter_pick_side(pick, market)
+        if line is None or not side:
+            continue
+        player_id = row.get("Player ID") or _mlb_search_player_id_by_name(row.get("Player"))
+        game_pk = row.get("Game PK") or _ow_today_game_pk_for_team(row.get("Team"), row.get("Opponent"))
+        is_fs = "FANTASY" in market or "BATTER FS" in market
+        snap = dict(row)
+        snap_date = california_now().strftime("%Y-%m-%d") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d")
+        snap.update({
+            "pick_id": _ow_batter_pick_id({**row, "Game PK": game_pk, "Snapshot Date": snap_date}),
+            "snapshot_type": "BATTER_FANTASY_BEFORE_GAME" if is_fs else "BATTER_BEFORE_GAME",
+            "snapshot_source": source_label,
+            "official_snapshot_saved_at": now_iso(),
+            "Snapshot Date": snap_date,
+            "Player ID": player_id,
+            "Game PK": game_pk,
+            "Line": line,
+            "Pick Side": side,
+            "graded": False,
+            "Grade Status": "SAVED / WAITING FINAL",
+            "Projection Version": OW_BATTER_FS_VERSION if is_fs else row.get("Projection Version") or OW_FINAL_LINE_PROJECTION_VERSION,
+        })
+        if snap["pick_id"] in ids:
+            continue
+        picks.append(snap); ids.add(snap["pick_id"]); added += 1
+    save_json(OW_BATTER_PICK_LOG, picks[-20000:])
+    return added
+
+
+def _ow_bfs_full_snapshot_key(row):
+    r = row or {}
+    stamp = str(r.get("Snapshot Date") or "")
+    game = str(r.get("Game PK") or "")
+    player = _v3_norm_name(r.get("Player") or r.get("UD Player"))
+    line = str(r.get("Line") or "")
+    lineup_ok = r.get("Lineup Confirmed") is True or str(r.get("Lineup Confirmed") or "").lower() in {"true","1","yes"}
+    pitcher_ok = r.get("Pitcher Confirmed") is True or str(r.get("Pitcher Confirmed") or "").lower() in {"true","1","yes"}
+    stage = str(r.get("Snapshot Stage") or ("CONFIRMED" if lineup_ok and pitcher_ok else "PROJECTED"))
+    pitcher = _v3_norm_name(r.get("Opp Pitcher") or "")
+    version = str(r.get("Projection Version") or OW_BATTER_FS_VERSION)
+    return "|".join([stamp, game, player, line, stage, pitcher, version])
+
+
+def _ow_bfs_save_full_board_snapshot(df):
+    """Save every untouched Fantasy projection, including PASS rows, for honest model grading."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return 0
+    hist = load_json(OW_BATTER_FS_BOARD_LOG, [])
+    seen = {_ow_bfs_full_snapshot_key(r) for r in hist}
+    added = 0
+    snap_date = california_now().strftime("%Y-%m-%d") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d")
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        # Never learn from a projection created after first pitch.
+        started = row.get("Game Started") is True or str(row.get("Game Started") or "").lower() in {"true","1","yes"}
+        if started:
+            continue
+        player_id = row.get("Player ID") or _mlb_search_player_id_by_name(row.get("Player"))
+        game_pk = row.get("Game PK") or _ow_today_game_pk_for_team(row.get("Team"), row.get("Opponent"))
+        model_side = str(row.get("Model Side") or "PASS").upper()
+        lineup_ok = row.get("Lineup Confirmed") is True or str(row.get("Lineup Confirmed") or "").lower() in {"true","1","yes"}
+        pitcher_ok = row.get("Pitcher Confirmed") is True or str(row.get("Pitcher Confirmed") or "").lower() in {"true","1","yes"}
+        snapshot_stage = "CONFIRMED" if lineup_ok and pitcher_ok else "PROJECTED"
+        snap = dict(row)
+        snap.update({
+            "Snapshot Date": snap_date,
+            "Snapshot Stage": snapshot_stage,
+            "Game PK": game_pk,
+            "Player ID": player_id,
+            "snapshot_type": "BATTER_FANTASY_FULL_BOARD",
+            "snapshot_source": "BATTER_FANTASY_V2_FULL_BOARD",
+            "full_board_saved_at": now_iso(),
+            "Evaluation Side": model_side,
+            "Official Pick At Save": row.get("Pick"),
+            "graded": False,
+            "Grade Status": "FULL BOARD / WAITING FINAL",
+            "Projection Version": OW_BATTER_FS_VERSION,
+        })
+        key = _ow_bfs_full_snapshot_key(snap)
+        if key in seen:
+            continue
+        hist.append(snap); seen.add(key); added += 1
+    save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    return added
+
+
+def _ow_bfs_grade_full_board_snapshots():
+    hist = load_json(OW_BATTER_FS_BOARD_LOG, [])
+    graded = waiting = missing = 0
+    final_cache = {}
+    box_cache = {}
+    for r in hist:
+        if r.get("graded"):
+            continue
+        game_pk = r.get("Game PK"); pid = r.get("Player ID")
+        if not game_pk or not pid:
+            missing += 1; r["Grade Status"] = "MISSING GAME/PLAYER ID"; continue
+        if game_pk not in final_cache:
+            try: final_cache[game_pk] = bool(is_game_final(game_pk))
+            except Exception: final_cache[game_pk] = False
+        if not final_cache[game_pk]:
+            waiting += 1; r["Grade Status"] = "WAITING FINAL"; continue
+        bk = (str(game_pk), str(pid))
+        if bk not in box_cache:
+            box_cache[bk] = _ow_get_actual_batter_boxscore(game_pk, pid)
+        actual_ctx = box_cache.get(bk)
+        if not actual_ctx:
+            missing += 1; r["Grade Status"] = "FINAL / PLAYER STATS MISSING"; continue
+        r.update(actual_ctx)
+        actual = _v3_safe_num(actual_ctx.get("Actual FPTS"), None)
+        line = _v3_safe_num(r.get("Line"), None)
+        side = str(r.get("Evaluation Side") or r.get("Model Side") or "PASS").upper()
+        r["Actual"] = actual
+        r["Projection Error"] = None if actual is None or _v3_safe_num(r.get("Projection"), None) is None else round(float(actual) - float(r.get("Projection")), 3)
+        if actual is None or line is None or side not in {"HIGHER", "LOWER"}:
+            result = "NO ACTION"
+        elif float(actual) == float(line):
+            result = "PUSH"
+        else:
+            win = float(actual) > float(line) if side == "HIGHER" else float(actual) < float(line)
+            result = "WIN" if win else "LOSS"
+        r["Model Side Result"] = result
+        # Official pick result stays separate so PASS rows never inflate betting record.
+        official = str(r.get("Official Pick At Save") or "PASS").upper()
+        r["Official Result"] = result if official in {"HIGHER", "LOWER"} else "PASS"
+        prob = _v3_safe_num(r.get("Win Probability %"), None)
+        if prob is not None and result in {"WIN", "LOSS"}:
+            y = 1.0 if result == "WIN" else 0.0
+            r["Brier Score"] = round(((prob / 100.0) - y) ** 2, 4)
+        r["graded"] = True; r["graded_at"] = now_iso(); r["Grade Status"] = "FULL BOARD / GRADED"
+        graded += 1
+    save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    return {"graded": graded, "waiting_final": waiting, "missing": missing, "rows": len(hist)}
+
+
+def _ow_bfs_full_board_history_frame():
+    rows = load_json(OW_BATTER_FS_BOARD_LOG, [])
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+def _ow_grade_batter_snapshots():
+    picks=load_json(OW_BATTER_PICK_LOG,[]); results=load_json(OW_BATTER_RESULT_LOG,[])
+    result_ids={r.get("pick_id") for r in results}; result_keys={_ow_batter_result_key(r) for r in results}
+    graded=checked=waiting=missing=0
+    for p in picks:
+        if p.get("graded"): continue
+        game_pk=p.get("Game PK"); player_id=p.get("Player ID")
+        if not game_pk or not player_id:
+            missing+=1; p["Grade Status"]="MISSING GAME/PLAYER ID"; continue
+        checked+=1
+        if not is_game_final(game_pk):
+            waiting+=1; p["Grade Status"]="WAITING FINAL"; continue
+        actual_ctx=_ow_get_actual_batter_boxscore(game_pk,player_id)
+        if not actual_ctx:
+            missing+=1; p["Grade Status"]="FINAL / PLAYER STATS MISSING"; continue
+        p.update(actual_ctx)
+        market=str(p.get("Market") or p.get("Best Market") or "").upper()
+        if "FANTASY" in market or "BATTER FS" in market:
+            actual=actual_ctx.get("Actual FPTS")
+        elif "HOME RUN" in market or market=="HR":
+            actual=actual_ctx.get("Actual HR")
+        else:
+            actual=actual_ctx.get("Actual H+R+RBI")
+        p["Actual"]=actual
+        line=_v3_safe_num(p.get("Line"),None); side=_ow_batter_pick_side(p.get("Pick") or p.get("Best Pick") or p.get("Pick Side"),market)
+        if line is None or side is None or actual is None:
+            p["graded_result"]="NO ACTION"; p["win"]=None
+        elif float(actual)==float(line):
+            p["graded_result"]="PUSH"; p["win"]=None
+        else:
+            over_side=side in {"OVER","HIGHER"}
+            win=float(actual)>float(line) if over_side else float(actual)<float(line)
+            p["graded_result"]="WIN" if win else "LOSS"; p["win"]=bool(win)
+        proj=_v3_safe_num(p.get("Projection") if p.get("Projection") not in (None,"") else p.get("HR Projection"),None)
+        p["Projection Error"]=None if proj is None or actual is None else round(float(actual)-float(proj),3)
+        # Probability diagnostics for Batter Fantasy.
+        prob=_v3_safe_num(p.get("Win Probability %"),None)
+        if prob is not None and p.get("graded_result") in {"WIN","LOSS"}:
+            y=1.0 if p.get("graded_result")=="WIN" else 0.0
+            p["Brier Score"]=round(((prob/100.0)-y)**2,4)
+        p["graded"]=True; p["graded_at"]=now_iso(); p["Grade Status"]="CLEARED / GRADED"
+        rk=_ow_batter_result_key(p)
+        if p.get("pick_id") not in result_ids and rk not in result_keys:
+            results.append(dict(p)); result_ids.add(p.get("pick_id")); result_keys.add(rk)
+        graded+=1
+    save_json(OW_BATTER_PICK_LOG,picks[-20000:])
+    ded=[]; seen=set()
+    for r in results:
+        k=_ow_batter_result_key(r)
+        if k in seen: continue
+        seen.add(k); ded.append(r)
+    save_json(OW_BATTER_RESULT_LOG,ded[-20000:])
+    return {"graded":graded,"checked":checked,"waiting_final":waiting,"missing":missing,"saved":len(picks),"results":len(ded)}
+
+
+def _ow_bfs_official_candidates(df):
+    if not isinstance(df,pd.DataFrame) or df.empty: return pd.DataFrame()
+    d=df.copy()
+    prob=pd.to_numeric(d.get("Win Probability %"),errors="coerce").fillna(0)
+    conf=pd.to_numeric(d.get("Confidence"),errors="coerce").fillna(0)
+    clear=d.get("Decision Gate",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).eq("CLEAR")
+    pick=d.get("Pick",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).isin(["HIGHER","LOWER"])
+    return d[clear & pick & (prob>=OW_BATTER_FS_MIN_PLAY_PROB) & (conf>=55)].copy()
+
+
+def _ow_bfs_history_frame():
+    full=_ow_bfs_full_board_history_frame() if "_ow_bfs_full_board_history_frame" in globals() else pd.DataFrame()
+    if isinstance(full,pd.DataFrame) and not full.empty:
+        d=full.copy()
+        if "Model Side Result" in d.columns: d["graded_result"]=d["Model Side Result"]
+        return d
+    hist=_ow_deduped_batter_results() if "_ow_deduped_batter_results" in globals() else []
+    rows=[]
+    for r in hist:
+        m=str(r.get("Market") or r.get("Best Market") or "").upper()
+        if "FANTASY" in m or "BATTER FS" in m: rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _ow_bfs_learning_audit_ui():
+    st.markdown("#### Batter Fantasy V2 Learning / Calibration")
+    d=_ow_bfs_history_frame()
+    if not isinstance(d,pd.DataFrame) or d.empty:
+        st.info("Batter Fantasy learning starts after you save pregame Fantasy snapshots and grade finished games. XGBoost stays OFF until 120+ graded Fantasy rows.")
+        return
+    if "graded_result" in d.columns:
+        d=d[d["graded_result"].astype(str).str.upper().isin(["WIN","LOSS"])].copy()
+    if d.empty:
+        st.info("No graded Batter Fantasy model-side rows yet."); return
+    wins=int(d["graded_result"].astype(str).str.upper().eq("WIN").sum()); losses=int(d["graded_result"].astype(str).str.upper().eq("LOSS").sum())
+    actual=pd.to_numeric(d.get("Actual FPTS",d.get("Actual")),errors="coerce"); proj=pd.to_numeric(d.get("Projection"),errors="coerce")
+    valid=actual.notna() & proj.notna(); mae=float((actual[valid]-proj[valid]).abs().mean()) if valid.any() else None; bias=float((actual[valid]-proj[valid]).mean()) if valid.any() else None
+    brier=pd.to_numeric(d.get("Brier Score"),errors="coerce").dropna() if "Brier Score" in d.columns else pd.Series(dtype=float)
+    o=d[d.get("Official Result",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).str.upper().isin(["WIN","LOSS"])].copy() if "Official Result" in d.columns else pd.DataFrame()
+    ow=int(o["Official Result"].astype(str).str.upper().eq("WIN").sum()) if not o.empty else 0
+    ol=int(o["Official Result"].astype(str).str.upper().eq("LOSS").sum()) if not o.empty else 0
+    a,b,c,e=st.columns(4)
+    a.metric("Model-Side Graded",len(d)); b.metric("Model-Side W-L",f"{wins}-{losses}"); c.metric("Model-Side Win Rate",f"{wins/max(1,wins+losses)*100:.1f}%"); e.metric("Projection MAE","—" if mae is None else f"{mae:.2f}")
+    a2,b2,c2,e2=st.columns(4)
+    a2.metric("Official FS Graded",len(o)); b2.metric("Official FS W-L",f"{ow}-{ol}"); c2.metric("Official FS Win Rate","—" if not len(o) else f"{ow/max(1,ow+ol)*100:.1f}%"); e2.metric("Brier","—" if brier.empty else f"{brier.mean():.3f}")
+    if bias is not None: st.caption(f"Projection bias actual − projection: {bias:+.2f} FPTS. Model-side grades include the full untouched board; official W-L counts only rows that cleared the pregame decision gates.")
+    audit=[]
+    for col in ["Pick","Evaluation Side","Confidence","Contact","Snapshot Stage","Line Validated","Lineup Confirmed","Pitcher Confirmed","Bayes Sample Label","Market Type","Decision Gate"]:
+        if col not in d.columns: continue
+        tmp=d.copy()
+        if col in {"Confidence","Contact"}:
+            nums=pd.to_numeric(tmp[col],errors="coerce")
+            tmp["_bucket"]=pd.cut(nums,bins=[-1,49,59,69,79,89,101],labels=["<50","50s","60s","70s","80s","90+"])
+            gcol="_bucket"
+        else: gcol=col
+        tmp["_win"]=tmp["graded_result"].astype(str).str.upper().eq("WIN").astype(int)
+        g=tmp.groupby(gcol,dropna=False).agg(Plays=("_win","count"),Wins=("_win","sum")).reset_index(); g["Win Rate %"]=(g["Wins"]/g["Plays"].replace(0,1)*100).round(1); g["Signal"]=col; g=g.rename(columns={gcol:"Bucket"}); audit.append(g[["Signal","Bucket","Plays","Wins","Win Rate %"]])
+    if audit: st.dataframe(pd.concat(audit,ignore_index=True).sort_values(["Plays","Win Rate %"],ascending=[False,False]).head(120),use_container_width=True,hide_index=True)
+    if "Win Probability %" in d.columns:
+        tmp=d.copy(); tmp["_p"]=pd.to_numeric(tmp["Win Probability %"],errors="coerce"); tmp=tmp[tmp["_p"].notna()].copy(); tmp["Prob Bucket"]=(np.floor(tmp["_p"]/5)*5).astype(int).astype(str)+"-"+((np.floor(tmp["_p"]/5)*5+5).astype(int)).astype(str); tmp["_win"]=tmp["graded_result"].astype(str).str.upper().eq("WIN").astype(int)
+        g=tmp.groupby("Prob Bucket").agg(Plays=("_win","count"),Avg_Model_Prob=("_p","mean"),Actual_Win_Rate=("_win","mean")).reset_index(); g["Avg_Model_Prob"]=g["Avg_Model_Prob"].round(1); g["Actual_Win_Rate"]=(g["Actual_Win_Rate"]*100).round(1)
+        st.markdown("##### Probability Calibration"); st.dataframe(g,use_container_width=True,hide_index=True)
+
+
+# ---- UI wrappers: wire Batter Fantasy into the existing app ecosystem ----
+_original_render_v3_batter_learning_lab_tab_bfsv2 = render_v3_batter_learning_lab_tab
+_original_render_v3_batter_official_plays_tab_bfsv2 = render_v3_batter_official_plays_tab
+_original_render_v3_top_batter_plays_board_bfsv2 = render_v3_top_batter_plays_board
+_original_render_v3_discord_poster_studio_tab_bfsv2 = render_v3_discord_poster_studio_tab
+_original_render_v3_settings_tab_bfsv2 = render_v3_settings_tab
+
+
+def render_v3_batter_learning_lab_tab():
+    _original_render_v3_batter_learning_lab_tab_bfsv2()
+    _ow_bfs_learning_audit_ui()
+
+
+def render_v3_batter_official_plays_tab():
+    _original_render_v3_batter_official_plays_tab_bfsv2()
+    st.divider(); st.markdown("#### ⚾ Batter Fantasy V2 Official Candidates")
+    df=st.session_state.get("ow_bfs_df")
+    cand=_ow_bfs_official_candidates(df) if isinstance(df,pd.DataFrame) else pd.DataFrame()
+    if cand.empty:
+        st.info("No cleared Batter Fantasy candidates in the current session. Build the Fantasy board after lineups/pitchers are confirmed.")
+        return
+    if st.button("💾 SAVE BATTER FANTASY OFFICIAL SNAPSHOT",key=_v3_unique_widget_key("ow_bfs_save_official"),use_container_width=True):
+        added=_ow_save_batter_snapshots(cand,source_label="BATTER_FANTASY_V2_OFFICIAL")
+        st.success(f"Saved {added} new Batter Fantasy pregame rows.")
+    cols=[c for c in ["Player","Team","Opponent","Opp Pitcher","Line","Projection","Pick","Win Probability %","Confidence","Contact","Decision Gate","Edge","Median","P20","P80","Starter PA/G","Bullpen PA/G","Flags"] if c in cand.columns]
+    st.dataframe(cand[cols],use_container_width=True,hide_index=True)
+
+
+def render_v3_top_batter_plays_board():
+    _original_render_v3_top_batter_plays_board_bfsv2()
+    df=st.session_state.get("ow_bfs_df")
+    if not isinstance(df,pd.DataFrame) or df.empty: return
+    d=_ow_bfs_official_candidates(df)
+    if d.empty: return
+    st.divider(); st.markdown("#### ⚾ Batter Fantasy — Best Cleared Plays")
+    cols=[c for c in ["Player","Team","Line","Projection","Pick","Win Probability %","Confidence","Skill","Match","Form","Contact","Edge","Flags"] if c in d.columns]
+    st.dataframe(d.sort_values(["Win Probability %","Confidence"],ascending=False)[cols].head(12),use_container_width=True,hide_index=True)
+
+
+def render_v3_discord_poster_studio_tab():
+    _original_render_v3_discord_poster_studio_tab_bfsv2()
+    st.divider(); st.markdown("#### ⚾ Batter Fantasy V2 Poster")
+    df=st.session_state.get("ow_bfs_df")
+    if not isinstance(df,pd.DataFrame) or df.empty:
+        st.info("Build the Batter Fantasy board first to create a Fantasy poster."); return
+    choices=df["Player"].dropna().astype(str).tolist()
+    selected=st.selectbox("Batter Fantasy poster player",choices,key=_v3_unique_widget_key("ow_bfs_poster_player"))
+    row=df[df["Player"].astype(str)==selected].iloc[0].to_dict()
+    png=_ow_build_single_pick_poster_png(row,title_label="BATTER FANTASY")
+    if png:
+        st.image(png,use_container_width=True)
+        st.download_button("Download Batter Fantasy poster",data=png,file_name=f"batter_fantasy_{_v3_norm_name(selected).replace(' ','_')}.png",mime="image/png",key=_v3_unique_widget_key("ow_bfs_poster_dl"),use_container_width=True)
+
+
+def render_v3_settings_tab():
+    _original_render_v3_settings_tab_bfsv2()
+    st.divider(); st.markdown("#### Batter Fantasy V2 Status")
+    st.write({
+        "Batter Fantasy visible":"YES — Underdog Event Model V2",
+        "Full board":"YES — no 36-player cap",
+        "Starter/Bullpen split":"YES",
+        "Bayesian small-sample protection":"YES",
+        "Contact V2":"YES — contact/zone/chase + Statcast quality + pitcher allowed",
+        "Base-state R/RBI model":"YES",
+        "SB opportunity + opponent running control":"YES",
+        "Hard PASS gates":"lineup + starter + data + game status + availability",
+        "Fantasy grading":"YES — actual Underdog hitter FPTS",
+        "Probability calibration":"activates with graded history",
+        "XGBoost residual assist":f"automatic only after {OW_BATTER_FS_XGB_MIN_GRADED}+ graded Fantasy rows",
+        "Version":OW_BATTER_FS_VERSION,
+    })
+
+
+def _ow_bfs_card_html(row):
+    # V2 card keeps the user's requested compact UI but surfaces SP/BP and gate status.
+    esc=html.escape
+    player=esc(str(row.get("Player") or "—")); team=esc(str(row.get("Team") or "—")); pos=esc(str(row.get("Position") or "—")); bats=esc(str(row.get("Bats") or "—")); opp_pitcher=esc(str(row.get("Opp Pitcher") or "—")); p_hand=esc(str(row.get("Pitcher Hand") or "—"))
+    p_era=_ow_bfs_html_num(row.get("Pitcher ERA"),2); p_k=_ow_bfs_html_num(row.get("Pitcher K%"),1,"%"); proj=_ow_bfs_html_num(row.get("Projection"),1); p20=_ow_bfs_html_num(row.get("P20"),1); p80=_ow_bfs_html_num(row.get("P80"),1); line=_ow_bfs_html_num(row.get("Line"),1)
+    pick=str(row.get("Pick") or "PASS").upper(); model_side=str(row.get("Model Side") or "PASS").upper(); winp=_ow_bfs_num(row.get("Win Probability %"),50) or 50; conf=int(round(_ow_bfs_num(row.get("Confidence"),50) or 50)); skill=int(round(_ow_bfs_num(row.get("Skill"),50) or 50)); match=int(round(_ow_bfs_num(row.get("Match"),50) or 50)); form=int(round(_ow_bfs_num(row.get("Form"),50) or 50)); contact=int(round(_ow_bfs_num(row.get("Contact"),50) or 50)); vol=esc(str(row.get("Volatility") or "NORMAL")); gate=esc(str(row.get("Decision Gate") or "PASS")); market_type=esc(str(row.get("Market Type") or "MAIN")); flags=[x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()][:5]; flag_html="".join(f"<span class='ow-bfs-flag'>{esc(x)}</span>" for x in flags)
+    if pick=="HIGHER": badge="🔥 HIGHER"; badge_class="higher"
+    elif pick=="LOWER": badge="⬇ LOWER"; badge_class="lower"
+    else: badge=f"⚠ PASS · {model_side}"; badge_class="pass"
+    def score_block(label,val): return f"<div class='ow-bfs-score'><div><span>{label}</span><b>{val}</b></div><div class='ow-bfs-track'><i style='width:{max(0,min(100,val))}%'></i></div></div>"
+    def mini(label,value,digits=2): return f"<div class='ow-bfs-mini'><strong>{_ow_bfs_html_num(value,digits)}</strong><span>{label}</span></div>"
+    return f"""
+    <div class="ow-bfs-card">
+      <div class="ow-bfs-head"><div class="ow-bfs-player-wrap"><div class="ow-bfs-player">{player}</div><div class="ow-bfs-meta">{team} {pos} · {bats}HB · {market_type}</div><div class="ow-bfs-opp">vs {opp_pitcher} {p_hand}HP · ERA {p_era} · K {p_k}</div></div><div class="ow-bfs-proj"><span>PROJ FPTS</span><strong>{proj}</strong><small>P20 {p20} · P80 {p80}</small></div></div>
+      <div class="ow-bfs-pick-row"><span class="ow-bfs-badge {badge_class}">{badge} {line}</span><span class="ow-bfs-prob">{winp:.0f}%</span></div>
+      <div style="font-size:9px;color:#8c8a9a;margin:-2px 0 7px">GATE {gate} · SP {_ow_bfs_html_num(row.get('Starter PA/G'),1)} PA / BP {_ow_bfs_html_num(row.get('Bullpen PA/G'),1)} PA · {esc(str(row.get('Game Time') or 'time —'))}</div>
+      <div class="ow-bfs-conf"><div><span>CONFIDENCE</span><b>{conf}/100</b></div><div class="ow-bfs-conf-track"><i style="width:{conf}%"></i></div></div>
+      <div class="ow-bfs-scores">{score_block('SKILL',skill)}{score_block('MATCH',match)}{score_block('FORM',form)}{score_block('CONTACT',contact)}</div>
+      <div class="ow-bfs-minis">{mini('H/G',row.get('H/G'))}{mini('HR/G',row.get('HR/G'))}{mini('2B/G',row.get('2B/G'))}{mini('R/G',row.get('R/G'))}{mini('RBI/G',row.get('RBI/G'))}{mini('BB/G',row.get('BB/G'))}{mini('SB/G',row.get('SB/G'),3)}{mini('K/G',row.get('K/G'))}</div>
+      <div class="ow-bfs-bottom"><span>AVG {_ow_bfs_html_num(row.get('AVG'),3)}</span><span>OPS {_ow_bfs_html_num(row.get('OPS'),3)}</span><span>xwOBA {_ow_bfs_html_num(row.get('wOBA/xwOBA'),3)}</span><span>ISO {_ow_bfs_html_num(row.get('ISO'),3)}</span><b>{vol}</b></div><div class="ow-bfs-flags">{flag_html}</div>
+    </div>"""
+
+
+def render_v3_batter_fantasy_tab():
+    st.markdown('<div class="section-title-pro">⚾ Batter Fantasy V2 — Full Underdog Board</div>',unsafe_allow_html=True)
+    st.caption("Full hitter board → BATTER/PITCHER safety gate → Bayesian event rates → starter/bullpen PA split → base-state R/RBI + SB opportunity model → 12,000 simulations → calibrated Higher/Lower. H+R+RBI remains untouched.")
+    source_meta=st.session_state.get("ow_bfs_source_meta",{})
+    c1,c2=st.columns([2,1])
+    build_now=c1.button("🔄 Pull FULL Underdog Board + Build Fantasy V2",key=_v3_unique_widget_key("ow_bfs_build_v2"),use_container_width=True,type="primary")
+    clear_now=c2.button("Clear FS cache",key=_v3_unique_widget_key("ow_bfs_clear_v2"),use_container_width=True)
+    if clear_now:
+        for key in ["ow_bfs_df","ow_bfs_meta","ow_bfs_source_meta","ow_bfs_built_at"]: st.session_state.pop(key,None)
+        for fn in [_ow_bfs_event_profile,_ow_bfs_primary_role,_ow_bfs_contact_detail,_ow_bfs_game_feed_context,_ow_bfs_opponent_running_context,_ow_fetch_ud_batter_fantasy_lines,_v3_fetch_ud_batter_fs_rows]:
+            try: fn.clear()
+            except Exception: pass
+        st.success("Batter Fantasy V2 board and BFS-only caches cleared."); source_meta={}
+    if build_now:
+        # Grade any saved prior Fantasy boards whose games are now final before
+        # building the next live board. This is Batter-Fantasy-only persistence and
+        # does not alter H+R+RBI projection math.
+        try:
+            auto_grade = _ow_bfs_grade_full_board_snapshots()
+        except Exception as e:
+            auto_grade = {"graded":0,"waiting_final":0,"error":str(e)}
+        for fn in [_ow_fetch_ud_batter_fantasy_lines,_v3_fetch_ud_batter_fs_rows]:
+            try: fn.clear()
+            except Exception: pass
+        with st.spinner("Building the FULL Batter Fantasy board. First build can take longer because every hitter gets MLB/Statcast/contact context..."):
+            df_new,meta_new=build_v3_batter_fantasy_table()
+            meta_new=dict(meta_new or {})
+            meta_new["auto_grade"]=auto_grade
+            try:
+                meta_new["auto_saved_full_board"] = _ow_bfs_save_full_board_snapshot(df_new)
+            except Exception as e:
+                meta_new["auto_saved_full_board_error"] = str(e)
+            st.session_state["ow_bfs_df"]=df_new; st.session_state["ow_bfs_meta"]=meta_new; st.session_state["ow_bfs_source_meta"]=meta_new; st.session_state["ow_bfs_built_at"]=now_iso(); source_meta=meta_new
+    m1,m2,m3,m4,m5=st.columns(5); m1.metric("UD FS Rows",source_meta.get("raw",0)); m2.metric("Batters",source_meta.get("batters",0)); m3.metric("Built",source_meta.get("built",0)); m4.metric("Pitchers Filtered",source_meta.get("pitchers",0)); m5.metric("Unknown Held",source_meta.get("unknown",0))
+    df=st.session_state.get("ow_bfs_df"); meta=st.session_state.get("ow_bfs_meta",{}); built_at=st.session_state.get("ow_bfs_built_at")
+    if not isinstance(df,pd.DataFrame) or df.empty:
+        st.info("Tap **Pull FULL Underdog Board + Build Fantasy V2**. The board keeps every safe batter Fantasy Points row; pitchers and unresolved rows are held out.")
+        with st.expander("Batter Fantasy source/debug",expanded=False): st.write(source_meta or {"status":"Not pulled in this session"}); st.write("Existing UD parser debug:",st.session_state.get("fs_ud_debug",{}))
+        return
+    if built_at: st.caption(f"Built: {built_at} · {OW_BATTER_FS_VERSION}")
+    auto_grade_meta=(meta or {}).get("auto_grade") or {}
+    auto_saved=(meta or {}).get("auto_saved_full_board")
+    if auto_saved is not None or auto_grade_meta:
+        st.caption(f"Auto audit: saved {int(auto_saved or 0)} new pregame full-board rows · graded {int(auto_grade_meta.get('graded',0) or 0)} prior finals · waiting {int(auto_grade_meta.get('waiting_final',0) or 0)}.")
+    a,b,c,d=st.columns([1.4,1.2,1.0,1.0]); search=a.text_input("Search player","",key=_v3_unique_widget_key("ow_bfs_search_v2")); sort_mode=b.selectbox("Sort",["Win Probability","Projection","Contact","Skill","Edge","Confidence"],key=_v3_unique_widget_key("ow_bfs_sort_v2")); min_conf=c.slider("Min confidence",30,90,45,1,key=_v3_unique_widget_key("ow_bfs_min_conf_v2")); show_pass=d.checkbox("Show PASS",value=True,key=_v3_unique_widget_key("ow_bfs_show_pass_v2"))
+    view=df.copy();
+    if search.strip(): view=view[view["Player"].astype(str).str.contains(search.strip(),case=False,na=False)]
+    view=view[pd.to_numeric(view.get("Confidence"),errors="coerce").fillna(0)>=min_conf]
+    if not show_pass: view=view[view.get("Pick",pd.Series(dtype=str)).astype(str).isin(["HIGHER","LOWER"])]
+    sort_map={"Win Probability":"Win Probability %","Projection":"Projection","Contact":"Contact","Skill":"Skill","Edge":"Edge","Confidence":"Confidence"}; sort_col=sort_map.get(sort_mode,"Win Probability %")
+    if sort_col in view.columns:
+        if sort_mode=="Edge": view["_abs_edge"]=pd.to_numeric(view["Edge"],errors="coerce").abs(); view=view.sort_values("_abs_edge",ascending=False).drop(columns=["_abs_edge"])
+        else: view=view.sort_values(sort_col,ascending=False,na_position="last")
+    k1,k2,k3,k4,k5=st.columns(5); k1.metric("Projected",len(view)); k2.metric("Higher",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="HIGHER").sum())); k3.metric("Lower",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="LOWER").sum())); k4.metric("PASS",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="PASS").sum())); k5.metric("60%+",int((pd.to_numeric(view.get("Win Probability %"),errors="coerce")>=60).sum()))
+    save1,save2,save3=st.columns(3)
+    if save1.button("📌 Save FULL untouched board",key=_v3_unique_widget_key("ow_bfs_save_full_v2"),use_container_width=True):
+        added=_ow_bfs_save_full_board_snapshot(df); st.success(f"Saved {added} new full-board Fantasy projections for untouched grading.")
+    if save2.button("💾 Save cleared plays",key=_v3_unique_widget_key("ow_bfs_save_snapshot_v2"),use_container_width=True):
+        cand=_ow_bfs_official_candidates(view); added=_ow_save_batter_snapshots(cand,source_label="BATTER_FANTASY_V2_BOARD"); st.success(f"Saved {added} new cleared Batter Fantasy play rows.")
+    if save3.button("✅ Grade finished FS boards",key=_v3_unique_widget_key("ow_bfs_grade_v2"),use_container_width=True):
+        full_info=_ow_bfs_grade_full_board_snapshots(); off_info=_ow_grade_batter_snapshots(); st.success(f"Full board graded {full_info.get('graded',0)}; official batter rows graded {off_info.get('graded',0)}. Waiting full-board finals: {full_info.get('waiting_final',0)}.")
+    _ow_bfs_render_cards(view)
+    with st.expander("Full Batter Fantasy V2 data table",expanded=False):
+        front=[c for c in ["Player","Team","Position","Bats","Opponent","Opp Pitcher","Pitcher Hand","Game Time","Game Status","Market Type","Line Validated","Line Validation Note","Opening Line","Current Line","Line Move","Line","Projection","Median","P20","P80","Fair Line","Edge","Median Edge","Pick","Model Side","Higher %","Lower %","Win Probability %","Probability Calibration Samples","Distribution Conflict","Decision Gate","Decision Gate Reasons","Confidence","Data Score","Skill","Match","Form","Contact","Volatility","Projected PA","Starter PA Share","Starter PA/G","Bullpen PA/G","Starter Avg IP","Lineup Slot","Lineup Status","Lineup Confirmed","Availability Factor","Availability Note","Pitcher Confirmed","Umpire Name","Umpire Hitter Factor","Defense/Framing Factor","Opponent Defense Score","Opponent Framing Score","H/G","1B/G","2B/G","3B/G","HR/G","BB/G","R/G","RBI/G","SB/G","K/G","AVG","OPS","wOBA/xwOBA","ISO","Batter Contact%","Batter Zone Contact%","Batter Chase Contact%","Batter Chase%","Batter xBA","Batter Sweet Spot%","Batter Avg EV","Batter HardHit%","Batter Barrel%","Batter Whiff%","Pitch Mix Matchup Factor","Batter Pitch Contact%","Pitcher ERA","Pitcher K%","Pitcher Allowed xBA","Pitcher Allowed xwOBA","Bayes Sample Label","Prior Weighted PA","HRR Component Hits","HRR Hit Blend Factor","SB Opportunity Factor","Calibration Samples","Calibration Bias","Calibration MAE","Calibration Adjustment","XGBoost Active","XGBoost Samples","XGBoost Adjustment","Flags","Role Source","Scoring Profile","Projection Version"] if c in view.columns]; rest=[c for c in view.columns if c not in front]; st.dataframe(view[front+rest],use_container_width=True,hide_index=True)
+    st.download_button("Download FULL Batter Fantasy V2 CSV",data=view.to_csv(index=False).encode("utf-8"),file_name="batter_fantasy_v2_full_underdog_board.csv",mime="text/csv",key=_v3_unique_widget_key("ow_bfs_download_v2"),use_container_width=True)
+    with st.expander("Model / source audit",expanded=False):
+        st.write(meta); st.code("Underdog FULL Fantasy board\n→ role safety gate\n→ Bayesian current/prior/league event rates\n→ starter PA + bullpen PA distributions\n→ pitch-mix/contact V2\n→ base-state RBI + run conversion\n→ on-base SB opportunity + opponent running control\n→ 12,000 simulations\n→ historical bias/probability calibration\n→ XGBoost only after 120+ graded Fantasy rows\n→ hard PASS gates before official play")
+        st.caption("A PASS still shows the model side/projection for audit, but the app will not call it an official Higher/Lower until lineup, pitcher, data and game-status gates clear.")
+
+
+
+# ============================================================
+# BATTER FANTASY V3 — ONE-SHOT DATA INSTALLER + ARSENAL MATRIX
+# + EXPECTED CONTACT QUALITY + TTO/PA DISTRIBUTION + EVENT COVARIANCE
+# Added 2026-08-12.
+#
+# IMPORTANT SCOPE:
+# - Batter Fantasy only. H+R+RBI / Home Run projection formulas are NOT rewritten.
+# - Installed files are preferred inside Batter Fantasy; live feeds remain fallback.
+# - Missing columns are ignored/reweighted, never silently treated as zero.
+# ============================================================
+OW_BATTER_FS_VERSION = "OW_BATTER_FS_V3_INSTALLER_ARSENAL_TTO_2026_08_12"
+OW_BFS_INSTALLER_SCHEMA = "OW_BFS_DATA_INSTALLER_V1"
+OW_BFS_INSTALL_DIR = Path(STORAGE_DIR) / "batter_fantasy_data"
+OW_BFS_INSTALL_INDEX = OW_BFS_INSTALL_DIR / "installer_index.json"
+OW_BFS_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Preserve V2 behavior as controlled fallbacks.
+_ow_bfs_build_context_v2_formula = _ow_bfs_build_context
+_ow_bfs_event_model_v2_formula = _ow_bfs_event_model
+_ow_bfs_simulate_v2_formula = _ow_bfs_simulate
+_ow_bfs_contact_score_v2_formula = _ow_bfs_contact_score
+_ow_bfs_probability_calibration_v2_formula = _ow_bfs_probability_calibration
+_ow_build_batter_fantasy_row_v2_formula = _ow_build_batter_fantasy_row
+_render_v3_settings_tab_v2_formula = render_v3_settings_tab
+
+
+# -------------------------
+# DATA INSTALLER CORE
+# -------------------------
+_OW_BFS_CANONICAL_FILES = {
+    "BATTER_PROFILE": "savant_batter_profiles.csv",
+    "PITCHER_PROFILE": "savant_pitcher_stats.csv",
+    "PITCHER_ARSENAL": "pitch_mix_matchups.csv",
+    "BATTER_PLATOON": "savant_batter_platoon_2026.csv",
+    "BATTER_PITCH_TYPE": "savant_batter_pitch_type.csv",
+    "CATCHER_RUNNING": "catcher_running.csv",
+    "BASERUNNING": "batter_baserunning.csv",
+    "BULLPEN": "bullpen_context.csv",
+    "PARK_FACTORS": "park_factors.csv",
+    "LINEUPS": "lineup_context.csv",
+    "PITCHER_K_HISTORY": "pitcher_k_graded_history.csv",
+}
+
+
+def _ow_bfs_sha256(payload):
+    import hashlib
+    return hashlib.sha256(payload if isinstance(payload, (bytes, bytearray)) else bytes(payload)).hexdigest()
+
+
+def _ow_bfs_clean_uploaded_name(name):
+    name = os.path.basename(str(name or "uploaded"))
+    return re.sub(r"[^A-Za-z0-9._()\- ]+", "_", name)[:180]
+
+
+def _ow_bfs_read_payload(name, payload):
+    """Parse one installer payload. Returns (kind, object, metadata)."""
+    low = str(name or "").lower()
+    meta = {"file": _ow_bfs_clean_uploaded_name(name), "sha256": _ow_bfs_sha256(payload), "error": ""}
+    try:
+        if low.endswith(".csv"):
+            obj = pd.read_csv(io.BytesIO(payload), low_memory=False)
+            meta.update({"format": "csv", "rows": int(len(obj)), "columns": list(map(str, obj.columns))})
+            return "TABLE", obj, meta
+        if low.endswith((".xlsx", ".xls")):
+            obj = pd.read_excel(io.BytesIO(payload))
+            meta.update({"format": "excel", "rows": int(len(obj)), "columns": list(map(str, obj.columns))})
+            return "TABLE", obj, meta
+        if low.endswith(".json"):
+            obj = json.loads(payload.decode("utf-8-sig"))
+            meta.update({"format": "json", "rows": len(obj) if isinstance(obj, list) else 1, "columns": list(obj.keys()) if isinstance(obj, dict) else []})
+            return "JSON", obj, meta
+    except Exception as e:
+        meta["error"] = str(e)[:240]
+        return "ERROR", None, meta
+    meta["error"] = "Unsupported file type"
+    return "ERROR", None, meta
+
+
+def _ow_bfs_dataset_signature(df):
+    if not isinstance(df, pd.DataFrame):
+        return set()
+    return {re.sub(r"[^a-z0-9]+", "", str(c).lower()) for c in df.columns}
+
+
+def _ow_bfs_classify_dataset(name, obj, obj_type="TABLE"):
+    """Schema-first dataset recognition. Filename is only a tiebreaker."""
+    low = str(name or "").lower()
+    stage = "BACKUP" if "last_good" in low or "lastgood" in low else "ACTIVE"
+    if obj_type == "JSON":
+        if isinstance(obj, dict) and ("datasets" in obj or "refresh_started_at" in obj or "schema_version" in obj):
+            return "REFRESH_MANIFEST", stage, "manifest/schema keys"
+        return "JSON_OTHER", stage, "generic JSON"
+    if not isinstance(obj, pd.DataFrame):
+        return "UNKNOWN", stage, "not tabular"
+    sig = _ow_bfs_dataset_signature(obj)
+    schema_values = []
+    for c in obj.columns:
+        if str(c).lower() == "schema_version":
+            schema_values = obj[c].dropna().astype(str).head(5).str.upper().tolist()
+            break
+    schema_blob = " ".join(schema_values)
+    # Explicit schema/version signatures first.
+    if "BATTER_PROFILE" in schema_blob:
+        return "BATTER_PROFILE", stage, "schema_version"
+    if "PITCHER_SCHEMA" in schema_blob or ("PITCHER" in schema_blob and "ARSENAL" not in schema_blob):
+        return "PITCHER_PROFILE", stage, "schema_version"
+    if "ARSENAL" in schema_blob:
+        return "PITCHER_ARSENAL", stage, "schema_version"
+    # Column signatures.
+    if {"vsrhpktpct", "vslhpktpct"}.issubset(sig) or {"vsrhpkpct", "vslhpkpct"}.issubset(sig):
+        return "BATTER_PLATOON", stage, "R/L platoon columns"
+    if {"actualk", "pitcher", "result"}.issubset(sig):
+        return "PITCHER_K_HISTORY", stage, "graded K history columns"
+    if "pitchtype" in sig and "pitchusage" in sig and ("playerid" in sig or "mlbamid" in sig):
+        # Future batter-by-pitch files can be identified by hitter-event columns/name.
+        batter_tokens = {"battercontact", "batterwhiff", "hrrate", "xbhrate", "single", "double", "triple"}
+        if "batter" in low or len(sig.intersection(batter_tokens)) >= 2:
+            return "BATTER_PITCH_TYPE", stage, "pitch-type batter schema"
+        return "PITCHER_ARSENAL", stage, "pitch_type + pitch_usage"
+    if {"playerid", "xwoba", "xba", "xslg"}.issubset(sig) or {"playerid", "xwoba", "hardhit"}.issubset(sig):
+        if "pitcher" in low:
+            return "PITCHER_PROFILE", stage, "profile columns + filename tiebreak"
+        if "batter" in low or "hitter" in low:
+            return "BATTER_PROFILE", stage, "profile columns + filename tiebreak"
+    if "catcher" in low and ("caughtstealing" in sig or "cs" in sig):
+        return "CATCHER_RUNNING", stage, "catcher running columns"
+    if ("baserun" in low or "stolen" in low) and ("sb" in sig or "stolenbases" in sig):
+        return "BASERUNNING", stage, "basing running columns"
+    if "bullpen" in low:
+        return "BULLPEN", stage, "filename/schema"
+    if "park" in low and "factor" in " ".join(sig):
+        return "PARK_FACTORS", stage, "filename/schema"
+    if "lineup" in low:
+        return "LINEUPS", stage, "filename/schema"
+    return "UNKNOWN", stage, "no known schema matched"
+
+
+def _ow_bfs_dataset_requirements(kind):
+    return {
+        "BATTER_PROFILE": [["player_id", "player_name"], ["xwOBA", "xBA", "xSLG"]],
+        "PITCHER_PROFILE": [["player_id", "player_name"], ["xwOBA", "xBA", "xSLG"]],
+        "PITCHER_ARSENAL": [["player_id", "pitch_type", "pitch_usage"]],
+        "BATTER_PLATOON": [["mlbam_id", "player_name"], ["vs_rhp_pa", "vs_rhp_k_pct", "vs_lhp_pa", "vs_lhp_k_pct"]],
+        "BATTER_PITCH_TYPE": [["player_id", "pitch_type"]],
+        "PITCHER_K_HISTORY": [["Pitcher", "Line", "Actual_K", "Result"]],
+    }.get(kind, [])
+
+
+def _ow_bfs_validate_dataset(kind, df):
+    if not isinstance(df, pd.DataFrame):
+        return {"valid": False, "missing": ["not tabular"], "empty_columns": [], "duplicates": 0, "coverage": 0}
+    missing = []
+    for group in _ow_bfs_dataset_requirements(kind):
+        # every column in each required group is required
+        for c in group:
+            if c not in df.columns:
+                missing.append(c)
+    empty_cols = [str(c) for c in df.columns if df[c].isna().all()]
+    dup_cols = [c for c in ["player_id", "mlbam_id", "pitch_type"] if c in df.columns]
+    duplicates = int(df.duplicated(subset=dup_cols).sum()) if dup_cols else 0
+    useful = sum(1 for c in df.columns if c not in empty_cols)
+    coverage = int(round(useful / max(1, len(df.columns)) * 100))
+    valid = len(missing) == 0 and len(df) > 0
+    return {"valid": valid, "missing": missing, "empty_columns": empty_cols, "duplicates": duplicates, "coverage": coverage}
+
+
+def _ow_bfs_install_index_load():
+    try:
+        if OW_BFS_INSTALL_INDEX.exists():
+            data = json.loads(OW_BFS_INSTALL_INDEX.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {"schema_version": OW_BFS_INSTALLER_SCHEMA, "datasets": {}, "manifests": [], "updated_at": None}
+
+
+def _ow_bfs_install_index_save(index):
+    index = dict(index or {})
+    index["schema_version"] = OW_BFS_INSTALLER_SCHEMA
+    index["updated_at"] = now_iso()
+    OW_BFS_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    OW_BFS_INSTALL_INDEX.write_text(json.dumps(index, indent=2, default=str), encoding="utf-8")
+
+
+def _ow_bfs_write_installed_table(kind, stage, source_name, df, meta):
+    import shutil
+    canonical = _OW_BFS_CANONICAL_FILES.get(kind)
+    if not canonical:
+        return {"Dataset": kind, "Stage": stage, "Source File": source_name, "Status": "NOT ROUTED", "Rows": len(df) if isinstance(df, pd.DataFrame) else 0}
+    active_path = OW_BFS_INSTALL_DIR / canonical
+    backup_path = active_path.with_name(active_path.stem + ".last_good" + active_path.suffix)
+    target = backup_path if stage == "BACKUP" else active_path
+    try:
+        if stage == "ACTIVE" and active_path.exists():
+            # Preserve the previous active file before replacement.
+            try:
+                shutil.copy2(active_path, backup_path)
+            except Exception:
+                pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if canonical.lower().endswith(".csv"):
+            df.to_csv(target, index=False)
+        else:
+            target.write_text(df.to_json(orient="records"), encoding="utf-8")
+        return {"Dataset": kind, "Stage": stage, "Source File": source_name, "Installed As": str(target), "Status": "INSTALLED", "Rows": int(len(df)), "Coverage %": meta.get("validation", {}).get("coverage")}
+    except Exception as e:
+        return {"Dataset": kind, "Stage": stage, "Source File": source_name, "Installed As": str(target), "Status": f"ERROR: {str(e)[:160]}", "Rows": int(len(df))}
+
+
+def _ow_bfs_install_payloads(payload_items):
+    """Install a scanned package. ACTIVE beats BACKUP; backups are retained but never double-counted."""
+    index = _ow_bfs_install_index_load()
+    rows = []
+    # Active files first so an accompanying last_good can never replace current.
+    ordered = sorted(payload_items, key=lambda x: 0 if x.get("stage") == "ACTIVE" else 1)
+    for item in ordered:
+        kind = item.get("kind")
+        stage = item.get("stage")
+        name = item.get("name")
+        obj = item.get("obj")
+        meta = item.get("meta") or {}
+        if kind == "REFRESH_MANIFEST":
+            try:
+                p = OW_BFS_INSTALL_DIR / ("manifest_" + _ow_bfs_clean_uploaded_name(name))
+                p.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+                index.setdefault("manifests", []).append({"source": name, "path": str(p), "installed_at": now_iso(), "sha256": meta.get("sha256")})
+                rows.append({"Dataset": kind, "Stage": stage, "Source File": name, "Installed As": str(p), "Status": "INSTALLED", "Rows": 1})
+            except Exception as e:
+                rows.append({"Dataset": kind, "Stage": stage, "Source File": name, "Status": f"ERROR: {str(e)[:160]}", "Rows": 1})
+            continue
+        if kind in {"UNKNOWN", "JSON_OTHER"}:
+            rows.append({"Dataset": kind, "Stage": stage, "Source File": name, "Status": "HELD OUT / UNKNOWN SCHEMA", "Rows": meta.get("rows", 0)})
+            continue
+        if not isinstance(obj, pd.DataFrame):
+            rows.append({"Dataset": kind, "Stage": stage, "Source File": name, "Status": "INVALID TABLE", "Rows": 0})
+            continue
+        validation = _ow_bfs_validate_dataset(kind, obj)
+        meta["validation"] = validation
+        if not validation.get("valid"):
+            rows.append({"Dataset": kind, "Stage": stage, "Source File": name, "Status": "HELD OUT / MISSING: " + ", ".join(validation.get("missing") or []), "Rows": int(len(obj)), "Coverage %": validation.get("coverage")})
+            continue
+        result = _ow_bfs_write_installed_table(kind, stage, name, obj, meta)
+        rows.append(result)
+        index.setdefault("datasets", {}).setdefault(kind, {})[stage.lower()] = {
+            "source_file": name,
+            "sha256": meta.get("sha256"),
+            "rows": int(len(obj)),
+            "columns": list(map(str, obj.columns)),
+            "empty_columns": validation.get("empty_columns") or [],
+            "duplicates": validation.get("duplicates", 0),
+            "coverage": validation.get("coverage"),
+            "installed_at": now_iso(),
+            "path": result.get("Installed As"),
+            "status": result.get("Status"),
+        }
+    _ow_bfs_install_index_save(index)
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return pd.DataFrame(rows)
+
+
+def _ow_bfs_expand_uploads(uploads):
+    """Expand multiple uploads or ZIPs into one normalized installer scan list."""
+    import zipfile
+    out = []
+    for up in uploads or []:
+        name = _ow_bfs_clean_uploaded_name(getattr(up, "name", "uploaded"))
+        payload = up.getvalue()
+        if name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                    for member in zf.infolist():
+                        if member.is_dir():
+                            continue
+                        inner = _ow_bfs_clean_uploaded_name(member.filename)
+                        if not inner.lower().endswith((".csv", ".json", ".xlsx", ".xls")):
+                            continue
+                        # basename sanitization prevents zip path traversal.
+                        out.append((inner, zf.read(member)))
+            except Exception as e:
+                out.append((name + ".ERROR.txt", str(e).encode()))
+        else:
+            out.append((name, payload))
+    return out
+
+
+def _ow_bfs_scan_uploads(uploads):
+    scanned = []
+    for name, payload in _ow_bfs_expand_uploads(uploads):
+        obj_type, obj, meta = _ow_bfs_read_payload(name, payload)
+        if obj_type == "ERROR":
+            scanned.append({"name": name, "kind": "UNKNOWN", "stage": "ACTIVE", "obj": None, "meta": meta, "reason": meta.get("error")})
+            continue
+        kind, stage, reason = _ow_bfs_classify_dataset(name, obj, obj_type)
+        validation = _ow_bfs_validate_dataset(kind, obj) if isinstance(obj, pd.DataFrame) else {"valid": True, "missing": [], "empty_columns": [], "duplicates": 0, "coverage": 100}
+        meta["validation"] = validation
+        scanned.append({"name": name, "kind": kind, "stage": stage, "obj": obj, "meta": meta, "reason": reason})
+    return scanned
+
+
+def _ow_bfs_scan_frame(scanned):
+    rows = []
+    for x in scanned or []:
+        meta = x.get("meta") or {}; val = meta.get("validation") or {}
+        rows.append({
+            "File": x.get("name"), "Detected Dataset": x.get("kind"), "Stage": x.get("stage"),
+            "Rows": meta.get("rows", 0), "Columns": len(meta.get("columns") or []),
+            "Coverage %": val.get("coverage"), "Empty Columns": ", ".join((val.get("empty_columns") or [])[:8]),
+            "Duplicates": val.get("duplicates", 0), "Valid": "YES" if val.get("valid", True) else "NO",
+            "Missing": ", ".join(val.get("missing") or []), "Detected By": x.get("reason"),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _ow_bfs_installed_df(kind):
+    canonical = _OW_BFS_CANONICAL_FILES.get(str(kind or "").upper())
+    if not canonical:
+        return pd.DataFrame()
+    path = OW_BFS_INSTALL_DIR / canonical
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _ow_bfs_find_installed_row(kind, player_id=None, player_name=None):
+    df = _ow_bfs_installed_df(kind)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    id_cols = [c for c in ["player_id", "mlbam_id", "id"] if c in df.columns]
+    if player_id is not None and id_cols:
+        for c in id_cols:
+            d = df[pd.to_numeric(df[c], errors="coerce") == float(player_id)]
+            if not d.empty:
+                return d.iloc[0].to_dict()
+    name_cols = [c for c in ["player_name", "Player", "Name", "batter", "pitcher"] if c in df.columns]
+    if player_name and name_cols:
+        target = _ow_savant_norm_name(player_name) if "_ow_savant_norm_name" in globals() else _v3_norm_name(player_name)
+        for c in name_cols:
+            d = df[df[c].map(lambda z: _ow_savant_norm_name(z) if "_ow_savant_norm_name" in globals() else _v3_norm_name(z)) == target]
+            if not d.empty:
+                return d.iloc[0].to_dict()
+    return {}
+
+
+def _ow_bfs_installed_pitcher_arsenal(pitcher_id=None, pitcher_name=None):
+    df = _ow_bfs_installed_df("PITCHER_ARSENAL")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    d = pd.DataFrame()
+    if pitcher_id is not None and "player_id" in df.columns:
+        d = df[pd.to_numeric(df["player_id"], errors="coerce") == float(pitcher_id)].copy()
+    if d.empty and pitcher_name and "player_name" in df.columns:
+        target = _ow_savant_norm_name(pitcher_name) if "_ow_savant_norm_name" in globals() else _v3_norm_name(pitcher_name)
+        d = df[df["player_name"].map(lambda z: _ow_savant_norm_name(z) if "_ow_savant_norm_name" in globals() else _v3_norm_name(z)) == target].copy()
+    if d.empty:
+        return []
+    usage = pd.to_numeric(d.get("pitch_usage"), errors="coerce") if "pitch_usage" in d.columns else pd.Series([0]*len(d), index=d.index)
+    d = d.assign(_usage=usage.fillna(0)).sort_values("_usage", ascending=False)
+    return d.drop(columns=["_usage"]).to_dict("records")
+
+
+def _ow_bfs_installer_status():
+    idx = _ow_bfs_install_index_load()
+    rows = []
+    for kind, stages in (idx.get("datasets") or {}).items():
+        active = (stages or {}).get("active") or {}
+        backup = (stages or {}).get("backup") or {}
+        rows.append({
+            "Dataset": kind, "Active Rows": active.get("rows", 0), "Active Coverage %": active.get("coverage"),
+            "Active Source": active.get("source_file", "—"), "Backup": "YES" if backup else "NO",
+            "Installed": active.get("installed_at", "—"), "Status": active.get("status", "—"),
+        })
+    return pd.DataFrame(rows), idx
+
+
+# -------------------------
+# INSTALLED DATA -> BFS CONTEXT
+# -------------------------
+def _ow_bfs_overlay_installed_savant(ctx, profile):
+    ctx = dict(ctx or {})
+    pid = (profile or {}).get("player_id")
+    player = ctx.get("Player")
+    b = _ow_bfs_find_installed_row("BATTER_PROFILE", pid, player)
+    pctx = dict(ctx.get("Pitcher") or {})
+    pitcher_id = pctx.get("Pitcher ID") or pctx.get("pitcher_id")
+    pitcher_name = pctx.get("Opp Pitcher")
+    p = _ow_bfs_find_installed_row("PITCHER_PROFILE", pitcher_id, pitcher_name)
+    pl = _ow_bfs_find_installed_row("BATTER_PLATOON", pid, player)
+    ars = _ow_bfs_installed_pitcher_arsenal(pitcher_id, pitcher_name)
+    ctx["Installed Batter Profile"] = b
+    ctx["Installed Pitcher Profile"] = p
+    ctx["Installed Platoon"] = pl
+    ctx["Installed Pitcher Arsenal"] = ars
+
+    # Batter profile overlays the BFS-only Savant context. Missing cells do not erase live values.
+    sav = dict(ctx.get("Savant Hitter") or {})
+    for src, dst in [
+        ("PA", "Savant PA"), ("xwOBA", "Savant xwOBA"), ("xBA", "Savant xBA"), ("xSLG", "Savant xSLG"),
+        ("wOBA", "Savant wOBA"), ("K%", "Savant K%"), ("BB%", "Savant BB%"), ("Whiff%", "Savant Whiff%"),
+        ("Hard-Hit%", "Savant HardHit%"), ("Barrel%", "Savant Barrel%"),
+    ]:
+        val = _ow_bfs_num(b.get(src), None) if b else None
+        if val is not None:
+            sav[dst] = val
+    if b:
+        sav["Savant Hitter Found"] = "YES"
+        sav["Savant Source"] = "INSTALLED:savant_batter_profiles.csv"
+    ctx["Savant Hitter"] = sav
+
+    # Pitcher current-season installed profile is preferred for allowed quality metrics in BFS.
+    pmap = {
+        "K%": "Pitcher K%", "BB%": "Pitcher BB%", "Whiff%": "Pitcher Whiff%",
+        "xwOBA": "Pitcher Allowed xwOBA", "xBA": "Pitcher Allowed xBA", "xSLG": "Pitcher Allowed xSLG",
+        "Hard-Hit%": "Pitcher Allowed HardHit%", "Barrel%": "Pitcher Allowed Barrel%",
+    }
+    for src, dst in pmap.items():
+        val = _ow_bfs_num(p.get(src), None) if p else None
+        if val is not None:
+            pctx[dst] = val
+    if ars:
+        profiles = []
+        for r in ars:
+            profiles.append({
+                "Pitch Type": str(r.get("pitch_type") or r.get("pitch_name") or "—").upper(),
+                "Pitch Name": r.get("pitch_name") or r.get("pitch_type"),
+                "Usage %": _ow_bfs_num(r.get("pitch_usage"), None),
+                "Pitcher Whiff%": _ow_bfs_num(r.get("Whiff%"), None),
+                "Pitcher K%": _ow_bfs_num(r.get("K%"), None),
+                "Pitcher BA": _ow_bfs_num(r.get("BA"), None),
+                "Pitcher SLG": _ow_bfs_num(r.get("SLG"), None),
+                "Pitcher wOBA": _ow_bfs_num(r.get("wOBA"), None),
+                "Pitcher xwOBA": _ow_bfs_num(r.get("xwOBA"), None),
+                "Pitcher xBA": _ow_bfs_num(r.get("xBA"), None),
+                "Pitcher xSLG": _ow_bfs_num(r.get("xSLG"), None),
+                "Pitcher HardHit%": _ow_bfs_num(r.get("Hard-Hit%"), None),
+                "Pitcher Barrel%": _ow_bfs_num(r.get("Barrel%"), None),
+                "Run Value/100": _ow_bfs_num(r.get("run_value_per_100"), None),
+                "Pitches": _ow_bfs_num(r.get("Pitches"), None),
+                "Source": "INSTALLED:pitch_mix_matchups.csv",
+            })
+        pctx["Pitcher Pitch Type Profile"] = profiles
+        if profiles:
+            pctx["Primary Pitch"] = profiles[0].get("Pitch Type") or pctx.get("Primary Pitch")
+    ctx["Pitcher"] = pctx
+    active = sum(bool(x) for x in [b, p, pl, ars])
+    ctx["Installed Data Layers"] = active
+    ctx["Installed Data Note"] = f"{active}/4 core installed layers active" if active else "Live/API fallbacks only"
+    return ctx
+
+
+def _ow_bfs_build_context(player, raw, profile):
+    ctx = _ow_bfs_build_context_v2_formula(player, raw, profile)
+    ctx = _ow_bfs_overlay_installed_savant(ctx, profile)
+    # Add starter hold + opposing catcher control for the SB formula.
+    try:
+        pctx = ctx.get("Pitcher") or {}
+        ctx["Pitcher Hold"] = _ow_bfs_pitcher_hold_context(pctx.get("Pitcher ID") or pctx.get("pitcher_id"))
+    except Exception:
+        ctx["Pitcher Hold"] = {}
+    try:
+        ctx["Catcher Running"] = _ow_bfs_opponent_catcher_context(ctx.get("Team"), ctx.get("Opponent"))
+    except Exception:
+        ctx["Catcher Running"] = {}
+    return ctx
+
+
+# -------------------------
+# EXPECTED CONTACT QUALITY
+# -------------------------
+def _ow_bfs_expected_contact_quality(ctx, profile):
+    """Availability-aware 0-100 contact quality score. Missing metrics are reweighted, never zero-filled."""
+    cd = ctx.get("Contact Detail") or {}
+    sav = ctx.get("Savant Hitter") or {}
+    bq = ctx.get("Batter Quality") or {}
+    p = ctx.get("Pitcher") or {}
+    ib = ctx.get("Installed Batter Profile") or {}
+    ip = ctx.get("Installed Pitcher Profile") or {}
+
+    def first(*vals):
+        for v in vals:
+            x = _ow_bfs_num(v, None)
+            if x is not None:
+                return x
+        return None
+
+    metrics = []
+    def add(label, value, center, scale, weight, higher=True):
+        v = first(value)
+        if v is None or scale == 0:
+            return
+        z = float(clamp((v - center) / scale, -2.25, 2.25))
+        if not higher:
+            z = -z
+        metrics.append((label, v, z, float(weight)))
+
+    add("B xBA", first(ib.get("xBA"), cd.get("xBA"), sav.get("Savant xBA")), 0.245, 0.045, 0.09, True)
+    add("B xwOBA", first(ib.get("xwOBA"), cd.get("xwOBA"), sav.get("Savant xwOBA")), 0.320, 0.065, 0.11, True)
+    add("B xSLG", first(ib.get("xSLG"), sav.get("Savant xSLG"), bq.get("Batter xSLG")), 0.410, 0.090, 0.07, True)
+    add("B EV", first(cd.get("Avg EV"), bq.get("Batter Avg EV")), 88.5, 3.5, 0.05, True)
+    add("B Barrel", first(ib.get("Barrel%"), bq.get("Batter Barrel%"), sav.get("Savant Barrel%")), 7.5, 6.0, 0.06, True)
+    add("B HardHit", first(ib.get("Hard-Hit%"), bq.get("Batter HardHit%"), sav.get("Savant HardHit%")), 40.0, 9.0, 0.06, True)
+    add("B SweetSpot", cd.get("Sweet Spot%"), 33.0, 9.0, 0.04, True)
+    add("B Contact", cd.get("Contact%"), 76.0, 7.0, 0.10, True)
+    add("B ZoneContact", cd.get("Zone Contact%"), 83.0, 6.0, 0.07, True)
+    add("B ChaseContact", cd.get("Chase Contact%"), 58.0, 10.0, 0.035, True)
+    add("B Whiff", first(ib.get("Whiff%"), cd.get("Whiff%"), sav.get("Savant Whiff%")), 24.0, 7.0, 0.085, False)
+    add("P xBA allowed", first(ip.get("xBA"), p.get("Pitcher Allowed xBA")), 0.245, 0.045, 0.075, True)
+    add("P xwOBA allowed", first(ip.get("xwOBA"), p.get("Pitcher Allowed xwOBA")), 0.320, 0.065, 0.075, True)
+    add("P xSLG allowed", first(ip.get("xSLG"), p.get("Pitcher Allowed xSLG")), 0.410, 0.090, 0.05, True)
+    add("P HardHit allowed", first(ip.get("Hard-Hit%"), p.get("Pitcher Allowed HardHit%")), 40.0, 9.0, 0.045, True)
+    add("P Barrel allowed", first(ip.get("Barrel%"), p.get("Pitcher Allowed Barrel%")), 7.5, 6.0, 0.035, True)
+    add("P Whiff", first(ip.get("Whiff%"), p.get("Pitcher Whiff%")), 24.5, 8.0, 0.045, False)
+    add("P ZoneContact allowed", p.get("Pitcher Zone Contact%"), 82.0, 7.0, 0.035, True)
+
+    if not metrics:
+        return {"score": 50, "coverage": 0, "hit_factor": 1.0, "power_factor": 1.0, "k_factor": 1.0, "note": "Expected contact quality unavailable", "components": []}
+    wsum = sum(w for _, _, _, w in metrics) or 1.0
+    z = sum(zv * w for _, _, zv, w in metrics) / wsum
+    score = float(clamp(50.0 + z * 18.0, 8.0, 97.0))
+    # Direct but tightly capped probability shapers.
+    hit_factor = float(clamp(1.0 + (score - 50.0) * 0.0020, 0.90, 1.10))
+    power_labels = {"B xwOBA", "B xSLG", "B EV", "B Barrel", "B HardHit", "P xwOBA allowed", "P xSLG allowed", "P HardHit allowed", "P Barrel allowed"}
+    pmetrics = [m for m in metrics if m[0] in power_labels]
+    pz = sum(m[2] * m[3] for m in pmetrics) / max(1e-9, sum(m[3] for m in pmetrics)) if pmetrics else 0.0
+    power_factor = float(clamp(1.0 + pz * 0.050, 0.88, 1.14))
+    contact_labels = {"B Contact", "B ZoneContact", "B ChaseContact", "B Whiff", "P Whiff", "P ZoneContact allowed"}
+    cmetrics = [m for m in metrics if m[0] in contact_labels]
+    cz = sum(m[2] * m[3] for m in cmetrics) / max(1e-9, sum(m[3] for m in cmetrics)) if cmetrics else z
+    # >1 means more Ks; good contact lowers it.
+    k_factor = float(clamp(1.0 - cz * 0.055, 0.88, 1.12))
+    top = sorted(metrics, key=lambda m: abs(m[2] * m[3]), reverse=True)[:5]
+    note = "; ".join(f"{lab} {val:.3f}" if abs(val) < 2 else f"{lab} {val:.1f}" for lab, val, _, _ in top)
+    return {
+        "score": int(round(score)), "coverage": int(round(len(metrics) / 18 * 100)),
+        "hit_factor": hit_factor, "power_factor": power_factor, "k_factor": k_factor,
+        "note": note or "Expected contact quality neutral", "components": metrics,
+    }
+
+
+# -------------------------
+# BATTER x PITCHER ARSENAL MATRIX
+# -------------------------
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_bfs_batter_pitch_type_outcomes(player_id, pitcher_hand=None, days=365):
+    """BFS-only per-pitch event outcomes. Installed BATTER_PITCH_TYPE is preferred when available."""
+    installed = _ow_bfs_installed_df("BATTER_PITCH_TYPE")
+    if isinstance(installed, pd.DataFrame) and not installed.empty:
+        d = installed.copy()
+        idc = "player_id" if "player_id" in d.columns else "mlbam_id" if "mlbam_id" in d.columns else None
+        if idc:
+            d = d[pd.to_numeric(d[idc], errors="coerce") == float(player_id)].copy()
+        if not d.empty:
+            return {"available": True, "source": "INSTALLED:savant_batter_pitch_type.csv", "rows": d.to_dict("records")}
+    if not player_id:
+        return {"available": False, "source": "none", "rows": []}
+    try:
+        end = datetime.now(); start = end - timedelta(days=int(days))
+        params = {
+            "all": "true", "player_type": "batter", "batters_lookup[]": str(player_id),
+            "game_date_gt": start.strftime("%Y-%m-%d"), "game_date_lt": end.strftime("%Y-%m-%d"), "type": "details",
+        }
+        r = requests.get("https://baseballsavant.mlb.com/statcast_search/csv", params=params, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code != 200 or not r.text.strip():
+            return {"available": False, "source": f"Savant HTTP {r.status_code}", "rows": []}
+        df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+        if df.empty or "pitch_type" not in df.columns:
+            return {"available": False, "source": "Savant empty", "rows": []}
+        if pitcher_hand in {"R","L"} and "p_throws" in df.columns:
+            hd = df[df["p_throws"].astype(str).str.upper() == pitcher_hand].copy()
+            if len(hd) >= 40:
+                df = hd
+        desc = df.get("description", pd.Series([""]*len(df), index=df.index)).astype(str).str.lower()
+        swing = desc.isin(["swinging_strike","swinging_strike_blocked","foul_tip","foul","foul_bunt","missed_bunt","hit_into_play","hit_into_play_no_out","hit_into_play_score"])
+        whiff = desc.isin(["swinging_strike","swinging_strike_blocked","foul_tip"])
+        events = df.get("events", pd.Series([None]*len(df), index=df.index)).astype(str).str.lower()
+        terminal = ~events.isin(["", "nan", "none"])
+        df = df.copy(); df["_swing"] = swing.astype(int); df["_whiff"] = whiff.astype(int); df["_contact"] = (swing & ~whiff).astype(int); df["_terminal"] = terminal.astype(int)
+        for ev, col in [("single","_1b"),("double","_2b"),("triple","_3b"),("home_run","_hr"),("strikeout","_k"),("walk","_bb"),("hit_by_pitch","_hbp")]:
+            df[col] = events.eq(ev).astype(int)
+        if "intent_walk" in events.values:
+            df["_bb"] = df["_bb"] + events.eq("intent_walk").astype(int)
+        ev = pd.to_numeric(df.get("launch_speed"), errors="coerce") if "launch_speed" in df.columns else pd.Series(np.nan, index=df.index)
+        la = pd.to_numeric(df.get("launch_angle"), errors="coerce") if "launch_angle" in df.columns else pd.Series(np.nan, index=df.index)
+        bbe = ev.notna()
+        df["_bbe"] = bbe.astype(int); df["_hard"] = (bbe & (ev >= 95)).astype(int); df["_sweet"] = (bbe & la.between(8,32)).astype(int)
+        if "launch_speed_angle" in df.columns:
+            lsa = pd.to_numeric(df["launch_speed_angle"], errors="coerce")
+            df["_barrel"] = (bbe & lsa.eq(6)).astype(int)
+        else:
+            df["_barrel"] = 0
+        xba = pd.to_numeric(df.get("estimated_ba_using_speedangle"), errors="coerce") if "estimated_ba_using_speedangle" in df.columns else pd.Series(np.nan,index=df.index)
+        xw = pd.to_numeric(df.get("estimated_woba_using_speedangle"), errors="coerce") if "estimated_woba_using_speedangle" in df.columns else pd.Series(np.nan,index=df.index)
+        wv = pd.to_numeric(df.get("woba_value"), errors="coerce") if "woba_value" in df.columns else pd.Series(np.nan,index=df.index)
+        df["_xba"] = xba; df["_xwoba"] = xw.where(xw.notna(), wv)
+        rows=[]
+        for pt, g in df.groupby(df["pitch_type"].fillna("UNK").astype(str)):
+            pitches=len(g); swings=int(g["_swing"].sum()); pa=int(g["_terminal"].sum())
+            if pitches < 15 or swings < 5:
+                continue
+            counts={k:int(g[col].sum()) for k,col in [("1B","_1b"),("2B","_2b"),("3B","_3b"),("HR","_hr"),("K","_k"),("BB","_bb"),("HBP","_hbp")]}
+            hits=counts["1B"]+counts["2B"]+counts["3B"]+counts["HR"]
+            tb=counts["1B"]+2*counts["2B"]+3*counts["3B"]+4*counts["HR"]
+            bbe_n=int(g["_bbe"].sum())
+            rows.append({
+                "pitch_type":str(pt).upper(), "Pitches":pitches, "Swings":swings, "PA":pa,
+                "Whiff%":round(g["_whiff"].sum()/swings*100,1) if swings else None,
+                "Contact%":round(g["_contact"].sum()/swings*100,1) if swings else None,
+                "1B":counts["1B"], "2B":counts["2B"], "3B":counts["3B"], "HR":counts["HR"], "K":counts["K"], "BB":counts["BB"], "HBP":counts["HBP"],
+                "BA":round(hits/max(1,pa),3) if pa else None, "SLG":round(tb/max(1,pa),3) if pa else None,
+                "xBA":round(float(g["_xba"].dropna().mean()),3) if int(g["_xba"].notna().sum()) >= 5 else None,
+                "xwOBA":round(float(g["_xwoba"].dropna().mean()),3) if int(g["_xwoba"].notna().sum()) >= 5 else None,
+                "Hard-Hit%":round(g["_hard"].sum()/bbe_n*100,1) if bbe_n else None,
+                "Barrel%":round(g["_barrel"].sum()/bbe_n*100,1) if bbe_n else None,
+                "Sweet-Spot%":round(g["_sweet"].sum()/bbe_n*100,1) if bbe_n else None,
+                "source":"BASEBALL_SAVANT_BFS_PITCH_TYPE",
+            })
+        return {"available": bool(rows), "source": "BASEBALL_SAVANT_BFS_PITCH_TYPE", "rows": rows}
+    except Exception as e:
+        return {"available": False, "source": f"Savant error: {str(e)[:120]}", "rows": []}
+
+
+def _ow_bfs_pitch_arsenal_matrix(profile, ctx, baseline_probs):
+    pctx = ctx.get("Pitcher") or {}
+    pid = pctx.get("Pitcher ID") or pctx.get("pitcher_id")
+    pname = pctx.get("Opp Pitcher")
+    hand = pctx.get("Pitcher Hand")
+    arsenal = ctx.get("Installed Pitcher Arsenal") or _ow_bfs_installed_pitcher_arsenal(pid, pname)
+    if not arsenal:
+        # Reuse live pitcher pitch profile when installer data is absent.
+        arsenal = []
+        for r in pctx.get("Pitcher Pitch Type Profile") or []:
+            arsenal.append({
+                "pitch_type":r.get("Pitch Type"), "pitch_usage":r.get("Usage %"), "BA":r.get("Pitcher BA"),
+                "SLG":r.get("Pitcher SLG"), "wOBA":r.get("Pitcher wOBA"), "Whiff%":r.get("Pitcher Whiff%"),
+                "K%":r.get("Pitcher K%"), "xwOBA":r.get("Pitcher xwOBA"), "xBA":r.get("Pitcher xBA"), "xSLG":r.get("Pitcher xSLG"),
+            })
+    batter = _ow_bfs_batter_pitch_type_outcomes((profile or {}).get("player_id"), hand)
+    bmap = {str(r.get("pitch_type") or r.get("Pitch Type") or "").upper(): r for r in (batter.get("rows") or [])}
+    if not arsenal:
+        return {"available": False, "rows": [], "coverage": 0, "1B_factor":1.0,"2B_factor":1.0,"3B_factor":1.0,"HR_factor":1.0,"K_factor":1.0,"Expected Contact%":None,"Expected Whiff%":None,"Expected xwOBA":None,"Expected HR Rate":None,"Expected XBH Rate":None,"note":"Pitcher arsenal unavailable"}
+    uses=[]
+    for r in arsenal:
+        pt=str(r.get("pitch_type") or r.get("Pitch Type") or r.get("pitch_name") or "").upper()
+        u=_ow_bfs_num(r.get("pitch_usage") if r.get("pitch_usage") is not None else r.get("Usage %"),0.0) or 0.0
+        if pt and u>=2.0:
+            uses.append((pt,float(u),r))
+    if not uses:
+        return {"available": False, "rows": [], "coverage": 0, "1B_factor":1.0,"2B_factor":1.0,"3B_factor":1.0,"HR_factor":1.0,"K_factor":1.0,"Expected Contact%":None,"Expected Whiff%":None,"Expected xwOBA":None,"Expected HR Rate":None,"Expected XBH Rate":None,"note":"No usable pitch usage"}
+    total_use=sum(u for _,u,_ in uses) or 100.0
+    sums={"1B":0.0,"2B":0.0,"3B":0.0,"HR":0.0,"K":0.0,"Contact":0.0,"Whiff":0.0,"xwOBA":0.0,"XBH":0.0}
+    denom={k:0.0 for k in sums}
+    rows=[]; matched_usage=0.0
+    base={k:float(_ow_bfs_num((baseline_probs or {}).get(k),_OW_BFS_LEAGUE_EVENT_PRIORS.get(k,0.01)) or 0.01) for k in ["1B","2B","3B","HR","K"]}
+    base_contact = _ow_bfs_pct((ctx.get("Contact Detail") or {}).get("Contact%"), 0.76) or 0.76
+    base_whiff = _ow_bfs_pct((ctx.get("Contact Detail") or {}).get("Whiff%"), 0.24) or 0.24
+    base_xwoba = _ow_bfs_num((ctx.get("Savant Hitter") or {}).get("Savant xwOBA"), 0.320) or 0.320
+    for pt,u,pr in uses:
+        w=u/total_use; br=bmap.get(pt); sample_pa=float(_ow_bfs_num((br or {}).get("PA"),0.0) or 0.0); sample_sw=float(_ow_bfs_num((br or {}).get("Swings"),0.0) or 0.0)
+        shrink=sample_pa/(sample_pa+55.0) if sample_pa>0 else 0.0; swing_shrink=sample_sw/(sample_sw+85.0) if sample_sw>0 else 0.0
+        vals={}
+        for k in ["1B","2B","3B","HR","K"]:
+            obs=(float(_ow_bfs_num((br or {}).get(k),0.0) or 0.0)/sample_pa) if sample_pa>0 else base[k]
+            vals[k]=base[k]*(1-shrink)+obs*shrink
+        contact_obs=_ow_bfs_pct((br or {}).get("Contact%"),None); whiff_obs=_ow_bfs_pct((br or {}).get("Whiff%"),None)
+        contact=base_contact*(1-swing_shrink)+(contact_obs if contact_obs is not None else base_contact)*swing_shrink
+        whiff=base_whiff*(1-swing_shrink)+(whiff_obs if whiff_obs is not None else base_whiff)*swing_shrink
+        xw_obs=_ow_bfs_num((br or {}).get("xwOBA"),None)
+        xw=base_xwoba*(1-shrink)+(xw_obs if xw_obs is not None else base_xwoba)*shrink
+        # Pitcher pitch-specific damage allowed is a modest independent adjustment.
+        pba=_ow_bfs_num(pr.get("BA") if pr.get("BA") is not None else pr.get("Pitcher BA"),None)
+        pslg=_ow_bfs_num(pr.get("SLG") if pr.get("SLG") is not None else pr.get("Pitcher SLG"),None)
+        pwoba=_ow_bfs_num(pr.get("wOBA") if pr.get("wOBA") is not None else pr.get("Pitcher wOBA"),None)
+        ba_f=float(clamp((pba/0.245)**0.22,0.90,1.10)) if pba and pba>0 else 1.0
+        slg_f=float(clamp((pslg/0.410)**0.25,0.87,1.14)) if pslg and pslg>0 else 1.0
+        wo_f=float(clamp((pwoba/0.320)**0.18,0.92,1.08)) if pwoba and pwoba>0 else 1.0
+        vals["1B"]*=ba_f*wo_f; vals["2B"]*=ba_f*(slg_f**0.75); vals["3B"]*=ba_f*(slg_f**0.55); vals["HR"]*=slg_f*wo_f
+        pwh=_ow_bfs_pct(pr.get("Whiff%") if pr.get("Whiff%") is not None else pr.get("Pitcher Whiff%"),None)
+        if pwh is not None:
+            vals["K"]*=float(clamp((pwh/0.245)**0.20,0.92,1.10))
+        xbh=vals["2B"]+vals["3B"]+vals["HR"]
+        for k in ["1B","2B","3B","HR","K"]: sums[k]+=w*vals[k]; denom[k]+=w
+        for k,val in [("Contact",contact),("Whiff",whiff),("xwOBA",xw),("XBH",xbh)]: sums[k]+=w*val; denom[k]+=w
+        if br: matched_usage+=u
+        rows.append({"Pitch":pt,"Usage %":round(u,1),"Batter PA":int(sample_pa),"Shrink Weight":round(shrink,3),"Contact %":round(contact*100,1),"Whiff %":round(whiff*100,1),"xwOBA":round(xw,3),"1B/PA":round(vals["1B"],4),"2B/PA":round(vals["2B"],4),"3B/PA":round(vals["3B"],4),"HR/PA":round(vals["HR"],4),"K/PA":round(vals["K"],4)})
+    factors={}
+    for k in ["1B","2B","3B","HR","K"]:
+        expv=sums[k]/max(1e-9,denom[k]); factors[k+"_factor"]=float(clamp(expv/max(1e-9,base[k]),0.78 if k=="HR" else 0.86,1.24 if k=="HR" else 1.14))
+    exp_contact=sums["Contact"]/max(1e-9,denom["Contact"]); exp_whiff=sums["Whiff"]/max(1e-9,denom["Whiff"]); exp_xw=sums["xwOBA"]/max(1e-9,denom["xwOBA"]); exp_xbh=sums["XBH"]/max(1e-9,denom["XBH"])
+    exp_hr=sums["HR"]/max(1e-9,denom["HR"])
+    top=sorted(rows,key=lambda r:r["Usage %"],reverse=True)[:4]
+    note=" | ".join(f"{r['Pitch']} {r['Usage %']:.0f}% xwOBA {r['xwOBA']:.3f}" for r in top)
+    return {"available":True,"rows":rows,"coverage":int(round(matched_usage/max(1e-9,total_use)*100)),**factors,"Expected Contact%":round(exp_contact*100,1),"Expected Whiff%":round(exp_whiff*100,1),"Expected xwOBA":round(exp_xw,3),"Expected HR Rate":round(exp_hr,4),"Expected XBH Rate":round(exp_xbh,4),"note":note or "Arsenal matrix neutral","source":batter.get("source")}
+
+
+# -------------------------
+# PLATOON SHRINKAGE / PA DISTRIBUTION / TTO
+# -------------------------
+def _ow_bfs_platoon_k_rate(profile, ctx, base_k):
+    row = ctx.get("Installed Platoon") or {}
+    hand = str((ctx.get("Pitcher") or {}).get("Pitcher Hand") or "").upper()
+    if hand not in {"R","L"} or not row:
+        return float(base_k), {"available":False,"sample":0,"raw":None,"shrunk":float(base_k)}
+    pa_key = "vs_rhp_pa" if hand=="R" else "vs_lhp_pa"; k_key = "vs_rhp_k_pct" if hand=="R" else "vs_lhp_k_pct"
+    pa=float(_ow_bfs_num(row.get(pa_key),0.0) or 0.0); raw=_ow_bfs_pct(row.get(k_key),None)
+    if raw is None or pa<=0:
+        return float(base_k), {"available":False,"sample":pa,"raw":raw,"shrunk":float(base_k)}
+    # 120 PA prior keeps small hand splits from overpowering the batter baseline.
+    w=pa/(pa+120.0); shrunk=float(base_k)*(1-w)+float(raw)*w
+    return float(clamp(shrunk,0.06,0.42)), {"available":True,"sample":int(pa),"raw":raw,"weight":round(w,3),"shrunk":shrunk,"hand":hand}
+
+
+def _ow_bfs_pa_distribution(ctx):
+    base=float(_ow_bfs_num(ctx.get("Projected PA"),4.15) or 4.15)
+    slot=int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"),4) or 4)); team_runs=float(_ow_bfs_num(ctx.get("Team Runs"),4.35) or 4.35)
+    theoretical=4.66-0.095*(slot-1)+0.075*(team_runs-4.35)
+    mean=float(clamp(0.72*base+0.28*theoretical,3.25,5.25))
+    confirmed=bool((ctx.get("Lineup") or {}).get("Lineup Confirmed")); support=np.arange(3 if confirmed else 2,8,dtype=float); sd=0.62 if confirmed else 0.78
+    # Exponential tilt solves for a discrete distribution with the requested mean.
+    base_log=-0.5*((support-mean)/sd)**2
+    lo,hi=-4.0,4.0
+    for _ in range(50):
+        lam=(lo+hi)/2; w=np.exp(base_log+lam*support); p=w/w.sum(); m=float(np.sum(p*support))
+        if m<mean: lo=lam
+        else: hi=lam
+    lam=(lo+hi)/2; w=np.exp(base_log+lam*support); p=w/w.sum()
+    return {"mean":float(np.sum(p*support)),"support":support.astype(int).tolist(),"probs":p.tolist(),**{f"P{int(k)}":round(float(v)*100,1) for k,v in zip(support,p)}}
+
+
+def _ow_bfs_starter_prob_by_pa(ctx, model):
+    avg_ip=float(_ow_bfs_num(model.get("Starter Avg IP"),5.25) or 5.25); leash=str(((ctx.get("Bullpen Leash") or {}).get("Starter Leash Label") or "")).upper()
+    p1=0.995; p2=float(clamp(0.91+(avg_ip-4.75)*0.035,0.88,0.97)); p3=float(clamp(0.64+(avg_ip-4.75)*0.15,0.50,0.89)); p4=float(clamp(0.07+(avg_ip-4.8)*0.11,0.02,0.30)); p5=0.015
+    if "SHORT" in leash: p2-=0.03; p3-=0.10; p4-=0.04
+    elif "LONG" in leash: p2+=0.01; p3+=0.06; p4+=0.05
+    vals=[p1,p2,p3,p4,p5,0.0,0.0]
+    return [float(clamp(x,0.0,0.999)) for x in vals]
+
+
+def _ow_bfs_tto_adjust_probs(probs, tto=1):
+    q={k:float(v) for k,v in (probs or {}).items()}
+    if tto>=2:
+        for k in ["1B","2B","3B"]: q[k]*=1.015
+        q["HR"]*=1.020; q["BB"]*=1.010; q["K"]*=0.980
+    if tto>=3:
+        for k in ["1B","2B","3B"]: q[k]*=1.020
+        q["HR"]*=1.030; q["BB"]*=1.010; q["K"]*=0.975
+    s=sum(q.get(k,0.0) for k in ["1B","2B","3B","HR","BB","HBP","K"])
+    if s>0.96:
+        f=0.96/s
+        for k in ["1B","2B","3B","HR","BB","HBP","K"]: q[k]*=f
+    q["OUT"]=max(0.01,1.0-sum(q.get(k,0.0) for k in ["1B","2B","3B","HR","BB","HBP","K"]))
+    z=sum(q.values()) or 1.0
+    return {k:v/z for k,v in q.items()}
+
+
+# -------------------------
+# CONDITIONAL R/RBI + SB CONTROL
+# -------------------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def _ow_bfs_pitcher_hold_context(pitcher_id):
+    out={"factor":1.0,"SB":None,"CS":None,"Pickoffs":None,"note":"Pitcher hold neutral/unavailable"}
+    if not pitcher_id: return out
+    try:
+        year=california_now().year if "california_now" in globals() else datetime.now().year
+        data=safe_get_json(f"{MLB_BASE}/people/{int(pitcher_id)}/stats",params={"stats":"season","group":"pitching","season":year},timeout=12) or {}
+        stat={}
+        for b in data.get("stats") or []:
+            sp=b.get("splits") or []
+            if sp: stat=sp[0].get("stat") or {}; break
+        sb=_ow_stat_num(stat,"stolenBases","stolenBasesAllowed",default=None); cs=_ow_stat_num(stat,"caughtStealing",default=None); po=_ow_stat_num(stat,"pickoffs",default=None)
+        f=1.0; notes=[]
+        if sb is not None and cs is not None and sb+cs>=8:
+            succ=sb/max(1.0,sb+cs); f*=float(clamp(1+(succ-0.75)*0.55,0.91,1.09)); notes.append(f"SB success allowed {succ*100:.0f}%")
+        if po is not None and po>=3: f*=0.96; notes.append(f"{int(po)} pickoffs")
+        out.update({"factor":round(float(clamp(f,0.88,1.12)),3),"SB":sb,"CS":cs,"Pickoffs":po,"note":", ".join(notes) if notes else "Pitcher hold neutral"})
+    except Exception: pass
+    return out
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def _ow_bfs_opponent_catcher_context(team, opponent=None):
+    out={"factor":1.0,"Catcher":"—","SB":None,"CS":None,"note":"Catcher throwing neutral/unavailable"}
+    try:
+        game_pk=_ow_today_game_pk_for_team(team, opponent)
+        if not game_pk: return out
+        box=safe_get_json(f"{MLB_BASE}/game/{int(game_pk)}/boxscore",timeout=12) or {}
+        target=_ow_team_abbr(opponent or "")
+        catcher=None
+        for side in ["home","away"]:
+            t=((box.get("teams") or {}).get(side) or {}); ab=_ow_team_abbr(((t.get("team") or {}).get("abbreviation") or (t.get("team") or {}).get("name") or ""))
+            if target and target!="—" and ab!=target: continue
+            for pp in (t.get("players") or {}).values():
+                pos=str(((pp.get("position") or {}).get("abbreviation") or "")).upper(); bo=pp.get("battingOrder")
+                if pos=="C" and bo:
+                    catcher=pp.get("person") or {}; break
+            if catcher: break
+        if not catcher: return out
+        cid=catcher.get("id"); cname=catcher.get("fullName") or "—"; year=california_now().year if "california_now" in globals() else datetime.now().year
+        data=safe_get_json(f"{MLB_BASE}/people/{int(cid)}/stats",params={"stats":"season","group":"fielding","season":year},timeout=12) or {}
+        stat={}
+        for b in data.get("stats") or []:
+            for sp in b.get("splits") or []:
+                pos=str(((sp.get("position") or {}).get("abbreviation") or "")).upper()
+                if pos=="C" or not stat: stat=sp.get("stat") or {}
+                if pos=="C": break
+        sb=_ow_stat_num(stat,"stolenBases","stolenBasesAllowed",default=None); cs=_ow_stat_num(stat,"caughtStealing",default=None)
+        f=1.0; note=[]
+        if sb is not None and cs is not None and sb+cs>=15:
+            succ=sb/max(1.0,sb+cs); f=float(clamp(1+(succ-0.75)*0.65,0.88,1.12)); note.append(f"{succ*100:.0f}% SB success vs C")
+        out.update({"factor":round(f,3),"Catcher":cname,"SB":sb,"CS":cs,"note":", ".join(note) if note else f"{cname} throwing sample neutral"})
+    except Exception: pass
+    return out
+
+
+def _ow_bfs_conditional_run_rbi_context(ctx):
+    prot=ctx.get("Protection") or {}; team_runs=float(_ow_bfs_num(ctx.get("Team Runs"),4.35) or 4.35); slot=int(round(_ow_bfs_num((ctx.get("Lineup") or {}).get("Lineup Slot"),4) or 4))
+    ahead=_ow_bfs_num(prot.get("Ahead OBP"),None); behind=_ow_bfs_num(prot.get("Behind SLG"),None)
+    if ahead is None: ahead=0.320
+    if behind is None: behind=0.410
+    occupancy=float(clamp(0.195+(ahead-0.320)*0.52+(team_runs-4.35)*0.014+(0.012 if 3<=slot<=5 else 0.0),0.135,0.32))
+    behind_factor=float(clamp(1+(behind-0.410)*0.85,0.86,1.16)); team_factor=float(clamp((team_runs/4.35)**0.45,0.86,1.17))
+    return {"Ahead OBP":ahead,"Behind SLG":behind,"Base Occupancy":occupancy,"Behind Run Factor":behind_factor,"Team Run Factor":team_factor,"note":f"ahead OBP {ahead:.3f}; behind SLG {behind:.3f}; occupancy {occupancy:.3f}"}
+
+
+def _ow_bfs_sb_target(profile, ctx, onbase_rate, pa):
+    season=(profile or {}).get("season") or {}; sc=(profile or {}).get("season_counts") or {}
+    sb=float(_ow_bfs_num(sc.get("SB"),0.0) or 0.0); cs=float(_ow_bfs_num(_ow_stat_num(season,"caughtStealing",default=0.0),0.0) or 0.0)
+    attempts=sb+cs; times_on_base=max(1.0,float(_ow_bfs_num(sc.get("H"),0.0) or 0.0)+float(_ow_bfs_num(sc.get("BB"),0.0) or 0.0)+float(_ow_bfs_num(sc.get("HBP"),0.0) or 0.0))
+    raw_attempt=attempts/times_on_base; raw_success=sb/max(1.0,attempts) if attempts>0 else 0.75
+    # Beta/Bayesian shrinkage toward league running behavior.
+    attempt_rate=(attempts+0.055*55.0)/(times_on_base+55.0); success=(sb+0.75*18.0)/(attempts+18.0)
+    hold=float(_ow_bfs_num((ctx.get("Pitcher Hold") or {}).get("factor"),1.0) or 1.0); catcher=float(_ow_bfs_num((ctx.get("Catcher Running") or {}).get("factor"),1.0) or 1.0); team_run=float(_ow_bfs_num((ctx.get("Running Context") or {}).get("SB Opportunity Factor"),1.0) or 1.0)
+    projected_ob=max(0.0,float(pa)*float(onbase_rate)); target=projected_ob*attempt_rate*success*hold*catcher*(team_run**0.35)
+    return {"target":float(clamp(target,0.0,0.85)),"attempt_rate":attempt_rate,"success_rate":success,"raw_attempt_rate":raw_attempt,"raw_success":raw_success,"pitcher_hold_factor":hold,"catcher_factor":catcher,"projected_onbase":projected_ob}
+
+
+# -------------------------
+# EVENT MODEL V3: DIRECT FORMULA INTEGRATION
+# -------------------------
+OW_BFS_V3_TRACE = {}
+
+def _ow_bfs_normalize_probs(probs):
+    keys=["1B","2B","3B","HR","BB","HBP","K"]
+    q={k:max(0.0001,float(_ow_bfs_num((probs or {}).get(k),0.0) or 0.0)) for k in keys}
+    s=sum(q.values())
+    if s>0.955:
+        f=0.955/s; q={k:v*f for k,v in q.items()}
+    q["OUT"]=max(0.005,1-sum(q.values())); z=sum(q.values()) or 1.0
+    return {k:v/z for k,v in q.items()}
+
+
+def _ow_bfs_event_model(profile, ctx):
+    model=dict(_ow_bfs_event_model_v2_formula(profile,ctx) or {})
+    sp=dict(model.get("starter_probs") or model.get("probs") or {}); bp=dict(model.get("bullpen_probs") or model.get("probs") or sp)
+    if not sp: return model
+    contactq=_ow_bfs_expected_contact_quality(ctx,profile)
+    arsenal=_ow_bfs_pitch_arsenal_matrix(profile,ctx,sp)
+    # Neutralize the old aggregate pitch factor before applying the richer matrix, preventing double-counting.
+    old_hrr=float(_ow_bfs_num((ctx.get("Pitch HRR") or {}).get("Pitch Mix Matchup Factor"),1.0) or 1.0); old_hr=float(_ow_bfs_num((ctx.get("Pitch HR") or {}).get("Pitch Mix Matchup Factor"),1.0) or 1.0)
+    for k in ["1B","2B","3B"]: sp[k]/=max(0.90,old_hrr**0.55)
+    sp["HR"]/=max(0.86,old_hr**0.65)
+    # Expected contact quality directly reshapes both starter and bullpen outcomes, but at controlled strength.
+    hf=float(contactq.get("hit_factor",1.0)); pf=float(contactq.get("power_factor",1.0)); kf=float(contactq.get("k_factor",1.0))
+    for q,strength in [(sp,0.50),(bp,0.35)]:
+        for k in ["1B","2B","3B"]: q[k]*=hf**strength
+        q["HR"]*=(hf**0.15)*(pf**strength); q["K"]*=kf**strength
+    # Full arsenal matrix is starter-specific and changes actual event probabilities, not just the card score.
+    if arsenal.get("available"):
+        sp["1B"]*=float(arsenal.get("1B_factor",1.0)); sp["2B"]*=float(arsenal.get("2B_factor",1.0)); sp["3B"]*=float(arsenal.get("3B_factor",1.0)); sp["HR"]*=float(arsenal.get("HR_factor",1.0)); sp["K"]*=float(arsenal.get("K_factor",1.0))
+    # Handedness K split is sample-size shrunk before it can move starter K probability.
+    shrunk_k,platoon=_ow_bfs_platoon_k_rate(profile,ctx,sp.get("K",0.22)); sp["K"]=0.65*float(sp.get("K",0.22))+0.35*float(shrunk_k)
+    sp=_ow_bfs_normalize_probs(sp); bp=_ow_bfs_normalize_probs(bp)
+    pa_dist=_ow_bfs_pa_distribution(ctx); pa=float(pa_dist.get("mean",ctx.get("Projected PA") or 4.15))
+    cond=_ow_bfs_conditional_run_rbi_context(ctx)
+    # Event-derived conditional means blended with historical V2 run/RBI targets.
+    occ=float(cond["Base Occupancy"]); teamf=float(cond["Team Run Factor"]); behindf=float(cond["Behind Run Factor"])
+    share=float(_ow_bfs_num(model.get("Starter PA Share"),0.65) or 0.65)
+    mix={k:share*sp.get(k,0)+(1-share)*bp.get(k,0) for k in sp.keys()}
+    event_rbi=pa*(mix["HR"]*(1+3*occ)+mix["1B"]*(3*occ*0.24)+mix["2B"]*(3*occ*0.52)+mix["3B"]*(3*occ*0.84))
+    event_run=pa*(mix["HR"]+mix["1B"]*0.27*behindf*teamf+mix["2B"]*0.44*behindf*teamf+mix["3B"]*0.68*behindf*teamf+(mix["BB"]+mix["HBP"])*0.25*behindf*teamf)
+    model["Projected Runs"]=float(clamp(0.48*float(model.get("Projected Runs",event_run))+0.52*event_run,0.03,1.9)); model["Projected RBI"]=float(clamp(0.48*float(model.get("Projected RBI",event_rbi))+0.52*event_rbi,0.03,2.1))
+    onbase_rate=sum(mix.get(k,0.0) for k in ["1B","2B","3B","HR","BB","HBP"]); sbf=_ow_bfs_sb_target(profile,ctx,onbase_rate,pa); model["Projected SB"]=sbf["target"]
+    model.update({"starter_probs":sp,"bullpen_probs":bp,"Expected Contact Quality":contactq,"Arsenal Matrix":arsenal,"Platoon K Shrink":platoon,"PA Distribution":pa_dist,"Conditional Run/RBI":cond,"SB Formula":sbf,"Modeled K/PA":share*sp["K"]+(1-share)*bp["K"]})
+    try:
+        OW_BFS_V3_TRACE[str((profile or {}).get("player_id") or ctx.get("Player") or "")] = {"ctx": ctx, "model": model, "profile": profile}
+    except Exception:
+        pass
+    return model
+
+
+# -------------------------
+# SEQUENTIAL TTO MONTE CARLO + EVENT COVARIANCE
+# -------------------------
+def _ow_bfs_simulate(player,line,profile,ctx,model,passes=OW_BATTER_FS_SIM_PASSES):
+    pass_n=int(clamp(_ow_bfs_num(passes,OW_BATTER_FS_SIM_PASSES) or OW_BATTER_FS_SIM_PASSES,5000,50000)); seed=_ow_seed_from_text(player,"BFS_V3_TTO",line,OW_BATTER_FS_VERSION); rng=np.random.default_rng(seed)
+    pa_dist=model.get("PA Distribution") or _ow_bfs_pa_distribution(ctx); support=np.asarray(pa_dist.get("support") or [3,4,5,6,7],dtype=int); probs_pa=np.asarray(pa_dist.get("probs") or [0.05,0.55,0.30,0.08,0.02],dtype=float); probs_pa=probs_pa/probs_pa.sum(); pa_counts=rng.choice(support,size=pass_n,p=probs_pa)
+    sp_base=model.get("starter_probs") or {}; bp=_ow_bfs_normalize_probs(model.get("bullpen_probs") or sp_base); starter_curve=_ow_bfs_starter_prob_by_pa(ctx,model)
+    order=["1B","2B","3B","HR","BB","HBP","K","OUT"]; event_matrix=np.full((pass_n,7),-1,dtype=np.int8); starter_matrix=np.zeros((pass_n,7),dtype=np.int8)
+    for j in range(7):
+        active=np.where(pa_counts>j)[0]
+        if len(active)==0: continue
+        sp_prob=starter_curve[j] if j<len(starter_curve) else 0.0; is_sp=rng.random(len(active))<sp_prob; sp_idx=active[is_sp]; bp_idx=active[~is_sp]
+        if len(sp_idx):
+            tto=1 if j==0 else 2 if j==1 else 3
+            q=_ow_bfs_tto_adjust_probs(sp_base,tto); p=np.asarray([q[k] for k in order],dtype=float); event_matrix[sp_idx,j]=rng.choice(len(order),size=len(sp_idx),p=p); starter_matrix[sp_idx,j]=1
+        if len(bp_idx):
+            p=np.asarray([bp[k] for k in order],dtype=float); event_matrix[bp_idx,j]=rng.choice(len(order),size=len(bp_idx),p=p)
+    counts={k:(event_matrix==i).sum(axis=1).astype(int) for i,k in enumerate(order)}; one_b,two_b,three_b,hr,bb,hbp,kk=[counts[k] for k in ["1B","2B","3B","HR","BB","HBP","K"]]; hits=one_b+two_b+three_b+hr
+    cond=model.get("Conditional Run/RBI") or _ow_bfs_conditional_run_rbi_context(ctx); occ=float(cond.get("Base Occupancy",0.20)); teamf=float(cond.get("Team Run Factor",1.0)); behindf=float(cond.get("Behind Run Factor",1.0))
+    # Every positive event creates linked fantasy outcomes; no independent hit/R/HR generation.
+    rbi=hr.copy(); rbi+=rng.binomial(3*hr,occ); rbi+=rng.binomial(3*one_b,float(clamp(occ*0.24,0,0.35))); rbi+=rng.binomial(3*two_b,float(clamp(occ*0.52,0,0.55))); rbi+=rng.binomial(3*three_b,float(clamp(occ*0.84,0,0.80)))
+    target_rbi=float(model.get("Projected RBI",np.mean(rbi))); resid=max(0.0,target_rbi-float(np.mean(rbi))); 
+    if resid>0.015: rbi=rbi+rng.poisson(min(0.65,resid),size=pass_n)
+    p1=float(clamp(0.27*behindf*teamf,0.15,0.49)); p2=float(clamp(0.44*behindf*teamf,0.25,0.68)); p3=float(clamp(0.68*behindf*teamf,0.40,0.86)); pob=float(clamp(0.25*behindf*teamf,0.14,0.46))
+    runs=hr.copy()+rng.binomial(one_b,p1)+rng.binomial(two_b,p2)+rng.binomial(three_b,p3)+rng.binomial(bb+hbp,pob)
+    target_run=float(model.get("Projected Runs",np.mean(runs))); residr=max(0.0,target_run-float(np.mean(runs))); 
+    if residr>0.015: runs=runs+rng.binomial(1,min(0.60,residr),size=pass_n)
+    sb_opps=one_b+bb+hbp; exp_opps=max(0.08,float(np.mean(sb_opps))); sb_target=float(model.get("Projected SB",0.05)); sb_p=float(clamp(sb_target/exp_opps,0.0,0.48)); sb=rng.binomial(sb_opps,sb_p)
+    fs=_ow_bfs_score_components(one_b,two_b,three_b,hr,bb,hbp,runs,rbi,sb)
+    starter_pa=starter_matrix.sum(axis=1); out={"Simulation Passes":pass_n,"Starter PA/G":round(float(np.mean(starter_pa)),2),"Bullpen PA/G":round(float(np.mean(pa_counts-starter_pa)),2),"Starter PA Share":round(float(np.mean(starter_pa/np.maximum(1,pa_counts))),3),"H/G":round(float(np.mean(hits)),2),"1B/G":round(float(np.mean(one_b)),2),"2B/G":round(float(np.mean(two_b)),2),"3B/G":round(float(np.mean(three_b)),3),"HR/G":round(float(np.mean(hr)),3),"BB/G":round(float(np.mean(bb)),2),"HBP/G":round(float(np.mean(hbp)),3),"R/G":round(float(np.mean(runs)),2),"RBI/G":round(float(np.mean(rbi)),2),"SB/G":round(float(np.mean(sb)),3),"K/G":round(float(np.mean(kk)),2),"PA/G":round(float(np.mean(pa_counts)),2),"PA P3%":pa_dist.get("P3"),"PA P4%":pa_dist.get("P4"),"PA P5%":pa_dist.get("P5"),"PA P6%":pa_dist.get("P6"),"PA P7%":pa_dist.get("P7"),"Starter 1st PA %":round(starter_curve[0]*100,1),"Starter 2nd PA %":round(starter_curve[1]*100,1),"Starter 3rd PA %":round(starter_curve[2]*100,1),"Starter 4th PA %":round(starter_curve[3]*100,1)}
+    return _ow_bfs_summarize_fs_array(fs,line,out)
+
+
+# -------------------------
+# CONTACT CARD SCORE + TRUE PROBABILITY CALIBRATION
+# -------------------------
+def _ow_bfs_contact_score(ctx,profile,model):
+    base=float(_ow_bfs_contact_score_v2_formula(ctx,profile,model)); cq=model.get("Expected Contact Quality") or {}; ar=model.get("Arsenal Matrix") or {}
+    cq_score=float(_ow_bfs_num(cq.get("score"),50) or 50); arsenal_contact=_ow_bfs_num(ar.get("Expected Contact%"),None); arsenal_whiff=_ow_bfs_num(ar.get("Expected Whiff%"),None)
+    # Blend the legacy rich score with the new direct expected-contact model.
+    score=0.48*base+0.52*cq_score
+    if arsenal_contact is not None: score+=(arsenal_contact-76.0)*0.42
+    if arsenal_whiff is not None: score+=(24.0-arsenal_whiff)*0.30
+    return int(round(clamp(score,5,99)))
+
+
+def _ow_bfs_probability_calibration(raw_prob,side,features=None):
+    cal=_ow_bfs_calibration_profile(); rows=list(cal.get("rows") or []); p=float(_ow_bfs_num(raw_prob,50.0) or 50.0); wanted=str(side or "").upper()
+    usable=[]
+    for r in rows:
+        saved=str(r.get("Evaluation Side") or r.get("Model Side") or r.get("Pick") or r.get("Pick Side") or "").upper(); aliases={wanted,"OVER" if wanted=="HIGHER" else "UNDER" if wanted=="LOWER" else wanted}
+        rp=_ow_bfs_num(r.get("Raw Win Probability %") if r.get("Raw Win Probability %") is not None else r.get("Win Probability %"),None); result=str(r.get("graded_result") or r.get("Model Side Result") or "").upper()
+        if saved in aliases and rp is not None and result in {"WIN","LOSS"}: usable.append((float(rp),1 if result=="WIN" else 0))
+    n=len(usable)
+    if n<30: return _ow_bfs_probability_calibration_v2_formula(raw_prob,side,features)
+    x=np.asarray([u[0] for u in usable],dtype=float); y=np.asarray([u[1] for u in usable],dtype=float)
+    # Beta-smoothed local 10-point reliability bucket is the robust fallback.
+    mask=np.abs(x-p)<=5.0; local_y=y[mask]; local_n=int(mask.sum()); beta_emp=(float(local_y.sum())+6.0*0.55)/(local_n+6.0) if local_n else p/100.0
+    empirical=beta_emp*100.0; method="beta reliability"
+    calibrated=0.78*p+0.22*empirical
+    # Isotonic becomes the main calibrator only with enough side-specific history and both outcomes.
+    if n>=80 and len(np.unique(y))>=2:
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            iso=IsotonicRegression(y_min=0.20,y_max=0.85,out_of_bounds="clip"); iso.fit(x/100.0,y); ip=float(iso.predict([p/100.0])[0])*100.0; alpha=float(clamp((n-60)/260.0,0.18,0.58)); calibrated=(1-alpha)*p+alpha*ip; empirical=ip; method=f"isotonic blend {alpha:.2f}"
+        except Exception:
+            pass
+    calibrated=float(clamp(calibrated,30.0,78.0))
+    return calibrated,{"samples":n,"empirical":round(empirical,1),"note":f"True probability calibration: {method}; {n} {wanted} grades (local {local_n})"}
+
+
+# -------------------------
+# ROW EXTENSION / FLAGS
+# -------------------------
+def _ow_build_batter_fantasy_row(raw):
+    row=_ow_build_batter_fantasy_row_v2_formula(raw)
+    if not row: return row
+    try:
+        pid=row.get("Player ID"); trace=OW_BFS_V3_TRACE.get(str(pid or row.get("Player") or ""), {}) if "OW_BFS_V3_TRACE" in globals() else {}; profile=trace.get("profile") or _ow_bfs_event_profile(row.get("Player")); ctx=trace.get("ctx") or _ow_bfs_build_context(row.get("Player"),raw,profile); model=trace.get("model") or _ow_bfs_event_model(profile,ctx); cq=model.get("Expected Contact Quality") or {}; ar=model.get("Arsenal Matrix") or {}; pa=model.get("PA Distribution") or {}; pl=model.get("Platoon K Shrink") or {}; sb=model.get("SB Formula") or {}; cond=model.get("Conditional Run/RBI") or {}
+        starter_curve=_ow_bfs_starter_prob_by_pa(ctx,model)
+        row.update({
+            "Expected Contact Quality":cq.get("score"),"Expected Contact Coverage %":cq.get("coverage"),"Expected Contact Note":cq.get("note"),
+            "Arsenal Matrix Coverage %":ar.get("coverage"),"Arsenal Expected Contact%":ar.get("Expected Contact%"),"Arsenal Expected Whiff%":ar.get("Expected Whiff%"),"Arsenal Expected xwOBA":ar.get("Expected xwOBA"),"Arsenal Expected HR Rate":ar.get("Expected HR Rate"),"Arsenal Expected XBH Rate":ar.get("Expected XBH Rate"),"Arsenal Matrix Note":ar.get("note"),
+            "PA P3%":pa.get("P3"),"PA P4%":pa.get("P4"),"PA P5%":pa.get("P5"),"PA P6%":pa.get("P6"),"PA P7%":pa.get("P7"),
+            "Starter 1st PA %":round(starter_curve[0]*100,1),"Starter 2nd PA %":round(starter_curve[1]*100,1),"Starter 3rd PA %":round(starter_curve[2]*100,1),"Starter 4th PA %":round(starter_curve[3]*100,1),
+            "Platoon K Raw%":None if pl.get("raw") is None else round(float(pl.get("raw"))*100,1),"Platoon K Shrunk%":None if pl.get("shrunk") is None else round(float(pl.get("shrunk"))*100,1),"Platoon K Sample":pl.get("sample"),
+            "Ahead OBP":cond.get("Ahead OBP"),"Behind SLG":cond.get("Behind SLG"),"Base Occupancy":cond.get("Base Occupancy"),
+            "SB Attempt Rate%":round(float(sb.get("attempt_rate",0))*100,1),"SB Success Rate%":round(float(sb.get("success_rate",0))*100,1),"Pitcher Hold Factor":sb.get("pitcher_hold_factor"),"Catcher Throw Factor":sb.get("catcher_factor"),"Projected Times On Base":round(float(sb.get("projected_onbase",0)),2),
+            "Installed Data Layers":ctx.get("Installed Data Layers"),"Installed Data Note":ctx.get("Installed Data Note"),
+            "Source":"Underdog Fantasy Points + BFS V3 installed/live contact + arsenal/TTO event model","Projection Version":OW_BATTER_FS_VERSION,
+        })
+        extra=[]
+        if cq.get("score",50)>=70: extra.append("🧬 Expected contact quality edge")
+        if ar.get("coverage",0)>=65 and (ar.get("HR_factor",1.0)>=1.08 or ar.get("1B_factor",1.0)>=1.05): extra.append("🎯 Arsenal outcome edge")
+        if ar.get("coverage",0)>=65 and ar.get("K_factor",1.0)>=1.08: extra.append("⚠️ Arsenal K risk")
+        if ctx.get("Installed Data Layers",0)>=3: extra.append("💾 Installed data active")
+        existing=[x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()]; row["Flags"]=" | ".join(dict.fromkeys(extra+existing))[:900]
+    except Exception as e:
+        row["V3 Formula Enrichment Error"]=str(e)[:180]
+    return row
+
+
+# -------------------------
+# INSTALLER UI + STATUS
+# -------------------------
+def _ow_bfs_data_installer_ui():
+    st.markdown("### 📦 Batter Fantasy — One-Shot Data Installer")
+    st.caption("Upload every CSV/JSON/Excel file at once — or one ZIP. The installer detects schemas, separates CURRENT from LAST_GOOD, validates columns, keeps missing fields as missing, and routes only compatible data into Batter Fantasy.")
+    uploads=st.file_uploader("Drop the full data package here",type=["csv","json","xlsx","xls","zip"],accept_multiple_files=True,key=_v3_unique_widget_key("ow_bfs_one_shot_installer"))
+    if uploads:
+        scanned=_ow_bfs_scan_uploads(uploads); sf=_ow_bfs_scan_frame(scanned)
+        st.markdown("#### Scan / validation")
+        st.dataframe(sf,use_container_width=True,hide_index=True)
+        good=sum(1 for x in scanned if (x.get("meta") or {}).get("validation",{}).get("valid",True) and x.get("kind") not in {"UNKNOWN","JSON_OTHER"})
+        bad=sum(1 for x in scanned if x.get("kind") in {"UNKNOWN","JSON_OTHER"} or not (x.get("meta") or {}).get("validation",{}).get("valid",True))
+        a,b,c=st.columns(3); a.metric("Recognized",good); b.metric("Held Out",bad); c.metric("Files Scanned",len(scanned))
+        if st.button("💾 INSTALL ALL VALID DATA",key=_v3_unique_widget_key("ow_bfs_install_all"),type="primary",use_container_width=True):
+            result=_ow_bfs_install_payloads(scanned); st.dataframe(result,use_container_width=True,hide_index=True); installed=int(result["Status"].astype(str).str.startswith("INSTALLED").sum()) if not result.empty else 0; st.success(f"Installed/routed {installed} files. Batter Fantasy caches were cleared and the next full-board build will prefer these datasets.")
+    st.markdown("#### Installed Batter Fantasy data")
+    status,idx=_ow_bfs_installer_status()
+    if isinstance(status,pd.DataFrame) and not status.empty:
+        st.dataframe(status,use_container_width=True,hide_index=True)
+    else:
+        st.info("No Batter Fantasy datasets installed yet. Upload the package above.")
+    st.caption(f"Persistent installer directory: {OW_BFS_INSTALL_DIR}")
+    if st.button("🧹 Clear Batter Fantasy installed-data cache",key=_v3_unique_widget_key("ow_bfs_installer_cache_clear"),use_container_width=True):
+        try: st.cache_data.clear()
+        except Exception: pass
+        st.success("Installed-data cache cleared. Files were not deleted.")
+
+
+def render_v3_settings_tab():
+    _render_v3_settings_tab_v2_formula()
+    st.divider()
+    _ow_bfs_data_installer_ui()
+    st.divider(); st.markdown("#### Batter Fantasy V3 Formula Status")
+    status,_=_ow_bfs_installer_status(); active=set(status[status["Active Rows"]>0]["Dataset"].astype(str).tolist()) if isinstance(status,pd.DataFrame) and not status.empty else set()
+    st.write({
+        "Expected Contact Quality":"ACTIVE — xBA/xwOBA/xSLG/EV/barrel/hard-hit/sweet-spot/contact/zone-contact/whiff + pitcher allowed",
+        "Batter × Pitcher Arsenal Matrix":"ACTIVE — pitch-usage weighted 1B/2B/3B/HR/K + contact/whiff/xwOBA/XBH; pitch-type samples Bayesian-shrunk",
+        "Times Through Order":"ACTIVE — sequential PA1/PA2/PA3 starter effects then bullpen transition",
+        "Conditional Runs/RBI":"ACTIVE — lineup slot + ahead OBP + behind SLG + team run environment + hit type",
+        "SB Opportunity":"ACTIVE — projected times on base × attempt rate × success rate × pitcher hold × catcher throw",
+        "Expected PA Distribution":"ACTIVE — explicit 2/3/4/5/6/7 PA probabilities",
+        "Event Covariance":"ACTIVE — HR/H/R/RBI and XBH outcomes linked inside simulation",
+        "Bayesian Matchup Shrinkage":"ACTIVE — current/prior/league + hand-split + pitch-type sample shrinkage",
+        "True Probability Calibration":"ACTIVE when history supports it — beta reliability then isotonic blend at 80+ side-specific grades",
+        "Installed Core Layers":sorted(active), "Version":OW_BATTER_FS_VERSION,
+    })
+
+
+# Add new V3 audit columns to the full board without changing the card layout contract.
+_render_v3_batter_fantasy_tab_v2_formula = render_v3_batter_fantasy_tab
+
+def render_v3_batter_fantasy_tab():
+    status,_idx=_ow_bfs_installer_status()
+    if isinstance(status,pd.DataFrame) and not status.empty:
+        active=status[status["Active Rows"]>0]
+        st.caption("💾 Installed data active: " + ", ".join(active["Dataset"].astype(str).tolist()) if not active.empty else "💾 Installed data: none — live fallbacks will be used")
+    _render_v3_batter_fantasy_tab_v2_formula()
+    df=st.session_state.get("ow_bfs_df")
+    if isinstance(df,pd.DataFrame) and not df.empty:
+        with st.expander("V3 Arsenal / PA / Contact formula audit",expanded=False):
+            cols=[c for c in ["Player","Opp Pitcher","Line","Projection","Pick","Expected Contact Quality","Expected Contact Coverage %","Arsenal Matrix Coverage %","Arsenal Expected Contact%","Arsenal Expected Whiff%","Arsenal Expected xwOBA","Arsenal Expected HR Rate","Arsenal Expected XBH Rate","PA P3%","PA P4%","PA P5%","PA P6%","PA P7%","Starter 1st PA %","Starter 2nd PA %","Starter 3rd PA %","Starter 4th PA %","Platoon K Raw%","Platoon K Shrunk%","Platoon K Sample","Ahead OBP","Behind SLG","Base Occupancy","Projected Times On Base","SB Attempt Rate%","SB Success Rate%","Pitcher Hold Factor","Catcher Throw Factor","Installed Data Layers","Flags"] if c in df.columns]
+            st.dataframe(df[cols],use_container_width=True,hide_index=True)
+            st.caption("Pitch-type rows are sample-shrunk toward the batter baseline; missing installer fields are ignored and remaining weights renormalize automatically.")
+
+
+
+# Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
+tab_top, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_poster, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
     "1️⃣ H+R+RBI",
     "2️⃣ HOME RUNS",
+    "3️⃣ BATTER FANTASY",
     "🧠 BATTER LEARNING",
     "✅ OFFICIAL PLAYS",
     "🖼️ POSTER",
@@ -35567,6 +39541,9 @@ with tab_hrr:
 
 with tab_hr:
     render_v3_home_run_tab()
+
+with tab_bfs:
+    render_v3_batter_fantasy_tab()
 
 with tab_learning:
     render_v3_batter_learning_lab_tab()
