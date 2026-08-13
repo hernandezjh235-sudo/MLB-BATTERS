@@ -35565,7 +35565,7 @@ def render_v3_discord_poster_studio_tab():
 # ============================================================
 OW_BATTER_FS_VERSION = "OW_BATTER_FS_EVENT_MC_V1_2026_08_12"
 OW_BATTER_FS_SIM_PASSES = 12000
-OW_BATTER_FS_MAX_ROWS = 36
+OW_BATTER_FS_MAX_ROWS = None  # Full safe hitter board; retained only for compatibility.
 
 # Centralized scoring profile. These are the hitter fantasy values used by the
 # existing app's Underdog fantasy module and the current Underdog daily hitter
@@ -36514,7 +36514,7 @@ def build_v3_batter_fantasy_table():
         return pd.DataFrame(), source_meta
     rows = []
     errors = []
-    for raw in list(raw_rows)[:OW_BATTER_FS_MAX_ROWS]:
+    for raw in list(raw_rows):
         try:
             row = _ow_build_batter_fantasy_row(raw)
             if row:
@@ -36555,7 +36555,9 @@ def _ow_bfs_card_html(row):
     p20 = _ow_bfs_html_num(row.get("P20"), 1)
     p80 = _ow_bfs_html_num(row.get("P80"), 1)
     line = _ow_bfs_html_num(row.get("Line"), 1)
-    pick = str(row.get("Pick") or "PASS").upper()
+    higher = _ow_bfs_num(row.get("Higher %"), 50) or 50
+    lower = _ow_bfs_num(row.get("Lower %"), 50) or 50
+    pick = str(row.get("Model Direction") or row.get("Model Side") or ("HIGHER" if higher >= lower else "LOWER")).upper()
     winp = _ow_bfs_num(row.get("Win Probability %"), 50) or 50
     conf = int(round(_ow_bfs_num(row.get("Confidence"), 50) or 50))
     skill = int(round(_ow_bfs_num(row.get("Skill"), 50) or 50))
@@ -36572,8 +36574,8 @@ def _ow_bfs_card_html(row):
         badge = "⬇ LOWER"
         badge_class = "lower"
     else:
-        badge = "⚠ PASS"
-        badge_class = "pass"
+        badge = "⬇ LOWER"
+        badge_class = "lower"
 
     def score_block(label, val):
         return f"<div class='ow-bfs-score'><div><span>{label}</span><b>{val}</b></div><div class='ow-bfs-track'><i style='width:{max(0,min(100,val))}%'></i></div></div>"
@@ -37631,6 +37633,8 @@ def _ow_bfs_calibration_profile():
     # Projected-lineup rows remain in the audit history but cannot teach the betting calibrator.
     latest = {}
     for r in full:
+        if not _ow_bfs_snapshot_is_pregame(r):
+            continue
         if str(r.get("Model Side Result") or "").upper() not in {"WIN", "LOSS"}:
             continue
         if (_ow_bfs_num(r.get("Data Score"), 0) or 0) < 50:
@@ -37767,29 +37771,75 @@ def _ow_bfs_probability_calibration(raw_prob, side, features=None):
 
 
 def _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict=False):
+    """Measure reliability and data coverage, independent of betting direction."""
+    profile = profile or {}
+    ctx = ctx or {}
+    season_pa = _ow_bfs_num((profile.get("season_counts") or {}).get("PA"), 0) or 0
+    prior_pa = _ow_bfs_num((profile.get("prior_counts") or {}).get("PA"), 0) or 0
+    lineup = ctx.get("Lineup") or {}
+    pitcher = ctx.get("Pitcher") or {}
+    pitcher_confirm = ctx.get("Pitcher Confirm") or {}
+    contact = ctx.get("Contact Detail") or {}
+    savant = ctx.get("Savant Hitter") or {}
+    pitch_hrr = ctx.get("Pitch HRR") or {}
+    pitcher_split = ctx.get("Pitcher Split HRR") or {}
+    bullpen = ctx.get("Bullpen") or {}
+
     checks = [
-        bool((profile or {}).get("player_id")),
-        (_ow_bfs_num((profile or {}).get("season_counts",{}).get("PA"),0) or 0) >= 80 or (_ow_bfs_num((profile or {}).get("prior_counts",{}).get("PA"),0) or 0) >= 100,
-        bool((profile or {}).get("logs")),
-        _ow_bfs_num((ctx.get("Savant Hitter") or {}).get("Savant xwOBA"),None) is not None,
-        _ow_bfs_num((ctx.get("Contact Detail") or {}).get("Contact%"),None) is not None,
-        _ow_bfs_num((ctx.get("Pitch HRR") or {}).get("Pitch Mix Matchup Factor"),None) is not None,
-        _ow_bfs_num((ctx.get("Pitcher") or {}).get("Pitcher K%"),None) is not None,
-        _ow_bfs_num((ctx.get("Pitcher Split HRR") or {}).get("Pitcher Split Factor HRR"),None) is not None,
-        ctx.get("Team") not in (None,"","—"),
+        (bool(profile.get("player_id")), 8),
+        (season_pa >= 80 or prior_pa >= 100, 12),
+        (bool(profile.get("logs")), 9),
+        (_ow_bfs_num(savant.get("Savant xwOBA"), None) is not None, 8),
+        (_ow_bfs_num(contact.get("Contact%"), None) is not None, 8),
+        (_ow_bfs_num(contact.get("Zone Contact%"), None) is not None, 5),
+        (_ow_bfs_num(pitch_hrr.get("Pitch Mix Matchup Factor"), None) is not None, 9),
+        (_ow_bfs_num(pitcher.get("Pitcher K%"), None) is not None, 7),
+        (_ow_bfs_num(pitcher_split.get("Pitcher Split Factor HRR"), None) is not None, 8),
+        (ctx.get("Team") not in (None, "", "—"), 5),
+        (_ow_bfs_num(ctx.get("Projected PA"), None) is not None, 7),
+        (bool(bullpen), 5),
+        (_ow_bfs_num(pitcher.get("Pitcher Avg IP"), None) is not None
+         or _ow_bfs_num(pitcher.get("Pitcher Recent IP/G"), None) is not None, 4),
+        ((_ow_bfs_num(sim.get("Simulation Passes"), 0) or 0) >= 10000, 5),
     ]
-    coverage = sum(bool(x) for x in checks)/len(checks)
-    best_prob = max(_ow_bfs_num(sim.get("Higher %"),50) or 50, _ow_bfs_num(sim.get("Lower %"),50) or 50)
-    score = 38 + coverage*32 + min(16,max(0,best_prob-50)*0.65)
-    if bool((ctx.get("Lineup") or {}).get("Lineup Confirmed")): score += 5
-    if bool((ctx.get("Pitcher Confirm") or {}).get("Pitcher Confirmed")): score += 4
-    if (profile or {}).get("Bayes Sample Label") == "ROOKIE/SMALL": score -= 6
-    if distribution_conflict: score -= 8
-    if bool((ctx.get("Game") or {}).get("Game Started")): score -= 15
-    cv = _ow_bfs_num(sim.get("FS CV"),0.8) or 0.8
-    if cv >= 1.0: score -= 6
-    elif cv <= 0.70: score += 3
-    return int(round(clamp(score,30,94))), int(round(coverage*100))
+    possible = float(sum(weight for _, weight in checks)) or 1.0
+    coverage = sum(weight for present, weight in checks if present) / possible
+    data_score = int(round(clamp(coverage * 100.0, 0, 100)))
+
+    score = 30.0 + coverage * 52.0
+    if bool(lineup.get("Lineup Confirmed")):
+        score += 6
+    elif lineup.get("Lineup Slot") not in (None, "", "—"):
+        score += 2
+    else:
+        score -= 3
+    if bool(pitcher_confirm.get("Pitcher Confirmed")):
+        score += 6
+    else:
+        score -= 4
+    if int(_ow_bfs_num(ctx.get("Installed Data Layers"), 0) or 0) >= 3:
+        score += 3
+    if profile.get("Bayes Sample Label") in {"ROOKIE/SMALL", "SMALL"}:
+        score -= 7
+
+    mean = _ow_bfs_num(sim.get("FS Projection"), None)
+    median = _ow_bfs_num(sim.get("FS Median"), None)
+    if mean is not None and median is not None:
+        agreement = abs(float(mean) - float(median))
+        if agreement <= 1.0:
+            score += 3
+        elif agreement >= 3.0:
+            score -= 5
+    cv = _ow_bfs_num(sim.get("FS CV"), 0.8) or 0.8
+    if cv >= 1.0:
+        score -= 7
+    elif cv <= 0.70:
+        score += 3
+    if distribution_conflict:
+        score -= 6
+    if bool((ctx.get("Game") or {}).get("Game Started")):
+        score -= 25
+    return int(round(clamp(score, 20, 94))), data_score
 
 
 def _ow_bfs_decision_gate(ctx, profile, sim, data_score, distribution_conflict, market_type):
@@ -37854,7 +37904,7 @@ def _ow_build_batter_fantasy_row(raw):
     higher_raw = _ow_bfs_num(sim.get("Higher %"),50.0) or 50.0
     lower_raw = _ow_bfs_num(sim.get("Lower %"),50.0) or 50.0
     mean_side = "HIGHER" if mean > line else "LOWER" if mean < line else "PUSH"
-    raw_prob_side = "HIGHER" if higher_raw > lower_raw else "LOWER" if lower_raw > higher_raw else "PASS"
+    raw_prob_side = "HIGHER" if higher_raw >= lower_raw else "LOWER"
     raw_best_prob = max(higher_raw, lower_raw)
     distribution_conflict = raw_prob_side in {"HIGHER","LOWER"} and mean_side in {"HIGHER","LOWER"} and raw_prob_side != mean_side
     conf, data_score = _ow_bfs_data_confidence(ctx, profile, sim, distribution_conflict)
@@ -37863,13 +37913,13 @@ def _ow_build_batter_fantasy_row(raw):
     # Calibrate chosen-side probability, preserving the complementary direction.
     higher = calibrated_best if raw_prob_side == "HIGHER" else 100-calibrated_best if raw_prob_side == "LOWER" else higher_raw
     lower = calibrated_best if raw_prob_side == "LOWER" else 100-calibrated_best if raw_prob_side == "HIGHER" else lower_raw
-    prob_side = "HIGHER" if higher > lower else "LOWER" if lower > higher else "PASS"
+    prob_side = "HIGHER" if higher >= lower else "LOWER"
     best_prob = max(higher, lower)
 
     market_type = ctx.get("UD Market Type") or _ow_bfs_market_type(raw)
     gate, gate_reasons = _ow_bfs_decision_gate(ctx, profile, sim, data_score, distribution_conflict, market_type)
     pick = prob_side if gate == "CLEAR" and best_prob >= OW_BATTER_FS_MIN_PLAY_PROB else "PASS"
-    lean_side = prob_side if prob_side in {"HIGHER","LOWER"} else "PASS"
+    lean_side = prob_side
     edge = round(mean - float(line),2); median_edge = round(median - float(line),2)
     cv = _ow_bfs_num(sim.get("FS CV"),0.8) or 0.8
     volatility = "STABLE" if cv <= 0.70 else "VOLATILE" if cv >= 1.0 else "NORMAL"
@@ -38074,6 +38124,36 @@ def _ow_bfs_full_snapshot_key(row):
     return "|".join([stamp, game, player, line, stage, pitcher, version])
 
 
+def _ow_bfs_snapshot_is_pregame(row):
+    """Return True only for snapshots with credible pregame provenance."""
+    r = row or {}
+    started = r.get("Game Started") is True or str(r.get("Game Started") or "").lower() in {"true", "1", "yes"}
+    if started:
+        return False
+    status = str(r.get("Game Status") or "").strip().upper()
+    if any(token in status for token in ["FINAL", "LIVE", "IN PROGRESS"]):
+        return False
+    if r.get("Pregame Eligible") is False or r.get("Projection Generated Pregame") is False:
+        return False
+
+    snapshot_type = str(r.get("snapshot_type") or "").upper()
+    saved_at = r.get("full_board_saved_at") or r.get("official_snapshot_saved_at")
+    game_time = r.get("Game Time ISO") or r.get("Game DateTime") or r.get("Game Time UTC")
+    if saved_at and game_time:
+        try:
+            saved_ts = pd.to_datetime(saved_at, utc=True, errors="coerce")
+            game_ts = pd.to_datetime(game_time, utc=True, errors="coerce")
+            if pd.notna(saved_ts) and pd.notna(game_ts) and saved_ts >= game_ts:
+                return False
+        except Exception:
+            return False
+
+    # Full-board rows are the calibration source and must prove they were saved.
+    if snapshot_type == "BATTER_FANTASY_FULL_BOARD" and not saved_at:
+        return False
+    return True
+
+
 def _ow_bfs_save_full_board_snapshot(df):
     """Save every untouched Fantasy projection, including PASS rows, for honest model grading."""
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -38086,7 +38166,8 @@ def _ow_bfs_save_full_board_snapshot(df):
         row = rr.to_dict()
         # Never learn from a projection created after first pitch.
         started = row.get("Game Started") is True or str(row.get("Game Started") or "").lower() in {"true","1","yes"}
-        if started:
+        game_status = str(row.get("Game Status") or "").strip().upper()
+        if started or any(token in game_status for token in ["FINAL", "LIVE", "IN PROGRESS", "DELAYED"]):
             continue
         player_id = row.get("Player ID") or _mlb_search_player_id_by_name(row.get("Player"))
         game_pk = row.get("Game PK") or _ow_today_game_pk_for_team(row.get("Team"), row.get("Opponent"))
@@ -38105,6 +38186,8 @@ def _ow_bfs_save_full_board_snapshot(df):
             "full_board_saved_at": now_iso(),
             "Evaluation Side": model_side,
             "Official Pick At Save": row.get("Pick"),
+            "Pregame Eligible": True,
+            "Projection Generated Pregame": True,
             "graded": False,
             "Grade Status": "FULL BOARD / WAITING FINAL",
             "Projection Version": OW_BATTER_FS_VERSION,
@@ -38227,26 +38310,63 @@ def _ow_grade_batter_snapshots():
 
 def _ow_bfs_official_candidates(df):
     if not isinstance(df,pd.DataFrame) or df.empty: return pd.DataFrame()
-    d=df.copy()
+    d=_ow_bfs_rank_full_board(df) if "_ow_bfs_rank_full_board" in globals() else df.copy()
     prob=pd.to_numeric(d.get("Win Probability %"),errors="coerce").fillna(0)
     conf=pd.to_numeric(d.get("Confidence"),errors="coerce").fillna(0)
     clear=d.get("Decision Gate",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).eq("CLEAR")
     pick=d.get("Pick",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).isin(["HIGHER","LOWER"])
-    return d[clear & pick & (prob>=OW_BATTER_FS_MIN_PLAY_PROB) & (conf>=55)].copy()
+    official = d.get("Official Status",pd.Series(["QUALIFIED"]*len(d),index=d.index)).astype(str).eq("QUALIFIED")
+    return d[clear & pick & official & (prob>=OW_BATTER_FS_MIN_PLAY_PROB) & (conf>=55)].copy()
+
+
+_OW_BFS_MODEL_RESULT_COLUMNS = (
+    "graded_result",
+    "Model Side Result",
+    "Model Result",
+    "Evaluation Result",
+    "Batter Fantasy Model Result",
+)
+
+
+def _ow_bfs_normalize_model_side_history_frame(frame):
+    """Canonicalize legitimate model-side grades without using Official Result."""
+    if not isinstance(frame, pd.DataFrame):
+        return pd.DataFrame(columns=["graded_result"])
+    d = frame.copy()
+    canonical = pd.Series("", index=d.index, dtype="object")
+    sources = []
+    for col in _OW_BFS_MODEL_RESULT_COLUMNS:
+        if col not in d.columns:
+            continue
+        sources.append(col)
+        values = d[col].fillna("").astype(str).str.strip().str.upper()
+        canonical = canonical.mask(canonical.eq("") & values.ne(""), values)
+    d["graded_result"] = canonical.where(canonical.isin(["WIN", "LOSS"]), "")
+    d.attrs["ow_bfs_model_result_sources"] = tuple(sources)
+    return d
 
 
 def _ow_bfs_history_frame():
-    full=_ow_bfs_full_board_history_frame() if "_ow_bfs_full_board_history_frame" in globals() else pd.DataFrame()
-    if isinstance(full,pd.DataFrame) and not full.empty:
-        d=full.copy()
-        if "Model Side Result" in d.columns: d["graded_result"]=d["Model Side Result"]
+    """Return Batter Fantasy history with a stable model-side grading schema."""
+    full = _ow_bfs_full_board_history_frame() if "_ow_bfs_full_board_history_frame" in globals() else pd.DataFrame()
+    if isinstance(full, pd.DataFrame) and not full.empty:
+        d = _ow_bfs_normalize_model_side_history_frame(full)
+        d["Pregame Learning Eligible"] = [
+            bool(_ow_bfs_snapshot_is_pregame(row)) for row in d.to_dict("records")
+        ]
         return d
-    hist=_ow_deduped_batter_results() if "_ow_deduped_batter_results" in globals() else []
-    rows=[]
+    hist = _ow_deduped_batter_results() if "_ow_deduped_batter_results" in globals() else []
+    rows = []
     for r in hist:
-        m=str(r.get("Market") or r.get("Best Market") or "").upper()
-        if "FANTASY" in m or "BATTER FS" in m: rows.append(r)
-    return pd.DataFrame(rows)
+        m = str(r.get("Market") or r.get("Best Market") or "").upper()
+        if "FANTASY" in m or "BATTER FS" in m:
+            rows.append(r)
+    d = _ow_bfs_normalize_model_side_history_frame(pd.DataFrame(rows))
+    if not d.empty:
+        d["Pregame Learning Eligible"] = [
+            bool(_ow_bfs_snapshot_is_pregame(row)) for row in d.to_dict("records")
+        ]
+    return d
 
 
 def _ow_bfs_learning_audit_ui():
@@ -38255,12 +38375,21 @@ def _ow_bfs_learning_audit_ui():
     if not isinstance(d,pd.DataFrame) or d.empty:
         st.info("Batter Fantasy learning starts after you save pregame Fantasy snapshots and grade finished games. XGBoost stays OFF until 120+ graded Fantasy rows.")
         return
-    if "graded_result" in d.columns:
-        d=d[d["graded_result"].astype(str).str.upper().isin(["WIN","LOSS"])].copy()
+    d = _ow_bfs_normalize_model_side_history_frame(d)
+    if "Pregame Learning Eligible" in d.columns:
+        eligible = d["Pregame Learning Eligible"].fillna(False).astype(bool)
+        d = d[eligible].copy()
+    grades = d["graded_result"].fillna("").astype(str).str.strip().str.upper()
+    d = d[grades.isin(["WIN", "LOSS"])].copy()
     if d.empty:
-        st.info("No graded Batter Fantasy model-side rows yet."); return
-    wins=int(d["graded_result"].astype(str).str.upper().eq("WIN").sum()); losses=int(d["graded_result"].astype(str).str.upper().eq("LOSS").sum())
-    actual=pd.to_numeric(d.get("Actual FPTS",d.get("Actual")),errors="coerce"); proj=pd.to_numeric(d.get("Projection"),errors="coerce")
+        st.info("Batter Fantasy history exists, but no model-side WIN/LOSS grades are available yet.")
+        return
+    grades = d["graded_result"].fillna("").astype(str).str.strip().str.upper()
+    wins = int(grades.eq("WIN").sum())
+    losses = int(grades.eq("LOSS").sum())
+    actual_source = d["Actual FPTS"] if "Actual FPTS" in d.columns else d["Actual"] if "Actual" in d.columns else pd.Series(np.nan, index=d.index, dtype=float)
+    projection_source = d["Projection"] if "Projection" in d.columns else pd.Series(np.nan, index=d.index, dtype=float)
+    actual=pd.to_numeric(actual_source,errors="coerce"); proj=pd.to_numeric(projection_source,errors="coerce")
     valid=actual.notna() & proj.notna(); mae=float((actual[valid]-proj[valid]).abs().mean()) if valid.any() else None; bias=float((actual[valid]-proj[valid]).mean()) if valid.any() else None
     brier=pd.to_numeric(d.get("Brier Score"),errors="coerce").dropna() if "Brier Score" in d.columns else pd.Series(dtype=float)
     o=d[d.get("Official Result",pd.Series(["PASS"]*len(d),index=d.index)).astype(str).str.upper().isin(["WIN","LOSS"])].copy() if "Official Result" in d.columns else pd.DataFrame()
@@ -38313,7 +38442,7 @@ def render_v3_batter_official_plays_tab():
     if st.button("💾 SAVE BATTER FANTASY OFFICIAL SNAPSHOT",key=_v3_unique_widget_key("ow_bfs_save_official"),use_container_width=True):
         added=_ow_save_batter_snapshots(cand,source_label="BATTER_FANTASY_V2_OFFICIAL")
         st.success(f"Saved {added} new Batter Fantasy pregame rows.")
-    cols=[c for c in ["Player","Team","Opponent","Opp Pitcher","Line","Projection","Pick","Win Probability %","Confidence","Contact","Decision Gate","Edge","Median","P20","P80","Starter PA/G","Bullpen PA/G","Flags"] if c in cand.columns]
+    cols=[c for c in ["Rank","Player","Team","Opponent","Opp Pitcher","Line","Projection","Model Direction","Model Win Probability %","Confidence","Play Status","Official Status","Pick","Contact","Decision Gate","Edge","Median","P20","P80","Starter PA/G","Bullpen PA/G","Flags"] if c in cand.columns]
     st.dataframe(cand[cols],use_container_width=True,hide_index=True)
 
 
@@ -38324,7 +38453,7 @@ def render_v3_top_batter_plays_board():
     d=_ow_bfs_official_candidates(df)
     if d.empty: return
     st.divider(); st.markdown("#### ⚾ Batter Fantasy — Best Cleared Plays")
-    cols=[c for c in ["Player","Team","Line","Projection","Pick","Win Probability %","Confidence","Skill","Match","Form","Contact","Edge","Flags"] if c in d.columns]
+    cols=[c for c in ["Rank","Player","Team","Line","Projection","Model Direction","Model Win Probability %","Confidence","Play Status","Official Status","Pick","Skill","Match","Form","Contact","Edge","Flags"] if c in d.columns]
     st.dataframe(d.sort_values(["Win Probability %","Confidence"],ascending=False)[cols].head(12),use_container_width=True,hide_index=True)
 
 
@@ -38337,6 +38466,7 @@ def render_v3_discord_poster_studio_tab():
     choices=df["Player"].dropna().astype(str).tolist()
     selected=st.selectbox("Batter Fantasy poster player",choices,key=_v3_unique_widget_key("ow_bfs_poster_player"))
     row=df[df["Player"].astype(str)==selected].iloc[0].to_dict()
+    row["Pick"] = row.get("Model Direction") or row.get("Model Side") or "HIGHER"
     png=_ow_build_single_pick_poster_png(row,title_label="BATTER FANTASY")
     if png:
         st.image(png,use_container_width=True)
@@ -38363,96 +38493,226 @@ def render_v3_settings_tab():
 
 
 def _ow_bfs_card_html(row):
-    # V2 card keeps the user's requested compact UI but surfaces SP/BP and gate status.
-    esc=html.escape
-    player=esc(str(row.get("Player") or "—")); team=esc(str(row.get("Team") or "—")); pos=esc(str(row.get("Position") or "—")); bats=esc(str(row.get("Bats") or "—")); opp_pitcher=esc(str(row.get("Opp Pitcher") or "—")); p_hand=esc(str(row.get("Pitcher Hand") or "—"))
-    p_era=_ow_bfs_html_num(row.get("Pitcher ERA"),2); p_k=_ow_bfs_html_num(row.get("Pitcher K%"),1,"%"); proj=_ow_bfs_html_num(row.get("Projection"),1); p20=_ow_bfs_html_num(row.get("P20"),1); p80=_ow_bfs_html_num(row.get("P80"),1); line=_ow_bfs_html_num(row.get("Line"),1)
-    pick=str(row.get("Pick") or "PASS").upper(); model_side=str(row.get("Model Side") or "PASS").upper(); winp=_ow_bfs_num(row.get("Win Probability %"),50) or 50; conf=int(round(_ow_bfs_num(row.get("Confidence"),50) or 50)); skill=int(round(_ow_bfs_num(row.get("Skill"),50) or 50)); match=int(round(_ow_bfs_num(row.get("Match"),50) or 50)); form=int(round(_ow_bfs_num(row.get("Form"),50) or 50)); contact=int(round(_ow_bfs_num(row.get("Contact"),50) or 50)); vol=esc(str(row.get("Volatility") or "NORMAL")); gate=esc(str(row.get("Decision Gate") or "PASS")); market_type=esc(str(row.get("Market Type") or "MAIN")); flags=[x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()][:5]; flag_html="".join(f"<span class='ow-bfs-flag'>{esc(x)}</span>" for x in flags)
-    if pick=="HIGHER": badge="🔥 HIGHER"; badge_class="higher"
-    elif pick=="LOWER": badge="⬇ LOWER"; badge_class="lower"
-    else: badge=f"⚠ PASS · {model_side}"; badge_class="pass"
-    def score_block(label,val): return f"<div class='ow-bfs-score'><div><span>{label}</span><b>{val}</b></div><div class='ow-bfs-track'><i style='width:{max(0,min(100,val))}%'></i></div></div>"
-    def mini(label,value,digits=2): return f"<div class='ow-bfs-mini'><strong>{_ow_bfs_html_num(value,digits)}</strong><span>{label}</span></div>"
+    # Model Direction is always directional. Pick remains the stricter Official gate.
+    row = _ow_bfs_finalize_direction_row(dict(row or {}))
+    esc = html.escape
+    player = esc(str(row.get("Player") or "—"))
+    team = esc(str(row.get("Team") or "—"))
+    opponent = esc(str(row.get("Opponent") or "—"))
+    pos = esc(str(row.get("Position") or "—"))
+    bats = esc(str(row.get("Bats") or "—"))
+    opp_pitcher = esc(str(row.get("Opp Pitcher") or "—"))
+    p_hand = esc(str(row.get("Pitcher Hand") or "—"))
+    rank = int(_ow_bfs_num(row.get("Rank"), 0) or 0)
+    p_era = _ow_bfs_html_num(row.get("Pitcher ERA"), 2)
+    p_k = _ow_bfs_html_num(row.get("Pitcher K%"), 1, "%")
+    proj = _ow_bfs_html_num(row.get("Projection"), 1)
+    p20 = _ow_bfs_html_num(row.get("P20"), 1)
+    p80 = _ow_bfs_html_num(row.get("P80"), 1)
+    line = _ow_bfs_html_num(row.get("Line"), 1)
+    direction = str(row.get("Model Direction") or "HIGHER").upper()
+    direction_alt = str(row.get("Model Direction Alt") or ("OVER" if direction == "HIGHER" else "UNDER")).upper()
+    winp = float(_ow_bfs_num(row.get("Model Win Probability %"), 50) or 50)
+    conf = int(round(_ow_bfs_num(row.get("Confidence"), 50) or 50))
+    skill = int(round(_ow_bfs_num(row.get("Skill"), 50) or 50))
+    match = int(round(_ow_bfs_num(row.get("Match"), 50) or 50))
+    form = int(round(_ow_bfs_num(row.get("Form"), 50) or 50))
+    contact = int(round(_ow_bfs_num(row.get("Contact"), 50) or 50))
+    vol = esc(str(row.get("Volatility") or "NORMAL"))
+    play_status = esc(str(row.get("Play Status") or "LOW CONFIDENCE"))
+    official_status = esc(str(row.get("Official Status") or "NOT QUALIFIED"))
+    status_color = "#52e3a4" if play_status in {"ELITE", "STRONG", "QUALIFIED"} else "#f2c94c" if play_status in {"LEAN", "LOW CONFIDENCE"} else "#ff6683"
+    flags = [x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()][:6]
+    flag_html = "".join(f"<span class='ow-bfs-flag'>{esc(x)}</span>" for x in flags)
+    badge = "🔥 HIGHER / OVER" if direction == "HIGHER" else "⬇ LOWER / UNDER"
+    badge_class = "higher" if direction == "HIGHER" else "lower"
+
+    def score_block(label, val):
+        return f"<div class='ow-bfs-score'><div><span>{label}</span><b>{val}</b></div><div class='ow-bfs-track'><i style='width:{max(0,min(100,val))}%'></i></div></div>"
+
+    def mini(label, value, digits=2):
+        return f"<div class='ow-bfs-mini'><strong>{_ow_bfs_html_num(value,digits)}</strong><span>{label}</span></div>"
+
     return f"""
-    <div class="ow-bfs-card">
-      <div class="ow-bfs-head"><div class="ow-bfs-player-wrap"><div class="ow-bfs-player">{player}</div><div class="ow-bfs-meta">{team} {pos} · {bats}HB · {market_type}</div><div class="ow-bfs-opp">vs {opp_pitcher} {p_hand}HP · ERA {p_era} · K {p_k}</div></div><div class="ow-bfs-proj"><span>PROJ FPTS</span><strong>{proj}</strong><small>P20 {p20} · P80 {p80}</small></div></div>
-      <div class="ow-bfs-pick-row"><span class="ow-bfs-badge {badge_class}">{badge} {line}</span><span class="ow-bfs-prob">{winp:.0f}%</span></div>
-      <div style="font-size:9px;color:#8c8a9a;margin:-2px 0 7px">GATE {gate} · SP {_ow_bfs_html_num(row.get('Starter PA/G'),1)} PA / BP {_ow_bfs_html_num(row.get('Bullpen PA/G'),1)} PA · {esc(str(row.get('Game Time') or 'time —'))}</div>
+    <div class="ow-bfs-card" style="min-width:0;overflow:hidden">
+      <div style="font-size:10px;font-weight:900;color:#f1c84c;margin-bottom:8px">RANK #{rank if rank else '—'} · {play_status}</div>
+      <div class="ow-bfs-head">
+        <div class="ow-bfs-player-wrap" style="min-width:0">
+          <div class="ow-bfs-player">{player}</div>
+          <div class="ow-bfs-meta">{team} {pos} · {bats}HB · vs {opponent}</div>
+          <div class="ow-bfs-opp">vs {opp_pitcher} {p_hand}HP · ERA {p_era} · K {p_k}</div>
+        </div>
+        <div class="ow-bfs-proj"><span>PROJECTED FPTS</span><strong>{proj}</strong><small>P20–P80 {p20}–{p80}</small></div>
+      </div>
+      <div class="ow-bfs-pick-row">
+        <span class="ow-bfs-badge {badge_class}">{badge} {line}</span>
+        <span class="ow-bfs-prob">WIN {winp:.1f}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:9px;margin:-1px 0 8px">
+        <b style="color:{status_color}">STATUS {play_status}</b>
+        <span style="color:#8c8a9a">OFFICIAL {official_status}</span>
+      </div>
       <div class="ow-bfs-conf"><div><span>CONFIDENCE</span><b>{conf}/100</b></div><div class="ow-bfs-conf-track"><i style="width:{conf}%"></i></div></div>
       <div class="ow-bfs-scores">{score_block('SKILL',skill)}{score_block('MATCH',match)}{score_block('FORM',form)}{score_block('CONTACT',contact)}</div>
-      <div class="ow-bfs-minis">{mini('H/G',row.get('H/G'))}{mini('HR/G',row.get('HR/G'))}{mini('2B/G',row.get('2B/G'))}{mini('R/G',row.get('R/G'))}{mini('RBI/G',row.get('RBI/G'))}{mini('BB/G',row.get('BB/G'))}{mini('SB/G',row.get('SB/G'),3)}{mini('K/G',row.get('K/G'))}</div>
-      <div class="ow-bfs-bottom"><span>AVG {_ow_bfs_html_num(row.get('AVG'),3)}</span><span>OPS {_ow_bfs_html_num(row.get('OPS'),3)}</span><span>xwOBA {_ow_bfs_html_num(row.get('wOBA/xwOBA'),3)}</span><span>ISO {_ow_bfs_html_num(row.get('ISO'),3)}</span><b>{vol}</b></div><div class="ow-bfs-flags">{flag_html}</div>
+      <div class="ow-bfs-minis">{mini('H/G',row.get('H/G'))}{mini('1B/G',row.get('1B/G'))}{mini('2B/G',row.get('2B/G'))}{mini('3B/G',row.get('3B/G'),3)}{mini('HR/G',row.get('HR/G'),3)}{mini('R/G',row.get('R/G'))}{mini('RBI/G',row.get('RBI/G'))}{mini('BB/G',row.get('BB/G'))}{mini('SB/G',row.get('SB/G'),3)}{mini('K/G',row.get('K/G'))}</div>
+      <div class="ow-bfs-bottom"><span>AVG {_ow_bfs_html_num(row.get('AVG'),3)}</span><span>OPS {_ow_bfs_html_num(row.get('OPS'),3)}</span><span>xwOBA {_ow_bfs_html_num(row.get('wOBA/xwOBA'),3)}</span><span>ISO {_ow_bfs_html_num(row.get('ISO'),3)}</span><b>{vol}</b></div>
+      <div class="ow-bfs-flags">{flag_html}</div>
     </div>"""
 
 
+def _ow_bfs_render_best_plays(df, limit=8):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    top = _ow_bfs_rank_full_board(df).head(int(limit))
+    cards = []
+    for _, row in top.iterrows():
+        r = row.to_dict()
+        direction = str(r.get("Model Direction") or "HIGHER")
+        color = "#55e3aa" if direction == "HIGHER" else "#ff6c87"
+        cards.append(
+            "<div style='background:#0e0e19;border:1px solid #29263b;border-radius:8px;padding:10px;min-width:0'>"
+            f"<div style='font-size:10px;color:#f2c94c;font-weight:900'>#{int(r.get('Rank') or 0)} · {html.escape(str(r.get('Play Status') or ''))}</div>"
+            f"<div style='font-size:15px;color:#f5f5fb;font-weight:900;white-space:normal;overflow-wrap:anywhere'>{html.escape(str(r.get('Player') or '—'))}</div>"
+            f"<div style='font-size:11px;color:{color};font-weight:900'>{direction} { _ow_bfs_html_num(r.get('Line'),1) }</div>"
+            f"<div style='font-size:10px;color:#a5a4b2'>{_ow_bfs_html_num(r.get('Model Win Probability %'),1,'%')} · CONF {int(_ow_bfs_num(r.get('Confidence'),0) or 0)}</div>"
+            "</div>"
+        )
+    st.markdown(
+        "<style>.ow-bfs-best{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:8px 0 16px}"
+        "@media(max-width:700px){.ow-bfs-best{grid-template-columns:repeat(2,minmax(0,1fr));}}</style>"
+        "<div class='ow-bfs-best'>" + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_v3_batter_fantasy_tab():
-    st.markdown('<div class="section-title-pro">⚾ Batter Fantasy V2 — Full Underdog Board</div>',unsafe_allow_html=True)
-    st.caption("Full hitter board → BATTER/PITCHER safety gate → Bayesian event rates → starter/bullpen PA split → base-state R/RBI + SB opportunity model → 12,000 simulations → calibrated Higher/Lower. H+R+RBI remains untouched.")
-    source_meta=st.session_state.get("ow_bfs_source_meta",{})
-    c1,c2=st.columns([2,1])
-    build_now=c1.button("🔄 Pull FULL Underdog Board + Build Fantasy V2",key=_v3_unique_widget_key("ow_bfs_build_v2"),use_container_width=True,type="primary")
-    clear_now=c2.button("Clear FS cache",key=_v3_unique_widget_key("ow_bfs_clear_v2"),use_container_width=True)
+    st.markdown('<div class="section-title-pro">⚾ Batter Fantasy V3 — Full Underdog Board</div>', unsafe_allow_html=True)
+    st.caption("Every safe hitter receives a probability-led HIGHER or LOWER direction. Play Status shows strength; Official Plays keeps its stricter qualification gates.")
+    source_meta = st.session_state.get("ow_bfs_source_meta", {})
+    c1, c2 = st.columns([2, 1])
+    build_now = c1.button("🔄 Pull FULL Underdog Board + Build Fantasy", key=_v3_unique_widget_key("ow_bfs_build_v2"), use_container_width=True, type="primary")
+    clear_now = c2.button("Clear FS cache", key=_v3_unique_widget_key("ow_bfs_clear_v2"), use_container_width=True)
+
     if clear_now:
-        for key in ["ow_bfs_df","ow_bfs_meta","ow_bfs_source_meta","ow_bfs_built_at"]: st.session_state.pop(key,None)
-        for fn in [_ow_bfs_event_profile,_ow_bfs_primary_role,_ow_bfs_contact_detail,_ow_bfs_game_feed_context,_ow_bfs_opponent_running_context,_ow_fetch_ud_batter_fantasy_lines,_v3_fetch_ud_batter_fs_rows]:
-            try: fn.clear()
-            except Exception: pass
-        st.success("Batter Fantasy V2 board and BFS-only caches cleared."); source_meta={}
+        for key in ["ow_bfs_df", "ow_bfs_meta", "ow_bfs_source_meta", "ow_bfs_built_at"]:
+            st.session_state.pop(key, None)
+        for fn in [_ow_bfs_event_profile, _ow_bfs_primary_role, _ow_bfs_contact_detail, _ow_bfs_game_feed_context, _ow_bfs_opponent_running_context, _ow_fetch_ud_batter_fantasy_lines, _v3_fetch_ud_batter_fs_rows]:
+            try:
+                fn.clear()
+            except Exception:
+                pass
+        st.success("Batter Fantasy board and BFS-only caches cleared.")
+        source_meta = {}
+
     if build_now:
-        # Grade any saved prior Fantasy boards whose games are now final before
-        # building the next live board. This is Batter-Fantasy-only persistence and
-        # does not alter H+R+RBI projection math.
         try:
             auto_grade = _ow_bfs_grade_full_board_snapshots()
-        except Exception as e:
-            auto_grade = {"graded":0,"waiting_final":0,"error":str(e)}
-        for fn in [_ow_fetch_ud_batter_fantasy_lines,_v3_fetch_ud_batter_fs_rows]:
-            try: fn.clear()
-            except Exception: pass
-        with st.spinner("Building the FULL Batter Fantasy board. First build can take longer because every hitter gets MLB/Statcast/contact context..."):
-            df_new,meta_new=build_v3_batter_fantasy_table()
-            meta_new=dict(meta_new or {})
-            meta_new["auto_grade"]=auto_grade
+        except Exception as exc:
+            auto_grade = {"graded": 0, "waiting_final": 0, "error": str(exc)}
+        for fn in [_ow_fetch_ud_batter_fantasy_lines, _v3_fetch_ud_batter_fs_rows]:
+            try:
+                fn.clear()
+            except Exception:
+                pass
+        with st.spinner("Building every safe hitter on the current Underdog Fantasy Points board..."):
+            df_new, meta_new = build_v3_batter_fantasy_table()
+            meta_new = dict(meta_new or {})
+            meta_new["auto_grade"] = auto_grade
             try:
                 meta_new["auto_saved_full_board"] = _ow_bfs_save_full_board_snapshot(df_new)
-            except Exception as e:
-                meta_new["auto_saved_full_board_error"] = str(e)
-            st.session_state["ow_bfs_df"]=df_new; st.session_state["ow_bfs_meta"]=meta_new; st.session_state["ow_bfs_source_meta"]=meta_new; st.session_state["ow_bfs_built_at"]=now_iso(); source_meta=meta_new
-    m1,m2,m3,m4,m5=st.columns(5); m1.metric("UD FS Rows",source_meta.get("raw",0)); m2.metric("Batters",source_meta.get("batters",0)); m3.metric("Built",source_meta.get("built",0)); m4.metric("Pitchers Filtered",source_meta.get("pitchers",0)); m5.metric("Unknown Held",source_meta.get("unknown",0))
-    df=st.session_state.get("ow_bfs_df"); meta=st.session_state.get("ow_bfs_meta",{}); built_at=st.session_state.get("ow_bfs_built_at")
-    if not isinstance(df,pd.DataFrame) or df.empty:
-        st.info("Tap **Pull FULL Underdog Board + Build Fantasy V2**. The board keeps every safe batter Fantasy Points row; pitchers and unresolved rows are held out.")
-        with st.expander("Batter Fantasy source/debug",expanded=False): st.write(source_meta or {"status":"Not pulled in this session"}); st.write("Existing UD parser debug:",st.session_state.get("fs_ud_debug",{}))
+            except Exception as exc:
+                meta_new["auto_saved_full_board_error"] = str(exc)
+            st.session_state["ow_bfs_df"] = df_new
+            st.session_state["ow_bfs_meta"] = meta_new
+            st.session_state["ow_bfs_source_meta"] = meta_new
+            st.session_state["ow_bfs_built_at"] = now_iso()
+            source_meta = meta_new
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("UD FS Rows", source_meta.get("raw", 0))
+    m2.metric("Batters", source_meta.get("batters", 0))
+    m3.metric("Built", source_meta.get("built", 0))
+    m4.metric("Pitchers Filtered", source_meta.get("pitchers", 0))
+    m5.metric("Unknown Held", source_meta.get("unknown", 0))
+
+    df = st.session_state.get("ow_bfs_df")
+    meta = st.session_state.get("ow_bfs_meta", {})
+    built_at = st.session_state.get("ow_bfs_built_at")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Tap **Pull FULL Underdog Board + Build Fantasy**. Every safe batter row is built; pitchers and unresolved roles are held out.")
+        with st.expander("Batter Fantasy source/debug", expanded=False):
+            st.write(source_meta or {"status": "Not pulled in this session"})
+            st.write("Existing UD parser debug:", st.session_state.get("fs_ud_debug", {}))
         return
-    if built_at: st.caption(f"Built: {built_at} · {OW_BATTER_FS_VERSION}")
-    auto_grade_meta=(meta or {}).get("auto_grade") or {}
-    auto_saved=(meta or {}).get("auto_saved_full_board")
+
+    df = _ow_bfs_rank_full_board(df)
+    st.session_state["ow_bfs_df"] = df
+    if built_at:
+        st.caption(f"Built: {built_at} · {OW_BATTER_FS_VERSION} · ranked calibrated win probability → confidence → data → contact → median edge")
+    auto_grade_meta = (meta or {}).get("auto_grade") or {}
+    auto_saved = (meta or {}).get("auto_saved_full_board")
     if auto_saved is not None or auto_grade_meta:
-        st.caption(f"Auto audit: saved {int(auto_saved or 0)} new pregame full-board rows · graded {int(auto_grade_meta.get('graded',0) or 0)} prior finals · waiting {int(auto_grade_meta.get('waiting_final',0) or 0)}.")
-    a,b,c,d=st.columns([1.4,1.2,1.0,1.0]); search=a.text_input("Search player","",key=_v3_unique_widget_key("ow_bfs_search_v2")); sort_mode=b.selectbox("Sort",["Win Probability","Projection","Contact","Skill","Edge","Confidence"],key=_v3_unique_widget_key("ow_bfs_sort_v2")); min_conf=c.slider("Min confidence",30,90,45,1,key=_v3_unique_widget_key("ow_bfs_min_conf_v2")); show_pass=d.checkbox("Show PASS",value=True,key=_v3_unique_widget_key("ow_bfs_show_pass_v2"))
-    view=df.copy();
-    if search.strip(): view=view[view["Player"].astype(str).str.contains(search.strip(),case=False,na=False)]
-    view=view[pd.to_numeric(view.get("Confidence"),errors="coerce").fillna(0)>=min_conf]
-    if not show_pass: view=view[view.get("Pick",pd.Series(dtype=str)).astype(str).isin(["HIGHER","LOWER"])]
-    sort_map={"Win Probability":"Win Probability %","Projection":"Projection","Contact":"Contact","Skill":"Skill","Edge":"Edge","Confidence":"Confidence"}; sort_col=sort_map.get(sort_mode,"Win Probability %")
-    if sort_col in view.columns:
-        if sort_mode=="Edge": view["_abs_edge"]=pd.to_numeric(view["Edge"],errors="coerce").abs(); view=view.sort_values("_abs_edge",ascending=False).drop(columns=["_abs_edge"])
-        else: view=view.sort_values(sort_col,ascending=False,na_position="last")
-    k1,k2,k3,k4,k5=st.columns(5); k1.metric("Projected",len(view)); k2.metric("Higher",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="HIGHER").sum())); k3.metric("Lower",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="LOWER").sum())); k4.metric("PASS",int((view.get("Pick",pd.Series(dtype=str)).astype(str)=="PASS").sum())); k5.metric("60%+",int((pd.to_numeric(view.get("Win Probability %"),errors="coerce")>=60).sum()))
-    save1,save2,save3=st.columns(3)
-    if save1.button("📌 Save FULL untouched board",key=_v3_unique_widget_key("ow_bfs_save_full_v2"),use_container_width=True):
-        added=_ow_bfs_save_full_board_snapshot(df); st.success(f"Saved {added} new full-board Fantasy projections for untouched grading.")
-    if save2.button("💾 Save cleared plays",key=_v3_unique_widget_key("ow_bfs_save_snapshot_v2"),use_container_width=True):
-        cand=_ow_bfs_official_candidates(view); added=_ow_save_batter_snapshots(cand,source_label="BATTER_FANTASY_V2_BOARD"); st.success(f"Saved {added} new cleared Batter Fantasy play rows.")
-    if save3.button("✅ Grade finished FS boards",key=_v3_unique_widget_key("ow_bfs_grade_v2"),use_container_width=True):
-        full_info=_ow_bfs_grade_full_board_snapshots(); off_info=_ow_grade_batter_snapshots(); st.success(f"Full board graded {full_info.get('graded',0)}; official batter rows graded {off_info.get('graded',0)}. Waiting full-board finals: {full_info.get('waiting_final',0)}.")
+        st.caption(f"Auto audit: saved {int(auto_saved or 0)} new pregame rows · graded {int(auto_grade_meta.get('graded',0) or 0)} prior finals · waiting {int(auto_grade_meta.get('waiting_final',0) or 0)}.")
+
+    directions = df["Model Direction"].astype(str)
+    official_count = int(df.get("Official Status", pd.Series(dtype=str)).astype(str).eq("QUALIFIED").sum())
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Full Board", len(df))
+    k2.metric("Higher", int(directions.eq("HIGHER").sum()))
+    k3.metric("Lower", int(directions.eq("LOWER").sum()))
+    k4.metric("Official Qualified", official_count)
+    k5.metric("60%+", int((pd.to_numeric(df["Model Win Probability %"], errors="coerce") >= 60).sum()))
+
+    st.markdown("#### 🔥 Best Batter Fantasy Plays")
+    _ow_bfs_render_best_plays(df, limit=min(8, len(df)))
+
+    save1, save2, save3 = st.columns(3)
+    if save1.button("📌 Save FULL untouched board", key=_v3_unique_widget_key("ow_bfs_save_full_v2"), use_container_width=True):
+        added = _ow_bfs_save_full_board_snapshot(df)
+        st.success(f"Saved {added} new pregame full-board Fantasy projections.")
+    if save2.button("💾 Save Official qualified", key=_v3_unique_widget_key("ow_bfs_save_snapshot_v2"), use_container_width=True):
+        cand = _ow_bfs_official_candidates(df)
+        added = _ow_save_batter_snapshots(cand, source_label="BATTER_FANTASY_V3_BOARD")
+        st.success(f"Saved {added} new qualified Batter Fantasy play rows.")
+    if save3.button("✅ Grade finished FS boards", key=_v3_unique_widget_key("ow_bfs_grade_v2"), use_container_width=True):
+        full_info = _ow_bfs_grade_full_board_snapshots()
+        off_info = _ow_grade_batter_snapshots()
+        st.success(f"Full board graded {full_info.get('graded',0)}; official rows graded {off_info.get('graded',0)}. Waiting: {full_info.get('waiting_final',0)}.")
+
+    search = st.text_input("Search player", "", key=_v3_unique_widget_key("ow_bfs_search_v2"))
+    view = df.copy()
+    if search.strip():
+        view = view[view["Player"].astype(str).str.contains(search.strip(), case=False, na=False)]
+    st.markdown("#### Full Ranked Board")
+    st.caption("All valid players remain visible, strongest chance first. Weak rows are labeled LEAN, LOW CONFIDENCE, or AVOID.")
     _ow_bfs_render_cards(view)
-    with st.expander("Full Batter Fantasy V2 data table",expanded=False):
-        front=[c for c in ["Player","Team","Position","Bats","Opponent","Opp Pitcher","Pitcher Hand","Game Time","Game Status","Market Type","Line Validated","Line Validation Note","Opening Line","Current Line","Line Move","Line","Projection","Median","P20","P80","Fair Line","Edge","Median Edge","Pick","Model Side","Higher %","Lower %","Win Probability %","Probability Calibration Samples","Distribution Conflict","Decision Gate","Decision Gate Reasons","Confidence","Data Score","Skill","Match","Form","Contact","Volatility","Projected PA","Starter PA Share","Starter PA/G","Bullpen PA/G","Starter Avg IP","Lineup Slot","Lineup Status","Lineup Confirmed","Availability Factor","Availability Note","Pitcher Confirmed","Umpire Name","Umpire Hitter Factor","Defense/Framing Factor","Opponent Defense Score","Opponent Framing Score","H/G","1B/G","2B/G","3B/G","HR/G","BB/G","R/G","RBI/G","SB/G","K/G","AVG","OPS","wOBA/xwOBA","ISO","Batter Contact%","Batter Zone Contact%","Batter Chase Contact%","Batter Chase%","Batter xBA","Batter Sweet Spot%","Batter Avg EV","Batter HardHit%","Batter Barrel%","Batter Whiff%","Pitch Mix Matchup Factor","Batter Pitch Contact%","Pitcher ERA","Pitcher K%","Pitcher Allowed xBA","Pitcher Allowed xwOBA","Bayes Sample Label","Prior Weighted PA","HRR Component Hits","HRR Hit Blend Factor","SB Opportunity Factor","Calibration Samples","Calibration Bias","Calibration MAE","Calibration Adjustment","XGBoost Active","XGBoost Samples","XGBoost Adjustment","Flags","Role Source","Scoring Profile","Projection Version"] if c in view.columns]; rest=[c for c in view.columns if c not in front]; st.dataframe(view[front+rest],use_container_width=True,hide_index=True)
-    st.download_button("Download FULL Batter Fantasy V2 CSV",data=view.to_csv(index=False).encode("utf-8"),file_name="batter_fantasy_v2_full_underdog_board.csv",mime="text/csv",key=_v3_unique_widget_key("ow_bfs_download_v2"),use_container_width=True)
-    with st.expander("Model / source audit",expanded=False):
-        st.write(meta); st.code("Underdog FULL Fantasy board\n→ role safety gate\n→ Bayesian current/prior/league event rates\n→ starter PA + bullpen PA distributions\n→ pitch-mix/contact V2\n→ base-state RBI + run conversion\n→ on-base SB opportunity + opponent running control\n→ 12,000 simulations\n→ historical bias/probability calibration\n→ XGBoost only after 120+ graded Fantasy rows\n→ hard PASS gates before official play")
-        st.caption("A PASS still shows the model side/projection for audit, but the app will not call it an official Higher/Lower until lineup, pitcher, data and game-status gates clear.")
+
+    with st.expander("Full Batter Fantasy data table", expanded=False):
+        front = [c for c in [
+            "Rank", "Player", "Team", "Position", "Bats", "Opponent", "Opp Pitcher", "Pitcher Hand",
+            "Line", "Projection", "Median", "P20", "P80", "Model Direction", "Model Direction Alt",
+            "Model Win Probability %", "Confidence", "Play Status", "Official Status", "Rank Score",
+            "Pick", "Decision Gate", "Decision Gate Reasons", "Data Score", "Skill", "Match", "Form", "Contact",
+            "Higher %", "Lower %", "Distribution Conflict", "Absolute Median Edge", "Edge", "Median Edge",
+            "Game Time", "Game Status", "Market Type", "Line Validated", "Lineup Slot", "Lineup Status",
+            "Lineup Confirmed", "Pitcher Confirmed", "Volatility", "Projected PA", "Starter PA/G", "Bullpen PA/G",
+            "H/G", "1B/G", "2B/G", "3B/G", "HR/G", "R/G", "RBI/G", "BB/G", "SB/G", "K/G",
+            "AVG", "OPS", "wOBA/xwOBA", "ISO", "Expected Contact Quality", "Expected Contact Coverage %",
+            "Arsenal Matrix Coverage %", "Flags", "Scoring Profile", "Projection Version",
+        ] if c in view.columns]
+        rest = [c for c in view.columns if c not in front]
+        st.dataframe(view[front + rest], use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download FULL ranked Batter Fantasy CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name="batter_fantasy_full_ranked_board.csv",
+        mime="text/csv",
+        key=_v3_unique_widget_key("ow_bfs_download_v2"),
+        use_container_width=True,
+    )
+    with st.expander("Model / source audit", expanded=False):
+        st.write(meta)
+        st.code("Full Underdog hitter board\n→ role safety gate\n→ event + arsenal + TTO simulation\n→ calibrated Higher/Lower direction for every row\n→ reliability confidence\n→ separate strict Official gate\n→ best-to-worst ranking")
 
 
 
@@ -38466,7 +38726,7 @@ def render_v3_batter_fantasy_tab():
 # - Installed files are preferred inside Batter Fantasy; live feeds remain fallback.
 # - Missing columns are ignored/reweighted, never silently treated as zero.
 # ============================================================
-OW_BATTER_FS_VERSION = "OW_BATTER_FS_V3_INSTALLER_ARSENAL_TTO_2026_08_12"
+OW_BATTER_FS_VERSION = "OW_BATTER_FS_V3_DIRECTION_RANK_LEARNING_FIX_2026_08_12"
 OW_BFS_INSTALLER_SCHEMA = "OW_BFS_DATA_INSTALLER_V1"
 OW_BFS_INSTALL_DIR = Path(STORAGE_DIR) / "batter_fantasy_data"
 OW_BFS_INSTALL_INDEX = OW_BFS_INSTALL_DIR / "installer_index.json"
@@ -39450,7 +39710,162 @@ def _ow_build_batter_fantasy_row(raw):
         existing=[x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()]; row["Flags"]=" | ".join(dict.fromkeys(extra+existing))[:900]
     except Exception as e:
         row["V3 Formula Enrichment Error"]=str(e)[:180]
-    return row
+    return _ow_bfs_finalize_direction_row(row)
+
+
+def _ow_bfs_truthy(value):
+    if value is True:
+        return True
+    return str(value or "").strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _ow_bfs_finalize_direction_row(row):
+    """Separate always-on model direction from conservative Official Play status."""
+    if not isinstance(row, dict) or not row:
+        return row
+    out = dict(row)
+    higher = _ow_bfs_num(out.get("Higher %"), None)
+    lower = _ow_bfs_num(out.get("Lower %"), None)
+    if higher is None and lower is None:
+        higher = lower = 50.0
+    elif higher is None:
+        higher = max(0.0, 100.0 - float(lower))
+    elif lower is None:
+        lower = max(0.0, 100.0 - float(higher))
+    higher = float(clamp(higher, 0.0, 100.0))
+    lower = float(clamp(lower, 0.0, 100.0))
+    direction = "HIGHER" if higher >= lower else "LOWER"
+    direction_alt = "OVER" if direction == "HIGHER" else "UNDER"
+    win_prob = higher if direction == "HIGHER" else lower
+
+    confidence = float(_ow_bfs_num(out.get("Confidence"), 0) or 0)
+    data_score = float(_ow_bfs_num(out.get("Data Score"), 0) or 0)
+    contact = float(_ow_bfs_num(out.get("Contact"), 0) or 0)
+    match = float(_ow_bfs_num(out.get("Match"), 0) or 0)
+    median_edge = abs(float(_ow_bfs_num(out.get("Median Edge"), 0) or 0))
+    gate_clear = str(out.get("Decision Gate") or "PASS").strip().upper() == "CLEAR"
+    official_pick = str(out.get("Pick") or "PASS").strip().upper()
+    market_type = str(out.get("Market Type") or "MAIN").strip().upper()
+    line_valid = _ow_bfs_truthy(out.get("Line Validated"))
+    lineup_confirmed = _ow_bfs_truthy(out.get("Lineup Confirmed"))
+    pitcher_confirmed = _ow_bfs_truthy(out.get("Pitcher Confirmed"))
+    game_started = _ow_bfs_truthy(out.get("Game Started"))
+    availability = float(_ow_bfs_num(out.get("Availability Factor"), 1.0) or 1.0)
+    conflict = str(out.get("Distribution Conflict") or "NO").strip().upper() == "YES"
+    volatility = str(out.get("Volatility") or "NORMAL").strip().upper()
+    arsenal_coverage = float(_ow_bfs_num(out.get("Arsenal Matrix Coverage %"), 0) or 0)
+    contact_coverage = float(_ow_bfs_num(out.get("Expected Contact Coverage %"), 0) or 0)
+
+    official_qualified = (
+        official_pick in {"HIGHER", "LOWER"}
+        and official_pick == direction
+        and gate_clear
+        and win_prob >= OW_BATTER_FS_MIN_PLAY_PROB
+        and confidence >= 55
+        and data_score >= OW_BATTER_FS_MIN_DATA_SCORE
+        and line_valid
+        and lineup_confirmed
+        and pitcher_confirmed
+        and not game_started
+        and market_type == "MAIN"
+        and availability >= 0.96
+    )
+    hard_avoid = game_started or not line_valid or market_type in {"ALT", "PROMO"} or availability < 0.92
+
+    if hard_avoid:
+        play_status = "AVOID"
+    elif official_qualified and win_prob >= 65 and confidence >= 78 and data_score >= 75 and not conflict and volatility != "VOLATILE":
+        play_status = "ELITE"
+    elif official_qualified and win_prob >= 60 and confidence >= 68 and data_score >= 65:
+        play_status = "STRONG"
+    elif official_qualified:
+        play_status = "QUALIFIED"
+    elif win_prob >= 56 and confidence >= 55 and data_score >= 50:
+        play_status = "LEAN"
+    elif win_prob >= 52:
+        play_status = "LOW CONFIDENCE"
+    else:
+        play_status = "AVOID"
+
+    prob_score = float(clamp(50.0 + max(0.0, win_prob - 50.0) * 3.0, 0.0, 100.0))
+    rank_score = (
+        0.60 * prob_score
+        + 0.15 * confidence
+        + 0.10 * data_score
+        + 0.075 * contact
+        + 0.075 * match
+    )
+    if not lineup_confirmed:
+        rank_score -= 5
+    if not pitcher_confirmed:
+        rank_score -= 5
+    if arsenal_coverage and arsenal_coverage < 50:
+        rank_score -= 4
+    if contact_coverage and contact_coverage < 50:
+        rank_score -= 4
+    if conflict:
+        rank_score -= 5
+    if volatility == "VOLATILE":
+        rank_score -= 4
+    if hard_avoid:
+        rank_score -= 10
+
+    out.update({
+        "Model Direction": direction,
+        "Model Direction Alt": direction_alt,
+        "Model Pick": direction,
+        "Model Side": direction,
+        "Model Win Probability %": round(win_prob, 1),
+        "Win Probability %": round(win_prob, 1),
+        "Higher %": round(higher, 1),
+        "Lower %": round(lower, 1),
+        "Play Status": play_status,
+        "Official Status": "QUALIFIED" if official_qualified else "NOT QUALIFIED",
+        "Rank Score": round(float(clamp(rank_score, 0.0, 100.0)), 1),
+        "Absolute Median Edge": round(median_edge, 2),
+    })
+    return out
+
+
+def _ow_bfs_rank_full_board(df):
+    """Keep every valid hitter row and rank calibrated best chance first."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame() if not isinstance(df, pd.DataFrame) else df.copy()
+    records = [_ow_bfs_finalize_direction_row(r) for r in df.to_dict("records")]
+    d = pd.DataFrame(records)
+    sort_specs = [
+        ("Model Win Probability %", "_ow_sort_prob"),
+        ("Confidence", "_ow_sort_conf"),
+        ("Data Score", "_ow_sort_data"),
+        ("Contact", "_ow_sort_contact"),
+        ("Absolute Median Edge", "_ow_sort_edge"),
+    ]
+    for source, target in sort_specs:
+        values = d[source] if source in d.columns else pd.Series(0, index=d.index, dtype=float)
+        d[target] = pd.to_numeric(values, errors="coerce").fillna(0)
+    temp_cols = [target for _, target in sort_specs]
+    d = d.sort_values(temp_cols, ascending=[False] * len(temp_cols), kind="mergesort", na_position="last")
+    d = d.drop(columns=temp_cols).reset_index(drop=True)
+    d["Rank"] = np.arange(1, len(d) + 1, dtype=int)
+    front = ["Rank", "Player", "Model Direction", "Model Direction Alt", "Model Win Probability %", "Confidence", "Play Status", "Official Status", "Rank Score"]
+    return d[[c for c in front if c in d.columns] + [c for c in d.columns if c not in front]]
+
+
+_build_v3_batter_fantasy_table_v3_source = build_v3_batter_fantasy_table
+
+
+def build_v3_batter_fantasy_table():
+    df, meta = _build_v3_batter_fantasy_table_v3_source()
+    ranked = _ow_bfs_rank_full_board(df)
+    meta = dict(meta or {})
+    meta.update({
+        "built": len(ranked),
+        "full_board": True,
+        "ranked_best_to_worst": True,
+        "directional_cards": True,
+        "official_gate_separate": True,
+    })
+    return ranked, meta
 
 
 # -------------------------
@@ -39514,7 +39929,7 @@ def render_v3_batter_fantasy_tab():
     df=st.session_state.get("ow_bfs_df")
     if isinstance(df,pd.DataFrame) and not df.empty:
         with st.expander("V3 Arsenal / PA / Contact formula audit",expanded=False):
-            cols=[c for c in ["Player","Opp Pitcher","Line","Projection","Pick","Expected Contact Quality","Expected Contact Coverage %","Arsenal Matrix Coverage %","Arsenal Expected Contact%","Arsenal Expected Whiff%","Arsenal Expected xwOBA","Arsenal Expected HR Rate","Arsenal Expected XBH Rate","PA P3%","PA P4%","PA P5%","PA P6%","PA P7%","Starter 1st PA %","Starter 2nd PA %","Starter 3rd PA %","Starter 4th PA %","Platoon K Raw%","Platoon K Shrunk%","Platoon K Sample","Ahead OBP","Behind SLG","Base Occupancy","Projected Times On Base","SB Attempt Rate%","SB Success Rate%","Pitcher Hold Factor","Catcher Throw Factor","Installed Data Layers","Flags"] if c in df.columns]
+            cols=[c for c in ["Rank","Player","Opp Pitcher","Line","Projection","Model Direction","Model Win Probability %","Confidence","Play Status","Official Status","Rank Score","Pick","Expected Contact Quality","Expected Contact Coverage %","Arsenal Matrix Coverage %","Arsenal Expected Contact%","Arsenal Expected Whiff%","Arsenal Expected xwOBA","Arsenal Expected HR Rate","Arsenal Expected XBH Rate","PA P3%","PA P4%","PA P5%","PA P6%","PA P7%","Starter 1st PA %","Starter 2nd PA %","Starter 3rd PA %","Starter 4th PA %","Platoon K Raw%","Platoon K Shrunk%","Platoon K Sample","Ahead OBP","Behind SLG","Base Occupancy","Projected Times On Base","SB Attempt Rate%","SB Success Rate%","Pitcher Hold Factor","Catcher Throw Factor","Installed Data Layers","Flags"] if c in df.columns]
             st.dataframe(df[cols],use_container_width=True,hide_index=True)
             st.caption("Pitch-type rows are sample-shrunk toward the batter baseline; missing installer fields are ignored and remaining weights renormalize automatically.")
 
