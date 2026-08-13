@@ -36636,42 +36636,43 @@ def _ow_bfs_render_cards(df):
     css = """
     <style>
     .ow-bfs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(355px,1fr));gap:14px;margin-top:10px}
-    .ow-bfs-card{background:linear-gradient(180deg,#0b0b16 0%,#090910 100%);border:1px solid #29233d;border-radius:18px;padding:17px 18px;box-shadow:0 9px 26px rgba(0,0,0,.28);color:#f5f5fb;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .ow-bfs-card{position:relative;background:linear-gradient(145deg,rgba(105,16,170,.22) 0%,#07070d 28%,#0b0911 72%,rgba(196,139,15,.13) 100%);border:1px solid rgba(235,183,45,.72);border-radius:8px;padding:17px 18px;box-shadow:inset 0 1px 0 rgba(229,35,255,.38),0 9px 26px rgba(0,0,0,.42),0 0 18px rgba(131,26,202,.10);color:#f7f5fb;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .ow-bfs-card:before{content:"";position:absolute;left:14px;right:14px;top:0;height:2px;background:linear-gradient(90deg,#d51cff,#ffcf36,#7f20df);opacity:.85}
     .ow-bfs-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-    .ow-bfs-player{font-size:22px;font-weight:900;line-height:1.05;letter-spacing:-.35px}
-    .ow-bfs-meta{font-size:13px;color:#aaa9b6;margin-top:5px;font-weight:700}
-    .ow-bfs-opp{font-size:12px;color:#777687;margin-top:3px}
+    .ow-bfs-player{font-size:22px;font-weight:900;line-height:1.05;letter-spacing:0;color:#fff}
+    .ow-bfs-meta{font-size:13px;color:#c8c2d1;margin-top:5px;font-weight:700}
+    .ow-bfs-opp{font-size:12px;color:#9991a5;margin-top:3px}
     .ow-bfs-proj{text-align:right;min-width:92px}
-    .ow-bfs-proj span{display:block;font-size:9px;color:#777687;font-weight:900;letter-spacing:.8px}
-    .ow-bfs-proj strong{display:block;font-size:39px;line-height:1;color:#f1c84c;font-weight:850;margin-top:3px}
-    .ow-bfs-proj small{font-size:11px;color:#747383}
+    .ow-bfs-proj span{display:block;font-size:9px;color:#c8b15d;font-weight:900;letter-spacing:.8px}
+    .ow-bfs-proj strong{display:block;font-size:39px;line-height:1;color:#ffd34d;font-weight:900;margin-top:3px;text-shadow:0 0 14px rgba(255,194,42,.20)}
+    .ow-bfs-proj small{font-size:11px;color:#9f98aa}
     .ow-bfs-pick-row{display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px}
-    .ow-bfs-badge{display:inline-block;border-radius:9px;padding:5px 9px;font-size:11px;font-weight:900;border:1px solid}
-    .ow-bfs-badge.higher{color:#59e6a9;border-color:#277b5b;background:#0b2d22}
-    .ow-bfs-badge.lower{color:#ff6c87;border-color:#79334a;background:#30111a}
+    .ow-bfs-badge{display:inline-block;border-radius:6px;padding:5px 9px;font-size:11px;font-weight:900;border:1px solid}
+    .ow-bfs-badge.higher{color:#69efb3;border-color:#3a9d76;background:rgba(8,54,39,.78)}
+    .ow-bfs-badge.lower{color:#ff7590;border-color:#a73f5d;background:rgba(63,12,28,.78)}
     .ow-bfs-badge.pass{color:#f0ca55;border-color:#786528;background:#2f290d}
     .ow-bfs-prob{font-size:12px;font-weight:900;color:#ececf3}
     .ow-bfs-conf>div:first-child{display:flex;justify-content:space-between;font-size:10px;color:#888798;font-weight:900}
-    .ow-bfs-conf-track,.ow-bfs-track{height:6px;background:#222130;border-radius:99px;overflow:hidden;margin-top:5px}
-    .ow-bfs-conf-track i{display:block;height:100%;background:linear-gradient(90deg,#44d8a6,#77e8c3);border-radius:99px}
+    .ow-bfs-conf-track,.ow-bfs-track{height:6px;background:#211b2b;border-radius:99px;overflow:hidden;margin-top:5px}
+    .ow-bfs-conf-track i{display:block;height:100%;background:linear-gradient(90deg,#8d21e5,#f1ba2c);border-radius:99px}
     .ow-bfs-scores{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:11px}
     .ow-bfs-score>div:first-child{display:flex;justify-content:space-between;gap:4px;font-size:9px;color:#777687;font-weight:850}
     .ow-bfs-score b{color:#deddea}
-    .ow-bfs-score:nth-child(1) .ow-bfs-track i{display:block;height:100%;background:#a783ff}
-    .ow-bfs-score:nth-child(2) .ow-bfs-track i{display:block;height:100%;background:#f1c84c}
+    .ow-bfs-score:nth-child(1) .ow-bfs-track i{display:block;height:100%;background:#bd2cff}
+    .ow-bfs-score:nth-child(2) .ow-bfs-track i{display:block;height:100%;background:#f5c63f}
     .ow-bfs-score:nth-child(3) .ow-bfs-track i{display:block;height:100%;background:#49d69e}
     .ow-bfs-score:nth-child(4) .ow-bfs-track i{display:block;height:100%;background:#65c9f2}
     .ow-bfs-minis{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:13px}
-    .ow-bfs-mini{background:#10101c;border:1px solid #1c1b2a;border-radius:10px;text-align:center;padding:7px 3px}
-    .ow-bfs-mini strong{display:block;font-size:16px;color:#63dfa7;font-weight:900}
-    .ow-bfs-mini span{display:block;font-size:9px;color:#727180;font-weight:800;margin-top:1px}
+    .ow-bfs-mini{background:rgba(10,8,17,.82);border:1px solid rgba(116,55,159,.38);border-radius:6px;text-align:center;padding:7px 3px}
+    .ow-bfs-mini strong{display:block;font-size:16px;color:#f5d15c;font-weight:900}
+    .ow-bfs-mini span{display:block;font-size:9px;color:#958d9f;font-weight:800;margin-top:1px}
     .ow-bfs-bottom{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;font-size:10px;color:#858493}
     .ow-bfs-bottom b{margin-left:auto;color:#e6a85e;border:1px solid #7f5c31;border-radius:7px;padding:1px 5px}
     .ow-bfs-flags{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
-    .ow-bfs-flag{font-size:9px;color:#c9c8d4;background:#151422;border:1px solid #25243a;border-radius:7px;padding:3px 6px}
+    .ow-bfs-flag{font-size:9px;color:#ddd6e3;background:rgba(25,15,33,.88);border:1px solid rgba(161,42,215,.38);border-radius:5px;padding:3px 6px}
     @media(max-width:700px){
       .ow-bfs-grid{grid-template-columns:1fr;gap:10px}
-      .ow-bfs-card{padding:14px;border-radius:15px}
+      .ow-bfs-card{padding:14px;border-radius:8px}
       .ow-bfs-player{font-size:20px}
       .ow-bfs-proj strong{font-size:35px}
       .ow-bfs-scores{gap:6px}
@@ -38067,6 +38068,119 @@ def _ow_get_actual_batter_boxscore(game_pk, player_id):
 
 
 OW_BATTER_FS_BOARD_LOG = os.path.join(STORAGE_DIR, "ow_batter_fs_full_board_log.json")
+OW_BATTER_FS_CURRENT_BOARD = os.path.join(STORAGE_DIR, "ow_batter_fs_current_board.json")
+OW_BATTER_FS_CURRENT_BOARD_SCHEMA = "OW_BATTER_FS_CURRENT_BOARD_V1"
+
+
+def _ow_bfs_json_safe(value):
+    """Convert pandas/NumPy values without turning legitimate missing data into zero."""
+    if isinstance(value, dict):
+        return {str(k): _ow_bfs_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_ow_bfs_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_ow_bfs_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return _ow_bfs_json_safe(value.item())
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
+def _ow_bfs_atomic_save_json(path, payload):
+    """Write Fantasy state atomically and report failures instead of hiding them."""
+    tmp_path = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(_ow_bfs_json_safe(payload), handle, indent=2, allow_nan=False)
+        os.replace(tmp_path, path)
+        return True, ""
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False, str(exc)
+
+
+def _ow_bfs_save_current_board(df, meta=None, built_at=None):
+    """Persist the complete ranked board so a new Streamlit session can restore it."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"saved": False, "rows": 0, "error": "No Batter Fantasy rows to save."}
+    ranked = _ow_bfs_rank_full_board(df) if "_ow_bfs_rank_full_board" in globals() else df.copy()
+    saved_at = built_at or now_iso()
+    payload = {
+        "schema_version": OW_BATTER_FS_CURRENT_BOARD_SCHEMA,
+        "saved_at": saved_at,
+        "snapshot_date": california_now().strftime("%Y-%m-%d") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d"),
+        "projection_version": OW_BATTER_FS_VERSION,
+        "row_count": int(len(ranked)),
+        "meta": dict(meta or {}),
+        "rows": ranked.to_dict("records"),
+    }
+    ok, error = _ow_bfs_atomic_save_json(OW_BATTER_FS_CURRENT_BOARD, payload)
+    return {"saved": bool(ok), "rows": int(len(ranked)) if ok else 0, "saved_at": saved_at, "error": error}
+
+
+def _ow_bfs_load_current_board():
+    payload = load_json(OW_BATTER_FS_CURRENT_BOARD, {})
+    if not isinstance(payload, dict) or payload.get("schema_version") != OW_BATTER_FS_CURRENT_BOARD_SCHEMA:
+        return pd.DataFrame(), {}, None
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return pd.DataFrame(), {}, None
+    frame = pd.DataFrame([r for r in rows if isinstance(r, dict)])
+    if frame.empty or "Player" not in frame.columns or "Line" not in frame.columns:
+        return pd.DataFrame(), {}, None
+    frame = _ow_bfs_rank_full_board(frame) if "_ow_bfs_rank_full_board" in globals() else frame
+    meta = dict(payload.get("meta") or {})
+    meta.update({
+        "built": int(len(frame)),
+        "restored_saved_board": True,
+        "restored_saved_at": payload.get("saved_at"),
+        "restored_snapshot_date": payload.get("snapshot_date"),
+    })
+    return frame, meta, payload.get("saved_at")
+
+
+def _ow_bfs_restore_saved_board_to_session():
+    """Restore once before tab execution; never triggers a sportsbook/model rebuild."""
+    if st.session_state.get("ow_bfs_restore_checked"):
+        return False
+    st.session_state["ow_bfs_restore_checked"] = True
+    current = st.session_state.get("ow_bfs_df")
+    if isinstance(current, pd.DataFrame) and not current.empty:
+        return False
+    frame, meta, built_at = _ow_bfs_load_current_board()
+    if frame.empty:
+        return False
+    st.session_state["ow_bfs_df"] = frame
+    st.session_state["ow_bfs_meta"] = meta
+    st.session_state["ow_bfs_source_meta"] = meta
+    st.session_state["ow_bfs_built_at"] = built_at
+    st.session_state["ow_bfs_restored_from_disk"] = True
+    return True
 
 
 def _ow_save_batter_snapshots(df, source_label="OFFICIAL"):
@@ -38155,7 +38269,7 @@ def _ow_bfs_snapshot_is_pregame(row):
 
 
 def _ow_bfs_save_full_board_snapshot(df):
-    """Save every untouched Fantasy projection, including PASS rows, for honest model grading."""
+    """Save every untouched Fantasy projection for honest pregame model grading."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
     hist = load_json(OW_BATTER_FS_BOARD_LOG, [])
@@ -38171,7 +38285,11 @@ def _ow_bfs_save_full_board_snapshot(df):
             continue
         player_id = row.get("Player ID") or _mlb_search_player_id_by_name(row.get("Player"))
         game_pk = row.get("Game PK") or _ow_today_game_pk_for_team(row.get("Team"), row.get("Opponent"))
-        model_side = str(row.get("Model Side") or "PASS").upper()
+        model_side = str(row.get("Model Direction") or row.get("Model Side") or "").upper()
+        if model_side not in {"HIGHER", "LOWER"}:
+            higher = _v3_safe_num(row.get("Higher %"), 50.0) or 50.0
+            lower = _v3_safe_num(row.get("Lower %"), 50.0) or 50.0
+            model_side = "HIGHER" if float(higher) >= float(lower) else "LOWER"
         lineup_ok = row.get("Lineup Confirmed") is True or str(row.get("Lineup Confirmed") or "").lower() in {"true","1","yes"}
         pitcher_ok = row.get("Pitcher Confirmed") is True or str(row.get("Pitcher Confirmed") or "").lower() in {"true","1","yes"}
         snapshot_stage = "CONFIRMED" if lineup_ok and pitcher_ok else "PROJECTED"
@@ -38196,7 +38314,10 @@ def _ow_bfs_save_full_board_snapshot(df):
         if key in seen:
             continue
         hist.append(snap); seen.add(key); added += 1
-    save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    ok, error = _ow_bfs_atomic_save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    st.session_state["ow_bfs_last_snapshot_save_error"] = error
+    if not ok:
+        return 0
     return added
 
 
@@ -38245,7 +38366,10 @@ def _ow_bfs_grade_full_board_snapshots():
             r["Brier Score"] = round(((prob / 100.0) - y) ** 2, 4)
         r["graded"] = True; r["graded_at"] = now_iso(); r["Grade Status"] = "FULL BOARD / GRADED"
         graded += 1
-    save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    ok, error = _ow_bfs_atomic_save_json(OW_BATTER_FS_BOARD_LOG, hist[-30000:])
+    st.session_state["ow_bfs_last_snapshot_save_error"] = error
+    if not ok:
+        return {"graded": 0, "waiting_final": waiting, "missing": missing, "rows": len(hist), "error": error}
     return {"graded": graded, "waiting_final": waiting, "missing": missing, "rows": len(hist)}
 
 
@@ -38570,15 +38694,16 @@ def _ow_bfs_render_best_plays(df, limit=8):
         direction = str(r.get("Model Direction") or "HIGHER")
         color = "#55e3aa" if direction == "HIGHER" else "#ff6c87"
         cards.append(
-            "<div style='background:#0e0e19;border:1px solid #29263b;border-radius:8px;padding:10px;min-width:0'>"
-            f"<div style='font-size:10px;color:#f2c94c;font-weight:900'>#{int(r.get('Rank') or 0)} · {html.escape(str(r.get('Play Status') or ''))}</div>"
+            "<div class='ow-bfs-best-card'>"
+            f"<div style='font-size:10px;color:#ffd34d;font-weight:900'>#{int(r.get('Rank') or 0)} · {html.escape(str(r.get('Play Status') or ''))}</div>"
             f"<div style='font-size:15px;color:#f5f5fb;font-weight:900;white-space:normal;overflow-wrap:anywhere'>{html.escape(str(r.get('Player') or '—'))}</div>"
             f"<div style='font-size:11px;color:{color};font-weight:900'>{direction} { _ow_bfs_html_num(r.get('Line'),1) }</div>"
-            f"<div style='font-size:10px;color:#a5a4b2'>{_ow_bfs_html_num(r.get('Model Win Probability %'),1,'%')} · CONF {int(_ow_bfs_num(r.get('Confidence'),0) or 0)}</div>"
+            f"<div style='font-size:10px;color:#b8afc0'>{_ow_bfs_html_num(r.get('Model Win Probability %'),1,'%')} · CONF {int(_ow_bfs_num(r.get('Confidence'),0) or 0)}</div>"
             "</div>"
         )
     st.markdown(
         "<style>.ow-bfs-best{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:8px 0 16px}"
+        ".ow-bfs-best-card{position:relative;background:linear-gradient(145deg,rgba(111,17,171,.22),#090810 52%,rgba(198,143,20,.12));border:1px solid rgba(221,171,45,.62);border-radius:7px;padding:10px;min-width:0;box-shadow:inset 0 1px 0 rgba(219,40,255,.30),0 7px 18px rgba(0,0,0,.30)}"
         "@media(max-width:700px){.ow-bfs-best{grid-template-columns:repeat(2,minmax(0,1fr));}}</style>"
         "<div class='ow-bfs-best'>" + "".join(cards) + "</div>",
         unsafe_allow_html=True,
@@ -38620,12 +38745,19 @@ def render_v3_batter_fantasy_tab():
             meta_new["auto_grade"] = auto_grade
             try:
                 meta_new["auto_saved_full_board"] = _ow_bfs_save_full_board_snapshot(df_new)
+                snapshot_save_error = st.session_state.get("ow_bfs_last_snapshot_save_error")
+                if snapshot_save_error:
+                    meta_new["auto_saved_full_board_error"] = snapshot_save_error
             except Exception as exc:
                 meta_new["auto_saved_full_board_error"] = str(exc)
+            built_at_new = now_iso()
+            persistent_save = _ow_bfs_save_current_board(df_new, meta_new, built_at_new)
+            meta_new["persistent_board_save"] = persistent_save
             st.session_state["ow_bfs_df"] = df_new
             st.session_state["ow_bfs_meta"] = meta_new
             st.session_state["ow_bfs_source_meta"] = meta_new
-            st.session_state["ow_bfs_built_at"] = now_iso()
+            st.session_state["ow_bfs_built_at"] = built_at_new
+            st.session_state["ow_bfs_restored_from_disk"] = False
             source_meta = meta_new
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -38649,10 +38781,19 @@ def render_v3_batter_fantasy_tab():
     st.session_state["ow_bfs_df"] = df
     if built_at:
         st.caption(f"Built: {built_at} · {OW_BATTER_FS_VERSION} · ranked calibrated win probability → confidence → data → contact → median edge")
+    if st.session_state.get("ow_bfs_restored_from_disk"):
+        restored_date = (meta or {}).get("restored_snapshot_date") or "saved slate"
+        st.success(f"Loaded the complete saved Batter Fantasy board from {restored_date}. Pull again when you want fresh lines and matchups.")
     auto_grade_meta = (meta or {}).get("auto_grade") or {}
     auto_saved = (meta or {}).get("auto_saved_full_board")
     if auto_saved is not None or auto_grade_meta:
         st.caption(f"Auto audit: saved {int(auto_saved or 0)} new pregame rows · graded {int(auto_grade_meta.get('graded',0) or 0)} prior finals · waiting {int(auto_grade_meta.get('waiting_final',0) or 0)}.")
+    persistent_info = (meta or {}).get("persistent_board_save") or {}
+    if persistent_info:
+        if persistent_info.get("saved"):
+            st.caption(f"Persistent board: {int(persistent_info.get('rows',0) or 0)} players saved and ready for the next app session.")
+        elif persistent_info.get("error"):
+            st.error(f"Batter Fantasy board could not be saved: {persistent_info.get('error')}")
 
     directions = df["Model Direction"].astype(str)
     official_count = int(df.get("Official Status", pd.Series(dtype=str)).astype(str).eq("QUALIFIED").sum())
@@ -38669,7 +38810,14 @@ def render_v3_batter_fantasy_tab():
     save1, save2, save3 = st.columns(3)
     if save1.button("📌 Save FULL untouched board", key=_v3_unique_widget_key("ow_bfs_save_full_v2"), use_container_width=True):
         added = _ow_bfs_save_full_board_snapshot(df)
-        st.success(f"Saved {added} new pregame full-board Fantasy projections.")
+        current_info = _ow_bfs_save_current_board(df, meta, built_at or now_iso())
+        snapshot_error = st.session_state.get("ow_bfs_last_snapshot_save_error")
+        if snapshot_error or current_info.get("error"):
+            st.error(f"Batter Fantasy save failed: {snapshot_error or current_info.get('error')}")
+        elif added:
+            st.success(f"Saved all {len(df)} players for reopening and added {added} new pregame grading rows.")
+        else:
+            st.success(f"All {len(df)} players are saved. The matching pregame grading rows were already stored.")
     if save2.button("💾 Save Official qualified", key=_v3_unique_widget_key("ow_bfs_save_snapshot_v2"), use_container_width=True):
         cand = _ow_bfs_official_candidates(df)
         added = _ow_save_batter_snapshots(cand, source_label="BATTER_FANTASY_V3_BOARD")
@@ -39936,6 +40084,8 @@ def render_v3_batter_fantasy_tab():
 
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
+_ow_bfs_restore_saved_board_to_session()
+
 tab_top, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_poster, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
     "1️⃣ H+R+RBI",
