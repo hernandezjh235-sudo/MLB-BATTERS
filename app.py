@@ -11346,7 +11346,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         st.info("No player cards to show.")
         return
     d = df.copy()
-    sort_cols = [c for c in ["Likely Score", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
+    sort_cols = [c for c in ["Best Play Score", "Likely Score", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
     if sort_cols:
         d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
 
@@ -11429,12 +11429,19 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         grade_color = "#31f08a" if grade_result == "WIN" else "#ff3f68" if grade_result == "LOSS" else "#9aa4b7" if grade_result == "VOID" else "#f6c43c"
         actual_grade = _v3_safe_num(row.get("Actual H+R+RBI"), None) if is_hrr_card else None
         grade_html = "" if not grade_badge else f'<div style="font-size:11px;font-weight:900;color:{grade_color};margin-top:4px">{esc(grade_badge)}' + (f' · {actual_grade:g} HRR' if actual_grade is not None else '') + '</div>'
-        hs_v2 = _ow_poster_value(row, "High Scoring Game Score", default="—") if is_hrr_card else "—"
-        bo_v2 = _ow_poster_value(row, "Blowout Score", default="—") if is_hrr_card else "—"
-        off_v2 = _ow_poster_value(row, "Team Offensive Score", default="—") if is_hrr_card else "—"
-        bp_v2 = _ow_poster_value(row, "Opponent Bullpen Fatigue", default="—") if is_hrr_card else "—"
-        pa_risk_v2 = _ow_poster_value(row, "PA Risk Score", default="—") if is_hrr_card else "—"
-        env_v2_line = "" if all(str(x) == "—" for x in [hs_v2, bo_v2, off_v2, bp_v2, pa_risk_v2]) else f" | V2 High {esc(hs_v2)} · Blowout {esc(bo_v2)} · Team {esc(off_v2)} · Pen {esc(bp_v2)} · PA Risk {esc(pa_risk_v2)}"
+        has_env_v2 = any(row.get(k) not in (None, "", "—", "nan", "None") for k in ["High Scoring Game Score", "Blowout Score", "Team Offensive Score", "Opponent Bullpen Fatigue", "PA Risk Score"])
+        hs_v2 = _ow_poster_value(row, "High Scoring Game Score", default="—") if has_env_v2 else "—"
+        bo_v2 = _ow_poster_value(row, "Blowout Score", default="—") if has_env_v2 else "—"
+        off_v2 = _ow_poster_value(row, "Team Offensive Score", default="—") if has_env_v2 else "—"
+        bp_v2 = _ow_poster_value(row, "Opponent Bullpen Fatigue", default="—") if has_env_v2 else "—"
+        pa_risk_v2 = _ow_poster_value(row, "PA Risk Score", default="—") if has_env_v2 else "—"
+        cross_v2 = _ow_poster_value(row, "Cross-Market Agreement", default="—")
+        best_play_score = _ow_poster_value(row, "Best Play Score", default="—")
+        env_v2_line = "" if not has_env_v2 else f" | GAME ENV {esc(hs_v2)}/100 / BLOWOUT {esc(bo_v2)}/100 / TEAM {esc(off_v2)}/100 / PEN {esc(bp_v2)} / PA RISK {esc(pa_risk_v2)}"
+        if str(cross_v2) != "—":
+            env_v2_line += f" / CROSS {esc(cross_v2)}"
+        if str(best_play_score) != "—":
+            env_v2_line += f" / BEST {esc(best_play_score)}"
         conf_pct = clamp(num(prob), 0, 100)
         data_pct = clamp(num(data), 0, 100)
         edge_pct = clamp(abs(num(edge)) * 32, 0, 100)
@@ -27610,6 +27617,7 @@ def render_v3_top_batter_plays_board():
             c.metric("Best Projection", rr.get("Best Projection", "—"))
             d.metric("Best Win/Hit", rr.get("Best Win/Hit %", "—"))
             e.metric("Likely Score", rr.get("Likely Score", "—"))
+            st.caption(f"GAME ENV {rr.get('High Scoring Game Score','—')}/100 / BLOWOUT {rr.get('Blowout Score','—')}/100 / TEAM OFFENSE {rr.get('Team Offensive Score','—')}/100 / BEST PLAY {rr.get('Best Play Score','—')} / CROSS-MARKET {rr.get('Cross-Market Agreement','—')}")
             st.info(f"HRR: {rr.get('HRR Projection','—')} vs {rr.get('HRR Line','—')} ({rr.get('HRR Pick','—')}, {rr.get('HRR Over Probability %','—')}%). HR: {rr.get('HR Probability','—')} vs line {rr.get('HR Line','—')} ({rr.get('HR Pick','—')}). Risk: {rr.get('No-Bet Risk Flags','clean') or 'clean'}. Use H+R+RBI and Home Runs tabs for full cards.")
 
 
@@ -35359,6 +35367,7 @@ def render_v3_batter_research_tab(market="HRR"):
             c.metric("Pick", rr.get("Pick", "—"))
             d.metric("Edge", f"{_v3_safe_num(rr.get('Edge'), 0):+.2f}")
             e.metric("Win Prob", f"{rr.get('Win Probability %', '—')}%")
+            st.caption(f"GAME ENV {rr.get('High Scoring Game Score','—')}/100 / BLOWOUT {rr.get('Blowout Score','—')}/100 / TEAM OFFENSE {rr.get('Team Offensive Score','—')}/100 / BEST PLAY {rr.get('Best Play Score','—')} / CROSS-MARKET {rr.get('Cross-Market Agreement','—')}")
             st.info(rr.get("Matchup Summary", "—"))
             st.write({"Projected Hits": rr.get("Projected Hits"), "Projected Runs": rr.get("Projected Runs"), "Projected RBI": rr.get("Projected RBI"), "Component Projection": rr.get("Component Projection"), "Moneyball": rr.get("Moneyball Note"), "Last 5": rr.get("Last 5"), "Last 10": rr.get("Last 10"), "Last 15": rr.get("Last 15"), "Last 30": rr.get("Last 30"), "Last 5 Avg": rr.get("Last 5 Avg"), "Last 10 Avg": rr.get("Last 10 Avg"), "Last 15 Avg": rr.get("Last 15 Avg"), "Last 30 Avg": rr.get("Last 30 Avg"), "Same-Line": rr.get("Same-Line"), "Recent Values": rr.get("Recent Values")})
 
@@ -38617,7 +38626,7 @@ def render_v3_top_batter_plays_board():
     if d.empty: return
     st.divider(); st.markdown("#### ⚾ Batter Fantasy — Best Cleared Plays")
     cols=[c for c in ["Rank","Player","Team","Line","Projection","Model Direction","Model Win Probability %","Confidence","Play Status","Official Status","Pick","Skill","Match","Form","Contact","Edge","Flags"] if c in d.columns]
-    st.dataframe(d.sort_values(["Win Probability %","Confidence"],ascending=False)[cols].head(12),use_container_width=True,hide_index=True)
+    st.dataframe(_ow_bfs_rank_full_board(d)[cols].head(12),use_container_width=True,hide_index=True)
 
 
 def render_v3_discord_poster_studio_tab():
@@ -41686,6 +41695,321 @@ def _ow_render_hrr_grading_results():
             st.caption("Deterministic HRR grading acceptance checks")
             st.dataframe(tests,use_container_width=True,hide_index=True)
 
+
+
+
+# ============================================================
+# CROSS-MARKET CONSENSUS + ALWAYS-BEST-FIRST RANKING
+# Added 2026-08-15 — additive only.
+#
+# Purpose:
+# - H+R+RBI and Batter Fantasy share game-environment context.
+# - They are expected to correlate directionally, but their projections/scoring
+#   remain independent because Fantasy also rewards BB/HBP/XBH/SB.
+# - Strong disagreements are flagged and de-prioritized; no projection or side
+#   is forcibly overwritten.
+# - Every affected board receives Best Play Score and Rank #1 -> N.
+# - Batter Fantasy grading functions are intentionally untouched.
+# ============================================================
+OW_BATTER_CROSSMARKET_VERSION = "OW_BATTER_CROSSMARKET_V1_2026_08_15"
+
+
+def _ow_cross_num(v, default=None):
+    try:
+        n = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+        if pd.isna(n):
+            return default
+        return float(n)
+    except Exception:
+        return default
+
+
+def _ow_cross_norm_player(v):
+    try:
+        return _v3_final_norm_player(v)
+    except Exception:
+        return _v3_norm_name(v)
+
+
+def _ow_cross_hrr_side(row):
+    txt = str((row or {}).get("Pick") or (row or {}).get("HRR Pick") or (row or {}).get("Best Pick") or "").upper()
+    if "UNDER" in txt or "LOWER" in txt:
+        return "UNDER"
+    if "OVER" in txt or "HIGHER" in txt:
+        return "OVER"
+    return ""
+
+
+def _ow_cross_bfs_side(row):
+    txt = str((row or {}).get("Model Direction") or (row or {}).get("Model Side") or (row or {}).get("Pick") or "").upper()
+    if "LOWER" in txt or "UNDER" in txt:
+        return "LOWER"
+    if "HIGHER" in txt or "OVER" in txt:
+        return "HIGHER"
+    return ""
+
+
+def _ow_cross_agreement(hrr_side, bfs_side):
+    h = str(hrr_side or "").upper()
+    b = str(bfs_side or "").upper()
+    if not h or not b:
+        return "NO FANTASY BOARD"
+    same = (h == "OVER" and b == "HIGHER") or (h == "UNDER" and b == "LOWER")
+    return "AGREE" if same else "DISAGREE"
+
+
+def _ow_cross_consensus_score(label):
+    t = str(label or "").upper()
+    if t == "AGREE":
+        return 100.0
+    if t == "DISAGREE":
+        return 0.0
+    return 50.0
+
+
+def _ow_side_environment_fit(row, side=None):
+    """Side-aware environment quality. High offense helps OVER/HIGHER; suppression helps UNDER/LOWER."""
+    r = row or {}
+    hs = _ow_cross_num(r.get("High Scoring Game Score"), 50.0)
+    team = _ow_cross_num(r.get("Team Offensive Score"), 50.0)
+    suppress = _ow_cross_num(r.get("Team Run Suppression Risk"), 50.0)
+    pen = _ow_cross_num(r.get("Opponent Bullpen Fatigue"), 50.0)
+    pa_risk = _ow_cross_num(r.get("PA Risk Score"), 50.0)
+    s = str(side or _ow_cross_hrr_side(r) or _ow_cross_bfs_side(r)).upper()
+    higher = s in {"OVER", "HIGHER"}
+    if higher:
+        fit = 0.34*hs + 0.31*team + 0.15*(100.0-suppress) + 0.12*pen + 0.08*(100.0-pa_risk)
+    else:
+        fit = 0.34*(100.0-hs) + 0.31*(100.0-team) + 0.15*suppress + 0.12*(100.0-pen) + 0.08*(100.0-pa_risk)
+    return round(float(clamp(fit, 0.0, 100.0)), 1)
+
+
+def _ow_current_bfs_map():
+    df = st.session_state.get("ow_bfs_df") if "st" in globals() else None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    out = {}
+    for _, rr in df.iterrows():
+        d = rr.to_dict(); key = _ow_cross_norm_player(d.get("Player"))
+        if key and key not in out:
+            out[key] = d
+    return out
+
+
+def _ow_current_hrr_map():
+    df = st.session_state.get("ow_hrr_live_df") if "st" in globals() else None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    out = {}
+    for _, rr in df.iterrows():
+        d = rr.to_dict(); key = _ow_cross_norm_player(d.get("Player"))
+        if key and key not in out:
+            out[key] = d
+    return out
+
+
+def _ow_attach_bfs_consensus_to_hrr(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    bfs_map = _ow_current_bfs_map()
+    rows = []
+    for _, rr in df.iterrows():
+        r = rr.to_dict(); bfs = bfs_map.get(_ow_cross_norm_player(r.get("Player")), {})
+        hside = _ow_cross_hrr_side(r); bside = _ow_cross_bfs_side(bfs)
+        agreement = _ow_cross_agreement(hside, bside)
+        r.update({
+            "Fantasy Cross Direction": bside or "—",
+            "Fantasy Cross Projection": bfs.get("Projection", "—") if bfs else "—",
+            "Fantasy Cross Line": bfs.get("Line", "—") if bfs else "—",
+            "Fantasy Cross Win Probability %": bfs.get("Model Win Probability %", bfs.get("Win Probability %", "—")) if bfs else "—",
+            "Cross-Market Agreement": agreement,
+            "Cross-Market Consensus Score": _ow_cross_consensus_score(agreement),
+            "Cross-Market Version": OW_BATTER_CROSSMARKET_VERSION,
+        })
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _ow_rank_hrr_best_first(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = _ow_attach_bfs_consensus_to_hrr(df.copy())
+    scores=[]
+    for _, rr in d.iterrows():
+        r=rr.to_dict(); side=_ow_cross_hrr_side(r)
+        win=_ow_cross_num(r.get("Win Probability %"), None)
+        if win is None:
+            over=_ow_cross_num(r.get("Over Probability %"), 50.0)
+            win = over if side == "OVER" else 100.0-over if side == "UNDER" else 50.0
+        sync=_ow_cross_num(r.get("Sync Score"), 50.0)
+        data=_ow_cross_num(r.get("Final Data Quality Score"), _ow_cross_num(r.get("Data Confidence"), 50.0))
+        edge=abs(_ow_cross_num(r.get("Edge"), 0.0) or 0.0)
+        edge_score=float(clamp(50.0 + edge*24.0, 0.0, 100.0))
+        envfit=_ow_side_environment_fit(r, side)
+        consensus=_ow_cross_consensus_score(r.get("Cross-Market Agreement"))
+        best=0.45*win + 0.15*sync + 0.10*data + 0.10*edge_score + 0.15*envfit + 0.05*consensus
+        if str(r.get("Cross-Market Agreement")).upper() == "DISAGREE" and win >= 58:
+            best -= 4.0
+        if str(r.get("Environment Model Agreement")).upper() == "DISAGREE":
+            best -= 3.0
+        scores.append(round(float(clamp(best,0,100)),1))
+    d["Side Environment Fit"] = [_ow_side_environment_fit(r.to_dict(), _ow_cross_hrr_side(r.to_dict())) for _,r in d.iterrows()]
+    d["Best Play Score"] = scores
+    _sort_cols=[c for c in ["Best Play Score","Win Probability %","Final Data Quality Score","Data Confidence"] if c in d.columns]
+    if _sort_cols:
+        d = d.sort_values(_sort_cols, ascending=[False]*len(_sort_cols), kind="mergesort", na_position="last").reset_index(drop=True)
+    else:
+        d = d.reset_index(drop=True)
+    d["Rank"] = np.arange(1, len(d)+1, dtype=int)
+    front=["Rank","Best Play Score","Player","Team","Opponent","Projection","Line","Pick","Win Probability %","High Scoring Game Score","Blowout Score","Team Offensive Score","Cross-Market Agreement"]
+    return d[[c for c in front if c in d.columns] + [c for c in d.columns if c not in front]]
+
+
+# Wrap HRR board: production projection stays untouched, only context/ranking is added.
+_build_v3_batter_research_table_before_crossmarket = build_v3_batter_research_table
+
+def build_v3_batter_research_table(market="HRR"):
+    df, meta = _build_v3_batter_research_table_before_crossmarket(market)
+    if str(market).upper() != "FS" and isinstance(df, pd.DataFrame) and not df.empty:
+        df = _ow_rank_hrr_best_first(df)
+        try:
+            st.session_state["ow_hrr_live_df"] = df.copy()
+        except Exception:
+            pass
+        meta = dict(meta or {})
+        meta.update({"best_first_ranked": True, "cross_market_version": OW_BATTER_CROSSMARKET_VERSION})
+    return df, meta
+
+
+# Batter Fantasy: preserve all scoring/projection/grading. Add HRR context and best-first rank only.
+_ow_bfs_rank_full_board_before_crossmarket = _ow_bfs_rank_full_board
+
+def _ow_bfs_rank_full_board(df):
+    base = _ow_bfs_rank_full_board_before_crossmarket(df)
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    hrr_map = _ow_current_hrr_map()
+    rows=[]
+    for _, rr in base.iterrows():
+        r=rr.to_dict(); hrr=hrr_map.get(_ow_cross_norm_player(r.get("Player")), {})
+        hside=_ow_cross_hrr_side(hrr); bside=_ow_cross_bfs_side(r)
+        agreement=_ow_cross_agreement(hside,bside)
+        for field in [
+            "High Scoring Game Score","High Scoring Game Label","Blowout Score","Blowout Score Label",
+            "Team Offensive Score","Expected Team Runs V2","Expected Game Runs V2","Team Run Suppression Risk",
+            "Opponent Bullpen Fatigue","Opponent Bullpen Fatigue Label","Series Game Number","Series Momentum Score",
+            "Expected PA V2","PA Risk Score","PA Risk Label","Environment Model Agreement"
+        ]:
+            if hrr and hrr.get(field) not in (None, ""):
+                r[field]=hrr.get(field)
+        r.update({
+            "HRR Cross Pick": hside or "—",
+            "HRR Cross Projection": hrr.get("Projection", "—") if hrr else "—",
+            "HRR Cross Line": hrr.get("Line", "—") if hrr else "—",
+            "HRR Cross Win Probability %": hrr.get("Win Probability %", "—") if hrr else "—",
+            "Cross-Market Agreement": agreement,
+            "Cross-Market Consensus Score": _ow_cross_consensus_score(agreement),
+            "Cross-Market Version": OW_BATTER_CROSSMARKET_VERSION,
+        })
+        envfit=_ow_side_environment_fit(r,bside)
+        win=_ow_cross_num(r.get("Model Win Probability %"),50.0)
+        conf=_ow_cross_num(r.get("Confidence"),50.0)
+        data=_ow_cross_num(r.get("Data Score"),50.0)
+        contact=_ow_cross_num(r.get("Contact"),50.0)
+        match=_ow_cross_num(r.get("Match"),50.0)
+        consensus=_ow_cross_consensus_score(agreement)
+        best=0.50*win + 0.14*conf + 0.09*data + 0.07*contact + 0.05*match + 0.10*envfit + 0.05*consensus
+        hrr_win=_ow_cross_num(r.get("HRR Cross Win Probability %"),0.0)
+        strong_conflict = agreement == "DISAGREE" and win >= 58.0 and hrr_win >= 58.0
+        if strong_conflict:
+            best -= 10.0
+            r["Cross-Market Guardrail"]="STRONG CONFLICT — NOT OFFICIAL"
+            # Do not force either projection to change. Keep the full-board direction visible,
+            # but prevent a strong HRR/Fantasy contradiction from being promoted as an official play.
+            r["Official Status"]="NOT QUALIFIED"
+            if str(r.get("Play Status") or "").upper() in {"ELITE","STRONG","QUALIFIED"}:
+                r["Play Status"]="CROSS-MARKET CONFLICT"
+        elif agreement == "DISAGREE":
+            best -= 3.0
+            r["Cross-Market Guardrail"]="CONFLICT — REVIEW"
+        elif agreement == "AGREE":
+            r["Cross-Market Guardrail"]="ALIGNED"
+        else:
+            r["Cross-Market Guardrail"]="NO HRR COMPARISON"
+        r["Side Environment Fit"] = envfit
+        r["Best Play Score"] = round(float(clamp(best,0,100)),1)
+        rows.append(r)
+    d=pd.DataFrame(rows)
+    _sort_cols=[c for c in ["Best Play Score","Model Win Probability %","Confidence","Data Score"] if c in d.columns]
+    if _sort_cols:
+        d=d.sort_values(_sort_cols,ascending=[False]*len(_sort_cols),kind="mergesort",na_position="last").reset_index(drop=True)
+    else:
+        d=d.reset_index(drop=True)
+    d["Rank"]=np.arange(1,len(d)+1,dtype=int)
+    front=["Rank","Best Play Score","Player","Model Direction","Model Win Probability %","Confidence","High Scoring Game Score","Team Offensive Score","Cross-Market Agreement","HRR Cross Pick"]
+    return d[[c for c in front if c in d.columns] + [c for c in d.columns if c not in front]]
+
+
+# Batter Upside: attach V2 environment + Fantasy consensus and sort #1 -> N by Best Play Score.
+_build_v3_batter_upside_board_before_crossmarket = build_v3_batter_upside_board_final
+
+def build_v3_batter_upside_board_final():
+    df = _build_v3_batter_upside_board_before_crossmarket()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    hrr_map=_ow_current_hrr_map(); bfs_map=_ow_current_bfs_map(); rows=[]
+    for _,rr in df.iterrows():
+        r=rr.to_dict(); key=_ow_cross_norm_player(r.get("Player")); hrr=hrr_map.get(key,{}); bfs=bfs_map.get(key,{})
+        for field in [
+            "High Scoring Game Score","High Scoring Game Label","Blowout Score","Blowout Score Label","Team Offensive Score",
+            "Expected Team Runs V2","Expected Game Runs V2","Team Run Suppression Risk","Opponent Bullpen Fatigue","Opponent Bullpen Fatigue Label",
+            "Series Game Number","Series Momentum Score","Expected PA V2","PA Risk Score","PA Risk Label","Environment Model Agreement"
+        ]:
+            if hrr and hrr.get(field) not in (None, ""):
+                r[field]=hrr.get(field)
+        hside=_ow_cross_hrr_side(hrr or r); bside=_ow_cross_bfs_side(bfs); agreement=_ow_cross_agreement(hside,bside)
+        r["Cross-Market Agreement"]=agreement
+        r["Fantasy Cross Direction"]=bside or "—"
+        r["Fantasy Cross Win Probability %"]=bfs.get("Model Win Probability %", "—") if bfs else "—"
+        best_side = str(r.get("Best Pick") or r.get("HRR Pick") or "OVER").upper()
+        envfit=_ow_side_environment_fit(r,best_side)
+        likely=_ow_cross_num(r.get("Likely Score"),50.0); upside=_ow_cross_num(r.get("Upside Score"),50.0); bestprob=_ow_cross_num(r.get("Best Win/Hit %"),50.0)
+        consensus=_ow_cross_consensus_score(agreement)
+        best=0.48*likely + 0.17*upside + 0.15*bestprob + 0.15*envfit + 0.05*consensus
+        if agreement == "DISAGREE": best -= 3.0
+        r["Side Environment Fit"]=envfit
+        r["Best Play Score"]=round(float(clamp(best,0,100)),1)
+        rows.append(r)
+    d=pd.DataFrame(rows)
+    _sort_cols=[c for c in ["Best Play Score","Likely Score","Upside Score","Best Hit Rate %"] if c in d.columns]
+    if _sort_cols:
+        d=d.sort_values(_sort_cols,ascending=[False]*len(_sort_cols),kind="mergesort",na_position="last").reset_index(drop=True)
+    else:
+        d=d.reset_index(drop=True)
+    d["Rank"]=np.arange(1,len(d)+1,dtype=int)
+    front=["Rank","Best Play Score","Player","Team","Opponent","Best Market","Best Pick","Best Line","Best Projection","Best Win/Hit %","Likely Score","High Scoring Game Score","Blowout Score","Team Offensive Score","Cross-Market Agreement"]
+    return d[[c for c in front if c in d.columns] + [c for c in d.columns if c not in front]]
+
+
+# Batter Fantasy cards: surface the shared game environment and HRR agreement cleanly.
+_ow_bfs_card_html_before_crossmarket = _ow_bfs_card_html
+
+def _ow_bfs_card_html(row):
+    r=dict(row or {})
+    body=_ow_bfs_card_html_before_crossmarket(r)
+    hs=r.get("High Scoring Game Score","—"); bo=r.get("Blowout Score","—"); team=r.get("Team Offensive Score","—")
+    cross=r.get("Cross-Market Agreement","—"); hrr_pick=r.get("HRR Cross Pick","—"); best=r.get("Best Play Score","—")
+    if all(str(x) in {"—","None","nan",""} for x in [hs,bo,team,cross,best]):
+        return body
+    cross_color="#52e3a4" if str(cross).upper()=="AGREE" else "#ff6683" if str(cross).upper()=="DISAGREE" else "#f2c94c"
+    snippet=(
+        "<div style='margin:8px 0 2px;padding:7px 8px;border:1px solid rgba(242,201,76,.28);border-radius:8px;"
+        "font-size:9px;color:#b8afc0;line-height:1.35'>"
+        f"GAME ENV <b>{html.escape(str(hs))}/100</b> / BLOWOUT <b>{html.escape(str(bo))}/100</b> / TEAM <b>{html.escape(str(team))}/100</b> / "
+        f"BEST <b>{html.escape(str(best))}</b> / HRR <b>{html.escape(str(hrr_pick))}</b> / "
+        f"<b style='color:{cross_color}'>CROSS {html.escape(str(cross))}</b></div>"
+    )
+    return body.replace("<div class=\"ow-bfs-flags\">", snippet + "<div class=\"ow-bfs-flags\">", 1)
 
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
