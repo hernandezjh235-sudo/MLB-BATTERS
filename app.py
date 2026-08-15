@@ -11388,7 +11388,40 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         .ow-tile-label{font-size:9px;color:#8f98ad;font-weight:700}
         .ow-tile-val{font-size:13px;color:#f8f8ff;font-weight:800;margin-top:4px;word-break:break-word}
         .ow-card-mini{font-size:10px;color:#8f98ad;margin:8px 2px 0;line-height:1.25}
+
+        /* Dedicated H+R+RBI cards: Fantasy-card visual language, same compact footprint. */
+        .ow-hrr-card{position:relative;background:linear-gradient(145deg,rgba(105,16,170,.22) 0%,#07070d 28%,#0b0911 72%,rgba(196,139,15,.13) 100%);border:1px solid rgba(235,183,45,.72);border-radius:8px;padding:15px 16px;box-shadow:inset 0 1px 0 rgba(229,35,255,.36),0 8px 23px rgba(0,0,0,.40),0 0 16px rgba(131,26,202,.10);color:#f7f5fb;min-width:0;overflow:hidden}
+        .ow-hrr-card:before{content:"";position:absolute;left:13px;right:13px;top:0;height:2px;background:linear-gradient(90deg,#d51cff,#ffcf36,#7f20df);opacity:.85}
+        .ow-hrr-rank{font-size:9px;font-weight:900;color:#f1c84c;letter-spacing:.45px;margin-bottom:7px}
+        .ow-hrr-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+        .ow-hrr-player{font-size:20px;font-weight:900;line-height:1.05;color:#fff;overflow-wrap:anywhere}
+        .ow-hrr-meta{font-size:11px;color:#c8c2d1;margin-top:5px;font-weight:700}
+        .ow-hrr-opp{font-size:10px;color:#9991a5;margin-top:3px}
+        .ow-hrr-proj{text-align:right;min-width:78px}
+        .ow-hrr-proj span{display:block;font-size:8px;color:#c8b15d;font-weight:900;letter-spacing:.7px}
+        .ow-hrr-proj strong{display:block;font-size:33px;line-height:1;color:#ffd34d;font-weight:900;margin-top:3px;text-shadow:0 0 12px rgba(255,194,42,.20)}
+        .ow-hrr-proj small{display:block;font-size:9px;color:#9f98aa;margin-top:2px}
+        .ow-hrr-pick-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:9px 0 7px}
+        .ow-hrr-badge{display:inline-block;border-radius:6px;padding:5px 9px;font-size:10px;font-weight:900;border:1px solid}
+        .ow-hrr-badge.over{color:#69efb3;border-color:#3a9d76;background:rgba(8,54,39,.78)}
+        .ow-hrr-badge.under{color:#ff7590;border-color:#a73f5d;background:rgba(63,12,28,.78)}
+        .ow-hrr-prob{font-size:11px;font-weight:900;color:#ececf3;white-space:nowrap}
+        .ow-hrr-status{display:flex;justify-content:space-between;gap:7px;flex-wrap:wrap;font-size:9px;color:#8c8a9a;margin-bottom:9px}
+        .ow-hrr-status b{color:#f0ca55}
+        .ow-hrr-components{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+        .ow-hrr-mini{background:rgba(10,8,17,.82);border:1px solid rgba(116,55,159,.38);border-radius:6px;text-align:center;padding:6px 3px}
+        .ow-hrr-mini strong{display:block;font-size:15px;color:#f5d15c;font-weight:900;line-height:1.05}
+        .ow-hrr-mini span{display:block;font-size:8px;color:#958d9f;font-weight:800;margin-top:2px}
+        .ow-hrr-env{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:7px}
+        .ow-hrr-env-item{border-top:1px solid rgba(255,255,255,.08);padding-top:6px;text-align:center}
+        .ow-hrr-env-item strong{display:block;font-size:11px;color:#e8e5ee;font-weight:900}
+        .ow-hrr-env-item span{display:block;font-size:7.5px;color:#817c89;font-weight:850;letter-spacing:.2px;margin-top:1px}
+        .ow-hrr-foot{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin-top:8px;font-size:9px;color:#858493;line-height:1.25}
+        .ow-hrr-foot .risk{margin-left:auto;font-weight:900}
+        .ow-hrr-grade{font-size:10px;font-weight:900;margin-top:3px}
+
         @media (min-width: 760px){.ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.ow-card-tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}
+        @media (max-width: 700px){.ow-hrr-card{padding:13px 14px}.ow-hrr-player{font-size:18px}.ow-hrr-proj strong{font-size:30px}.ow-hrr-components,.ow-hrr-env{gap:5px}}
         </style>
         """,
         unsafe_allow_html=True,
@@ -11447,6 +11480,57 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         edge_pct = clamp(abs(num(edge)) * 32, 0, 100)
         tier_color = pick_color(tier)
         risk_color = "#31f08a" if str(risk).lower() == "clean" else "#ff3f68"
+
+        # Keep Home Run / Official cards exactly as before. The dedicated HRR board
+        # gets the cleaner Batter-Fantasy-style card requested by the user.
+        dedicated_hrr_board = is_hrr_card and str(key or "").startswith("hrr_cards")
+        if dedicated_hrr_board:
+            proj_h = _ow_poster_value(row, "Projected Hits", default="—")
+            proj_r = _ow_poster_value(row, "Projected Runs", default="—")
+            proj_rbi = _ow_poster_value(row, "Projected RBI", default="—")
+            p_hand = _ow_poster_value(row, "Pitcher Hand", default="—")
+            pick_upper = str(pick or "").upper()
+            pick_class = "under" if "UNDER" in pick_upper or "LOWER" in pick_upper else "over"
+            pick_icon = "⬇" if pick_class == "under" else "🔥"
+            tier_text = str(tier or "RESEARCH").upper()
+            cross_text = str(cross_v2 or "—").upper()
+            grade_compact = ""
+            if grade_badge:
+                grade_compact = f'<div class="ow-hrr-grade" style="color:{grade_color}">{esc(grade_badge)}' + (f' · {actual_grade:g} HRR' if actual_grade is not None else '') + '</div>'
+            cards.append(textwrap.dedent(f"""
+                <div class="ow-hrr-card">
+                  <div class="ow-hrr-rank">RANK #{i} · BEST PLAY {esc(best_play_score)}</div>
+                  <div class="ow-hrr-head">
+                    <div style="min-width:0">
+                      <div class="ow-hrr-player">{esc(player)}</div>
+                      <div class="ow-hrr-meta">{esc(team)} · vs {esc(opp)}</div>
+                      <div class="ow-hrr-opp">vs {esc(pitcher)} {esc(p_hand)}HP · ERA {esc(_ow_fmt_slate_num(p_era, 2))} · WHIP {esc(_ow_fmt_slate_num(p_whip, 2))} · BAA {esc(_ow_fmt_slate_num(p_baa, 3))}</div>
+                      {grade_compact}
+                    </div>
+                    <div class="ow-hrr-proj"><span>PROJECTED HRR</span><strong>{esc(_ow_fmt_slate_num(proj, 2))}</strong><small>EDGE {esc(_ow_fmt_slate_num(edge, 2))}</small></div>
+                  </div>
+                  <div class="ow-hrr-pick-row">
+                    <span class="ow-hrr-badge {pick_class}">{pick_icon} {esc(pick_upper)} {esc(_ow_fmt_slate_num(line, 1))}</span>
+                    <span class="ow-hrr-prob">WIN {esc(_ow_fmt_slate_num(prob, 1))}%</span>
+                  </div>
+                  <div class="ow-hrr-status"><b>{esc(tier_text)}</b><span>CROSS {esc(cross_text)}</span><span>DATA {esc(_ow_fmt_slate_num(data, 0))}/100</span></div>
+                  <div class="ow-hrr-components">
+                    <div class="ow-hrr-mini"><strong>{esc(_ow_fmt_slate_num(proj_h, 2))}</strong><span>PROJ H</span></div>
+                    <div class="ow-hrr-mini"><strong>{esc(_ow_fmt_slate_num(proj_r, 2))}</strong><span>PROJ R</span></div>
+                    <div class="ow-hrr-mini"><strong>{esc(_ow_fmt_slate_num(proj_rbi, 2))}</strong><span>PROJ RBI</span></div>
+                    <div class="ow-hrr-mini"><strong>{esc(_ow_fmt_slate_num(pa, 1))}</strong><span>PROJ PA</span></div>
+                  </div>
+                  <div class="ow-hrr-env">
+                    <div class="ow-hrr-env-item"><strong>{esc(hs_v2)}</strong><span>GAME ENV</span></div>
+                    <div class="ow-hrr-env-item"><strong>{esc(off_v2)}</strong><span>TEAM OFF</span></div>
+                    <div class="ow-hrr-env-item"><strong>{esc(bo_v2)}</strong><span>BLOWOUT</span></div>
+                    <div class="ow-hrr-env-item"><strong>{esc(bp_v2)}</strong><span>PEN FATIGUE</span></div>
+                  </div>
+                  <div class="ow-hrr-foot"><span>PA RISK {esc(pa_risk_v2)}</span><span>CONTACT {esc(contact_signal)} {esc(contact_score)}/100</span><span class="risk" style="color:{risk_color}">RISK {esc(risk)}</span></div>
+                </div>
+            """).strip())
+            continue
+
         cards.append(textwrap.dedent(f"""
             <div class="ow-player-card">
               <div class="ow-card-head">
@@ -35298,6 +35382,67 @@ def build_v3_batter_upside_board_final():
     return df[[c for c in cols if c in df.columns]]
 
 
+def _ow_render_hrr_selected_detail(row):
+    """Compact selected-player HRR detail card. Display-only; no projection/grading math changes."""
+    if not isinstance(row, dict):
+        return
+    esc = lambda v: html.escape(str(v if v not in (None, "", "nan", "None") else "—"))
+    def fmt(v, digits=2):
+        return esc(_ow_fmt_slate_num(v, digits))
+    pick = str(row.get("Pick") or "—").upper()
+    pick_color = "#69efb3" if "OVER" in pick or "HIGHER" in pick else "#ff7590"
+    grade = str(row.get("Result Badge") or "")
+    grade_result = str(row.get("graded_result") or "").upper()
+    if not grade and grade_result:
+        grade = {"WIN":"✅ CLEARED","LOSS":"❌ MISSED","PUSH":"➖ PUSH","VOID":"⚪ VOID","UNRESOLVED":"⚠️ UNRESOLVED"}.get(grade_result, "")
+    grade_color = "#31f08a" if grade_result == "WIN" else "#ff3f68" if grade_result == "LOSS" else "#f6c43c"
+    recent = " · ".join([
+        f"L5 {esc(row.get('Last 5','—'))}",
+        f"L10 {esc(row.get('Last 10','—'))}",
+        f"L15 {esc(row.get('Last 15','—'))}",
+        f"L30 {esc(row.get('Last 30','—'))}",
+    ])
+    grade_html = f'<span style="color:{grade_color};font-weight:900">{esc(grade)}</span>' if grade else '<span style="color:#817c89">PREGAME / UNGRADED</span>'
+    html_card = f"""
+    <style>
+    .ow-hrr-detail{{background:linear-gradient(145deg,rgba(105,16,170,.18),#08070d 34%,#0c0911 78%,rgba(196,139,15,.10));border:1px solid rgba(235,183,45,.58);border-radius:9px;padding:14px 15px;color:#f5f2f8}}
+    .ow-hrr-detail-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}}
+    .ow-hrr-detail-name{{font-size:21px;font-weight:900;color:#fff;line-height:1.05}}
+    .ow-hrr-detail-meta{{font-size:11px;color:#aaa2b4;margin-top:4px}}
+    .ow-hrr-detail-proj{{text-align:right}} .ow-hrr-detail-proj span{{display:block;font-size:8px;color:#c7ad56;font-weight:900}} .ow-hrr-detail-proj b{{font-size:31px;color:#ffd34d;line-height:1}}
+    .ow-hrr-detail-pick{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:9px 0;font-size:11px;font-weight:900}}
+    .ow-hrr-detail-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:7px}}
+    .ow-hrr-detail-box{{background:rgba(12,9,18,.76);border:1px solid rgba(124,61,165,.34);border-radius:6px;padding:7px 4px;text-align:center}}
+    .ow-hrr-detail-box b{{display:block;font-size:15px;color:#f3cf5b}} .ow-hrr-detail-box span{{display:block;font-size:8px;color:#8f889a;font-weight:800;margin-top:2px}}
+    .ow-hrr-detail-line{{font-size:9px;color:#8f889a;margin-top:9px;line-height:1.35}}
+    @media(max-width:700px){{.ow-hrr-detail{{padding:12px}}.ow-hrr-detail-name{{font-size:19px}}.ow-hrr-detail-proj b{{font-size:28px}}}}
+    </style>
+    <div class="ow-hrr-detail">
+      <div class="ow-hrr-detail-head">
+        <div><div class="ow-hrr-detail-name">{esc(row.get('Player'))}</div><div class="ow-hrr-detail-meta">{esc(row.get('Team'))} vs {esc(row.get('Opponent'))} · vs {esc(row.get('Opp Pitcher'))} {esc(row.get('Pitcher Hand'))}HP</div></div>
+        <div class="ow-hrr-detail-proj"><span>PROJECTED HRR</span><b>{fmt(row.get('Projection'),2)}</b></div>
+      </div>
+      <div class="ow-hrr-detail-pick"><span style="color:{pick_color}">{esc(pick)} {fmt(row.get('Line'),1)} · WIN {fmt(row.get('Win Probability %'),1)}%</span>{grade_html}</div>
+      <div class="ow-hrr-detail-grid">
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Projected Hits'),2)}</b><span>PROJ H</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Projected Runs'),2)}</b><span>PROJ R</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Projected RBI'),2)}</b><span>PROJ RBI</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Projected PA'),1)}</b><span>PROJ PA</span></div>
+      </div>
+      <div class="ow-hrr-detail-grid">
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('High Scoring Game Score'),0)}</b><span>GAME ENV</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Team Offensive Score'),0)}</b><span>TEAM OFF</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Blowout Score'),0)}</b><span>BLOWOUT</span></div>
+        <div class="ow-hrr-detail-box"><b>{fmt(row.get('Best Play Score'),1)}</b><span>BEST PLAY</span></div>
+      </div>
+      <div class="ow-hrr-detail-line">PITCHER · ERA {fmt(row.get('Pitcher ERA'),2)} · WHIP {fmt(row.get('Pitcher WHIP'),2)} · BAA {fmt(row.get('Pitcher BAA'),3)} · H/9 {fmt(row.get('Pitcher H/9'),2)} · K% {fmt(row.get('Pitcher K%'),1)}</div>
+      <div class="ow-hrr-detail-line">RECENT · {recent} · SAME-LINE {esc(row.get('Same-Line','—'))} · CROSS {esc(row.get('Cross-Market Agreement','—'))}</div>
+      <div class="ow-hrr-detail-line">{esc(row.get('Matchup Summary','—'))}</div>
+    </div>
+    """
+    st.markdown(html_card, unsafe_allow_html=True)
+
+
 def render_v3_batter_research_tab(market="HRR"):
     st.markdown('<div class="section-title-pro">🧪 H+R+RBI Research — Underdog Lines + Projections</div>', unsafe_allow_html=True)
     st.caption("Pulled Underdog H+R+RBI lines with MLB Stats API game-log projections, edge, pick, and hit-rate context.")
@@ -35361,15 +35506,7 @@ def render_v3_batter_research_tab(market="HRR"):
         selected = st.selectbox("Open H+R+RBI card", names, key=_v3_unique_widget_key("ow_final_hrr_card_select"))
         rr = df[df["Player"].astype(str) == selected].iloc[0].to_dict()
         with st.expander(f"{selected} — H+R+RBI Projection Card", expanded=True):
-            a, b, c, d, e = st.columns(5)
-            a.metric("Projection", rr.get("Projection", "—"))
-            b.metric("Line", rr.get("Line", "—"))
-            c.metric("Pick", rr.get("Pick", "—"))
-            d.metric("Edge", f"{_v3_safe_num(rr.get('Edge'), 0):+.2f}")
-            e.metric("Win Prob", f"{rr.get('Win Probability %', '—')}%")
-            st.caption(f"GAME ENV {rr.get('High Scoring Game Score','—')}/100 / BLOWOUT {rr.get('Blowout Score','—')}/100 / TEAM OFFENSE {rr.get('Team Offensive Score','—')}/100 / BEST PLAY {rr.get('Best Play Score','—')} / CROSS-MARKET {rr.get('Cross-Market Agreement','—')}")
-            st.info(rr.get("Matchup Summary", "—"))
-            st.write({"Projected Hits": rr.get("Projected Hits"), "Projected Runs": rr.get("Projected Runs"), "Projected RBI": rr.get("Projected RBI"), "Component Projection": rr.get("Component Projection"), "Moneyball": rr.get("Moneyball Note"), "Last 5": rr.get("Last 5"), "Last 10": rr.get("Last 10"), "Last 15": rr.get("Last 15"), "Last 30": rr.get("Last 30"), "Last 5 Avg": rr.get("Last 5 Avg"), "Last 10 Avg": rr.get("Last 10 Avg"), "Last 15 Avg": rr.get("Last 15 Avg"), "Last 30 Avg": rr.get("Last 30 Avg"), "Same-Line": rr.get("Same-Line"), "Recent Values": rr.get("Recent Values")})
+            _ow_render_hrr_selected_detail(rr)
 
 
 def render_v3_home_run_tab():
