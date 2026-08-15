@@ -8409,29 +8409,163 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     out.update(integrity)
     return out
 
-def save_many_once(new_picks):
+def _official_snapshot_json_safe(value):
+    """JSON-safe conversion for the official K snapshot writer only.
+
+    This is intentionally isolated from the app-wide save_json helper so existing
+    grading/learning persistence behavior elsewhere is not changed.
+    """
+    if isinstance(value, dict):
+        return {str(k): _official_snapshot_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_official_snapshot_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_official_snapshot_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return _official_snapshot_json_safe(value.item())
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
+def _official_snapshot_atomic_write(path, payload):
+    """Atomically write + verify official before-game snapshots.
+
+    The original save_json helper intentionally swallows errors. That is unsafe for
+    an explicit user-facing SAVE OFFICIAL action because the UI can say "Saved"
+    even when the file write failed. This writer reports the real outcome.
+    """
+    tmp_path = f"{path}.official_tmp"
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        safe_payload = _official_snapshot_json_safe(payload)
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(safe_payload, handle, indent=2, allow_nan=False)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+        with open(path, "r", encoding="utf-8") as handle:
+            check = json.load(handle)
+        if not isinstance(check, list):
+            return False, "Saved file verification failed: snapshot log is not a list."
+        return True, ""
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False, str(exc)
+
+
+def _official_snapshot_fallback_id(row):
+    """Stable fallback only when an old/context row is unexpectedly missing pick_id."""
+    r = row or {}
+    existing = r.get("pick_id")
+    if existing not in (None, ""):
+        return str(existing)
+    return "|".join([
+        str(r.get("date") or r.get("game_date") or ""),
+        str(r.get("game_pk") or ""),
+        str(r.get("pitcher_id") or r.get("player_id") or r.get("pitcher") or ""),
+        str(r.get("line") or ""),
+        str(r.get("line_source") or r.get("active_source") or r.get("source") or ""),
+    ])
+
+
+def save_many_once(new_picks, return_info=False):
+    """Save the official K board once, then verify every current row is on disk.
+
+    Backward-compatible: by default this still returns the integer number of newly
+    added rows. The SAVE button requests return_info=True to get verification data.
+    """
     picks = load_json(PICK_LOG, [])
-    ids = set([p.get("pick_id") for p in picks])
+    if not isinstance(picks, list):
+        picks = []
+    ids = {str(p.get("pick_id")) for p in picks if isinstance(p, dict) and p.get("pick_id") not in (None, "")}
+    target_ids = []
     added = 0
-    for p in new_picks:
-        if p.get("pick_id") not in ids:
-            official = dict(p)
-            official["official_snapshot_saved_at"] = now_iso()
-            official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
-            # Projection Drift Tracker: preserve the original saved projection and line.
-            official["opening_projection"] = official.get("opening_projection", official.get("projection"))
-            official["opening_line"] = official.get("opening_line", official.get("line"))
-            official["final_projection"] = official.get("projection")
-            official["final_line"] = official.get("line")
-            official["projection_drift"] = 0.0
-            official["projection_drift_label"] = projection_drift_label(official.get("opening_projection"), official.get("final_projection"))
-            official["official_quality_gate"] = "PASS" if official.get("data_score", 0) >= MIN_OFFICIAL_SAVE_SCORE else "LOW_DATA_REVIEW"
-            picks.append(official)
+    already_present = 0
+    for p0 in (new_picks or []):
+        if not isinstance(p0, dict):
+            continue
+        pid = _official_snapshot_fallback_id(p0)
+        target_ids.append(pid)
+        if pid in ids:
+            already_present += 1
+            continue
+        official = dict(p0)
+        official["pick_id"] = pid
+        official["official_snapshot_saved_at"] = now_iso()
+        official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
+        # Projection Drift Tracker: preserve the original saved projection and line.
+        official["opening_projection"] = official.get("opening_projection", official.get("projection"))
+        official["opening_line"] = official.get("opening_line", official.get("line"))
+        official["final_projection"] = official.get("projection")
+        official["final_line"] = official.get("line")
+        official["projection_drift"] = 0.0
+        official["projection_drift_label"] = projection_drift_label(official.get("opening_projection"), official.get("final_projection"))
+        official["official_quality_gate"] = "PASS" if safe_float(official.get("data_score"), 0) >= MIN_OFFICIAL_SAVE_SCORE else "LOW_DATA_REVIEW"
+        picks.append(official)
+        # Keep the existing long-backtest hook. A failure there must not prevent the
+        # official snapshot itself from being written and verified.
+        try:
             log_long_backtest_row(official)
-            ids.add(p.get("pick_id"))
-            added += 1
-    save_json(PICK_LOG, picks[-10000:])
-    return added
+        except Exception:
+            pass
+        ids.add(pid)
+        added += 1
+
+    payload = picks[-10000:]
+    write_ok, write_error = _official_snapshot_atomic_write(PICK_LOG, payload)
+    readback = load_json(PICK_LOG, []) if write_ok else []
+    readback_ids = {
+        str(r.get("pick_id")) for r in readback
+        if isinstance(r, dict) and r.get("pick_id") not in (None, "")
+    } if isinstance(readback, list) else set()
+    unique_targets = {x for x in target_ids if x}
+    saved_current = len(unique_targets & readback_ids)
+    missing_ids = sorted(unique_targets - readback_ids)
+    verified = bool(write_ok and (not unique_targets or not missing_ids))
+    info = {
+        "added": int(added if write_ok else 0),
+        "attempted_new": int(added),
+        "already_present": int(already_present),
+        "current_rows": int(len(unique_targets)),
+        "saved_current_rows": int(saved_current),
+        "verified": bool(verified),
+        "missing_count": int(len(missing_ids)),
+        "missing_ids": missing_ids[:10],
+        "path": PICK_LOG,
+        "storage_dir": STORAGE_DIR,
+        "error": "" if verified else (write_error or f"{len(missing_ids)} current snapshot row(s) missing after write verification."),
+        "saved_at": now_iso(),
+    }
+    return info if return_info else info["added"]
 
 
 # =========================
@@ -9190,6 +9324,8 @@ if "last_refresh_time" not in st.session_state:
     st.session_state.last_refresh_time = None
 if "last_saved_count" not in st.session_state:
     st.session_state.last_saved_count = 0
+if "last_official_save_info" not in st.session_state:
+    st.session_state.last_official_save_info = None
 
 col_refresh, col_save = st.columns(2)
 
@@ -9231,24 +9367,44 @@ if refresh_btn:
 
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
+    st.session_state.last_official_save_info = None
     st.success(f"Refreshed {len(projections)} context rows. Nothing officially saved yet.")
 
 if save_btn:
     if not st.session_state.get("loaded_picks"):
         st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
     else:
-        added = save_many_once(st.session_state.loaded_picks)
-        st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+        save_info = save_many_once(st.session_state.loaded_picks, return_info=True)
+        st.session_state.last_official_save_info = save_info
+        st.session_state.last_saved_count = int(save_info.get("added", 0) or 0)
+        if save_info.get("verified"):
+            st.success(
+                f"✅ OFFICIAL SNAPSHOT VERIFIED — {save_info.get('saved_current_rows', 0)}/{save_info.get('current_rows', 0)} "
+                f"current rows are stored. Added {save_info.get('added', 0)} new; {save_info.get('already_present', 0)} already existed."
+            )
+        else:
+            st.error(
+                "❌ OFFICIAL SNAPSHOT SAVE FAILED VERIFICATION — the app will NOT claim this board is saved. "
+                f"Stored {save_info.get('saved_current_rows', 0)}/{save_info.get('current_rows', 0)} current rows. "
+                f"Error: {save_info.get('error') or 'unknown write/verification error'}"
+            )
 
 saved = load_json(PICK_LOG, [])
+saved = saved if isinstance(saved, list) else []
 
 # IMPORTANT:
-# - If you have refreshed this session, the screen shows refreshed live board.
-# - If not, it shows saved official snapshots for the selected dates.
+# - If you have refreshed this session, verify the current board against the persisted log.
+# - If not, show the saved official snapshots for the selected dates.
 if st.session_state.get("loaded_picks"):
     board = st.session_state.loaded_picks
-    board_status = "LIVE REFRESHED BOARD — NOT OFFICIAL UNLESS SAVED"
+    current_ids = {_official_snapshot_fallback_id(p) for p in board if isinstance(p, dict)}
+    saved_ids = {str(p.get("pick_id")) for p in saved if isinstance(p, dict) and p.get("pick_id") not in (None, "")}
+    current_ids = {x for x in current_ids if x}
+    saved_now = len(current_ids & saved_ids)
+    if current_ids and current_ids.issubset(saved_ids):
+        board_status = f"LIVE REFRESHED BOARD — ✅ OFFICIAL SNAPSHOT SAVED + VERIFIED ({saved_now}/{len(current_ids)})"
+    else:
+        board_status = f"LIVE REFRESHED BOARD — ⚠️ NOT FULLY SAVED ({saved_now}/{len(current_ids)} verified)"
 else:
     board = [p for p in saved if p.get("date") in dates]
     board_status = "SAVED OFFICIAL SNAPSHOTS"
@@ -9259,6 +9415,15 @@ if only_strong:
     board = [p for p in board if p.get("signal_type") == "good"]
 
 st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
+_last_save_info = st.session_state.get("last_official_save_info")
+if isinstance(_last_save_info, dict):
+    if _last_save_info.get("verified"):
+        st.caption(
+            f"Official save verification: ✅ {_last_save_info.get('saved_current_rows',0)}/{_last_save_info.get('current_rows',0)} current rows on disk · "
+            f"storage: {_last_save_info.get('storage_dir')} · saved {_last_save_info.get('saved_at')}"
+        )
+    elif _last_save_info.get("error"):
+        st.error(f"Official save verification error: {_last_save_info.get('error')}")
 
 render_kpis(board, bankroll)
 
