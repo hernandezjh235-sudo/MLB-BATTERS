@@ -35575,11 +35575,21 @@ def render_v3_batter_research_tab(market="HRR"):
     s1, s2 = st.columns(2)
     if s1.button("Save H+R+RBI snapshot", key=_v3_unique_widget_key("ow_save_hrr_snapshot"), use_container_width=True):
         added = _ow_save_hrr_snapshots(df, source_label="H+R+RBI_BOARD")
-        st.success(f"Saved {added} new H+R+RBI snapshot rows.")
+        sinfo = st.session_state.get("ow_hrr_last_save_info", {})
+        if sinfo.get("error"):
+            st.error(f"HRR save problem: {sinfo.get('error')} Attempted {sinfo.get('attempted',0)}, eligible {sinfo.get('eligible',0)}, verified {sinfo.get('verified',0)}.")
+        else:
+            st.success(f"✅ HRR SNAPSHOT VERIFIED — {sinfo.get('verified',0)}/{sinfo.get('eligible',0)} current rows stored. Added {added} new rows.")
     if s2.button("✅ GRADE FINAL HRR GAMES", key=_v3_unique_widget_key("ow_grade_hrr_snapshot"), use_container_width=True):
         info = _ow_grade_hrr_snapshots()
         st.session_state["ow_hrr_last_grade_info"] = info
-        st.success(f"HRR graded {info.get('graded', 0)} rows — wins {info.get('wins', 0)}, losses {info.get('losses', 0)}, pushes {info.get('pushes', 0)}, voids {info.get('voids', 0)}. Waiting final: {info.get('waiting_final', 0)}; unresolved: {info.get('unresolved', 0)}.")
+        if info.get("saved_hrr_rows", 0) <= 0:
+            st.error("No saved pregame HRR snapshots were found. The grader will not recreate postgame picks. Save the untouched HRR board before first pitch, then grade after MLB marks games Final.")
+        elif info.get("save_error"):
+            st.error(f"HRR grading completed with persistence error: {info.get('save_error')}")
+        else:
+            st.success(f"MLB OFFICIAL HRR GRADER — graded {info.get('graded', 0)} rows: ✅ {info.get('wins', 0)} wins, ❌ {info.get('losses', 0)} losses, ➖ {info.get('pushes', 0)} pushes, ⚪ {info.get('voids', 0)} voids. Final games: {info.get('final_games_found',0)}; waiting: {info.get('waiting_final', 0)}; unresolved: {info.get('unresolved', 0)}.")
+    st.caption("HRR grading source: official MLB schedule/game status + official MLB game box scores. Actual HRR = Hits + Runs + RBI from the saved pregame line/side.")
     _ow_render_hrr_grading_results()
     cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Projection", "Pick", "Edge", "Over Probability %", "Win Probability %", "H+R+RBI CSV Prior", "Prior H+R+RBI Projection", "Prior H+R+RBI Probability %", "Confidence", "Shadow Play Label", "Shadow Eligible", "Shadow Filter Reason", "Shadow Confidence Bucket", "Shadow Rank Bucket", "Shadow Core Combo 8.5+ Edge .75+ Top60", "Shadow Confirmed Core Combo", "Shadow Low-Confidence OVER", "Shadow Context Confirmed", "Shadow Environment Support", "Shadow Environment Fit", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Required Data Score", "Required Data Missing", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Projected AB", "Projected Hits", "Projected Runs", "Projected RBI", "Component Projection", "Component AVG", "Component OBP", "Component SLG", "Component BB%", "Component HR%", "PA Sim Passes", "PA Sim H+R+RBI Mean", "PA Sim H+R+RBI Median", "PA Sim H+R+RBI P75", "PA Sim H+R+RBI P90", "PA Sim HRR Over %", "PA Sim HRR Under %", "PA Sim Hit/G", "PA Sim HR/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "HR Score", "HR Score Label", "HR Likelihood Rank", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Team RPG", "Team Context Multiplier", "Moneyball OBP Edge", "Runs Created", "Runs Created/PA", "Pythagorean Win% Proxy", "Moneyball Factor", "Moneyball Note", "Season PA", "Season AB", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AB", "Split AVG", "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Savant Hitter Found", "Savant xwOBA", "Savant xBA", "Savant xSLG", "Savant xOBP", "Savant wOBA", "Savant K%", "Savant BB%", "Savant Whiff%", "Savant Chase%", "Savant HardHit%", "Savant Barrel%", "Savant Avg EV", "Savant Factor HRR", "Savant Note", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Required Data Loaded", "Required Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher Allowed xwOBA", "Pitcher Allowed xBA", "Pitcher Allowed xSLG", "Pitcher Allowed HardHit%", "Pitcher Allowed Barrel%", "Pitcher Allowed Avg EV", "Pitcher Allowed BBE", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Team Run Environment", "Run Factor", "Blowout Environment Factor", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HRR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Bullpen Weakness Label", "Bullpen Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg", "H2H", "H2H Games", "H2H Avg", "H2H Median", "Same-Line", "Best Hit Rate %", "Sync Score", "Official Play Filter"] if c in df.columns]
     for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note"]:
@@ -41509,8 +41519,10 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
 # Repairs H+R+RBI saving/grading/persistence only. Batter Fantasy grading is untouched.
 # Production HRR projection math is also untouched; environment additions below are audit/shadow only.
 
-OW_HRR_GRADING_VERSION = "HRR_GRADING_V2_2026_08_14"
+OW_HRR_GRADING_VERSION = "HRR_GRADING_V3_MLB_OFFICIAL_2026_08_16"
 OW_HRR_GRADE_LOG = os.path.join(STORAGE_DIR, "ow_hrr_grade_log.json")
+OW_HRR_SNAPSHOT_LOG = os.path.join(STORAGE_DIR, "ow_hrr_snapshot_log.json")
+OW_HRR_OFFICIAL_RESULTS_VERSION = "MLB_OFFICIAL_BOXSCORE_V1_2026_08_16"
 
 
 def _ow_hrr_is_market(row):
@@ -41563,17 +41575,74 @@ def _ow_hrr_saved_date(row):
         return datetime.now().strftime("%Y-%m-%d")
 
 
-def _ow_hrr_resolve_game_pk(row):
-    """Recover a missing gamePk from the immutable saved slate date, not from the current date."""
+def _ow_hrr_uncached_get_json(url, params=None, timeout=12):
+    """Fresh request used only by HRR grading so a cached Live/Preview response cannot block a final grade."""
+    try:
+        if "_ow_bfs_uncached_get_json" in globals():
+            data = _ow_bfs_uncached_get_json(url, params=params, timeout=timeout)
+            if data is not None:
+                return data
+    except Exception:
+        pass
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 MLB-HRR-Grader/1.0", "Accept": "application/json,text/plain,*/*"}
+        resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _ow_hrr_atomic_save(path, payload):
+    """Verified atomic JSON writer for HRR snapshots/results. Never silently reports a successful save."""
+    if "_ow_bfs_atomic_save_json" in globals():
+        return _ow_bfs_atomic_save_json(path, payload)
+    tmp = str(path) + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        safe_payload = _ow_bfs_json_safe(payload) if "_ow_bfs_json_safe" in globals() else payload
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(safe_payload, handle, indent=2, allow_nan=False)
+        os.replace(tmp, path)
+        return True, ""
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, str(exc)
+
+
+def _ow_hrr_official_schedule(saved_date):
+    """Official MLB schedule/scoreboard for the exact saved slate date."""
+    if not saved_date:
+        return {}
+    return _ow_hrr_uncached_get_json(
+        f"{MLB_BASE}/schedule",
+        params={"sportId": 1, "date": str(saved_date)[:10], "hydrate": "team"},
+        timeout=15,
+    ) or {}
+
+
+def _ow_hrr_official_boxscore(game_pk):
+    """Official MLB box score containing every batter's final H/R/RBI for a game."""
+    if not game_pk:
+        return {}
+    return _ow_hrr_uncached_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=15) or {}
+
+def _ow_hrr_resolve_game_pk(row, force_lookup=False):
+    """Recover gamePk from the immutable saved slate date + saved teams using MLB's official schedule."""
     existing = (row or {}).get("Game PK")
-    if existing not in (None, "", 0, "0"):
+    if not force_lookup and existing not in (None, "", 0, "0"):
         return existing
     team = _ow_team_abbr((row or {}).get("Team"))
     opp = _ow_team_abbr((row or {}).get("Opponent"))
     if not team or team == "—":
         return None
     try:
-        sched = get_schedule(_ow_hrr_saved_date(row)) or {}
+        sched = _ow_hrr_official_schedule(_ow_hrr_saved_date(row)) or {}
         for d0 in sched.get("dates", []) or []:
             for g in d0.get("games", []) or []:
                 teams = g.get("teams", {}) or {}
@@ -41591,7 +41660,6 @@ def _ow_hrr_resolve_game_pk(row):
         pass
     return None
 
-
 def _ow_hrr_resolve_player_id(row):
     existing = (row or {}).get("Player ID")
     if existing not in (None, "", 0, "0"):
@@ -41603,13 +41671,13 @@ def _ow_hrr_resolve_player_id(row):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _ow_hrr_game_status_context(game_pk):
-    """Return a conservative MLB game state so live/postponed games are never graded as losses."""
-    out = {"state": "UNKNOWN", "abstract": "", "detailed": "", "is_final": False}
+def _ow_hrr_game_status_context(game_pk, saved_date=None):
+    """Resolve final state from fresh MLB official endpoints; never grade a live/preview game as a loss."""
+    out = {"state": "UNKNOWN", "abstract": "", "detailed": "", "is_final": False, "source": ""}
     if not game_pk:
         return out
     try:
-        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=10) or {}
+        live = _ow_hrr_uncached_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12) or {}
         status = ((live.get("gameData") or {}).get("status") or {})
         abstract = str(status.get("abstractGameState") or "").strip()
         detailed = str(status.get("detailedState") or "").strip()
@@ -41620,26 +41688,40 @@ def _ow_hrr_game_status_context(game_pk):
             state = "POSTPONED"
         elif "cancel" in low:
             state = "CANCELLED"
-        elif "suspend" in low or "delay" in low:
+        elif "suspend" in low:
             state = "SUSPENDED"
+        elif "delay" in low:
+            state = "DELAYED"
         elif "live" in abstract.lower() or "in progress" in low or "warmup" in low:
             state = "LIVE"
         elif "preview" in abstract.lower() or "scheduled" in low or "pre-game" in low:
             state = "PREGAME"
         else:
             state = abstract.upper() or "UNKNOWN"
-        out.update({"state": state, "abstract": abstract, "detailed": detailed, "is_final": state == "FINAL"})
-        return out
+        out.update({"state": state, "abstract": abstract, "detailed": detailed, "is_final": state == "FINAL", "source": "MLB_LIVE"})
+        if out["is_final"] or state not in {"UNKNOWN", ""}:
+            return out
     except Exception:
-        try:
-            final = bool(is_game_final(game_pk))
-            out.update({"state": "FINAL" if final else "UNKNOWN", "is_final": final})
-        except Exception:
-            pass
-        return out
+        pass
+    # Scoreboard fallback for the saved slate date.
+    try:
+        sched = _ow_hrr_official_schedule(saved_date) if saved_date else {}
+        for d0 in sched.get("dates", []) or []:
+            for g in d0.get("games", []) or []:
+                if str(g.get("gamePk")) != str(game_pk):
+                    continue
+                stx = g.get("status") or {}
+                abstract = str(stx.get("abstractGameState") or "")
+                detailed = str(stx.get("detailedState") or "")
+                low = (abstract + " " + detailed).lower()
+                final = "final" in low or "game over" in low or "completed early" in low
+                state = "FINAL" if final else "LIVE" if "live" in abstract.lower() or "in progress" in low else "PREGAME" if "preview" in abstract.lower() or "scheduled" in low else abstract.upper() or "UNKNOWN"
+                return {"state": state, "abstract": abstract, "detailed": detailed, "is_final": final, "source": "MLB_SCHEDULE"}
+    except Exception:
+        pass
+    return out
 
-
-def _ow_hrr_boxscore_context(game_pk, player_id=None, player_name=None, team=None):
+def _ow_hrr_boxscore_context(game_pk, player_id=None, player_name=None, team=None, prefetched_box=None):
     """Official H/R/RBI + starter/PA context with controlled player matching.
 
     Match order: saved MLB player id -> exact normalized name within saved team -> unique high-confidence alias match.
@@ -41647,7 +41729,7 @@ def _ow_hrr_boxscore_context(game_pk, player_id=None, player_name=None, team=Non
     """
     if not game_pk:
         return None
-    box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=12)
+    box = prefetched_box if isinstance(prefetched_box, dict) and prefetched_box else _ow_hrr_official_boxscore(game_pk)
     if not isinstance(box, dict) or not box:
         return None
     teams = box.get("teams") or {}
@@ -41793,73 +41875,108 @@ def _ow_hrr_environment_shadow_fields(row):
 
 
 def _ow_save_hrr_snapshots(df, source_label="H+R+RBI_BOARD"):
-    """Save immutable pregame HRR rows through the existing proven writer, then add HRR-only audit metadata.
+    """Save every untouched HRR row to a dedicated verified log and mirror it to the legacy batter log.
 
-    Existing snapshots are never backfilled with newly calculated environment data because doing so after games
-    could introduce postgame leakage. Only newly created snapshot keys receive V2 environment metadata.
+    This no longer depends on the generic batter saver. The dedicated file is the grading source of truth,
+    while the legacy mirror keeps existing Batter Learning compatibility intact.
     """
+    info = {"attempted": 0, "eligible": 0, "added": 0, "verified": 0, "skipped": 0, "error": "", "path": OW_HRR_SNAPSHOT_LOG}
     if not isinstance(df, pd.DataFrame) or df.empty:
+        info["error"] = "No HRR board rows were available to save."
+        st.session_state["ow_hrr_last_save_info"] = info
         return 0
-    before = load_json(OW_BATTER_PICK_LOG, [])
-    before = before if isinstance(before, list) else []
-    before_keys = {_ow_hrr_snapshot_key(r) for r in before if isinstance(r, dict) and _ow_hrr_is_market(r)}
-    _ow_save_batter_snapshots(df, source_label=source_label)  # existing proven writer; Batter Fantasy behavior unchanged
-    picks = load_json(OW_BATTER_PICK_LOG, [])
-    picks = picks if isinstance(picks, list) else []
-    rank_map = {}
-    env_map = {}
-    for idx, (_, rr) in enumerate(df.iterrows(), start=1):
-        row = rr.to_dict()
-        nm = _v3_norm_name(row.get("Player") or row.get("UD Player"))
-        rank_map[nm] = int(_v3_safe_num(row.get("Rank"), idx) or idx)
-        env_map[(nm, _v3_safe_num(row.get("Line"), None), _ow_hrr_side(row))] = row
-    changed = False
-    for p0 in picks:
-        if not isinstance(p0, dict) or not _ow_hrr_is_market(p0) or str(p0.get("snapshot_source") or "") != str(source_label):
-            continue
-        key = _ow_hrr_snapshot_key(p0)
-        nm = _v3_norm_name(p0.get("Player") or p0.get("UD Player"))
-        if p0.get("Pregame Rank") in (None, "") and nm in rank_map:
-            p0["Pregame Rank"] = rank_map[nm]; changed = True
-        if p0.get("HRR Snapshot Key") in (None, ""):
-            p0["HRR Snapshot Key"] = key; changed = True
-        if p0.get("HRR Grade Version") in (None, ""):
-            p0["HRR Grade Version"] = "PENDING"; changed = True
-        if p0.get("HRR Snapshot Locked") is not True:
-            p0["HRR Snapshot Locked"] = True; changed = True
-        if p0.get("Pregame Timestamp") in (None, ""):
-            p0["Pregame Timestamp"] = p0.get("official_snapshot_saved_at") or now_iso(); changed = True
-        # Preserve exact immutable decision fields explicitly for grading/audit clarity.
-        for dest, src in [
-            ("Saved Projection","Projection"),("Saved Line","Line"),("Saved Pick","Pick"),("Saved Pick Side","Pick Side"),
-            ("Saved Confidence","Confidence"),("Saved Official Status","Official Play Filter"),("Saved Model Version","Projection Version"),
-            ("Saved Lineup Slot","Lineup Slot"),("Saved Lineup Status","Lineup Status"),("Saved Opp Pitcher","Opp Pitcher"),("Saved Pitcher Hand","Pitcher Hand")
-        ]:
-            if p0.get(dest) in (None, "") and p0.get(src) not in (None, ""):
-                p0[dest] = p0.get(src); changed = True
-        # Only brand-new rows get shadow-selection/environment fields. This prevents retrospective feature leakage.
-        if key not in before_keys:
-            src_row = env_map.get((nm, _v3_safe_num(p0.get("Line"), None), _ow_hrr_side(p0)), p0)
-            for k in [
-                "Shadow Filter Version", "Shadow Filter Mode", "Shadow Play Tier", "Shadow Play Label", "Shadow Eligible",
-                "Shadow Filter Reason", "Shadow Confidence Bucket", "Shadow Rank Bucket",
-                "Shadow Core Combo 8.5+ Edge .75+ Top60", "Shadow Confirmed Core Combo",
-                "Shadow Low-Confidence OVER", "Shadow Context Confirmed", "Shadow Environment Support", "Shadow Environment Fit",
-                "Best Play Score", "Side Environment Fit", "Cross-Market Agreement", "Cross-Market Consensus Score"
-            ]:
-                if src_row.get(k) not in (None, "") and p0.get(k) in (None, ""):
-                    p0[k] = src_row.get(k); changed = True
-            for k, v in _ow_hrr_environment_shadow_fields(src_row).items():
-                if k not in p0 or p0.get(k) in (None, ""):
-                    p0[k] = v; changed = True
-    if changed:
-        if "_ow_bfs_atomic_save_json" in globals():
-            _ow_bfs_atomic_save_json(OW_BATTER_PICK_LOG, picks[-20000:])
-        else:
-            save_json(OW_BATTER_PICK_LOG, picks[-20000:])
-    after_keys = {_ow_hrr_snapshot_key(r) for r in picks if isinstance(r, dict) and _ow_hrr_is_market(r)}
-    return max(0, len(after_keys - before_keys))
 
+    dedicated = load_json(OW_HRR_SNAPSHOT_LOG, [])
+    dedicated = dedicated if isinstance(dedicated, list) else []
+    legacy = load_json(OW_BATTER_PICK_LOG, [])
+    legacy = legacy if isinstance(legacy, list) else []
+    d_index = {_ow_hrr_snapshot_key(r): i for i, r in enumerate(dedicated) if isinstance(r, dict)}
+    l_keys = {_ow_hrr_snapshot_key(r) for r in legacy if isinstance(r, dict) and _ow_hrr_is_market(r)}
+    snap_date = california_now().strftime("%Y-%m-%d") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d")
+    now_stamp = now_iso()
+    expected_keys = set()
+
+    for idx, (_, rr) in enumerate(df.iterrows(), start=1):
+        info["attempted"] += 1
+        row = rr.to_dict()
+        market = str(row.get("Market") or row.get("Best Market") or "H+R+RBI")
+        if not _ow_hrr_is_market({**row, "Market": market}):
+            market = "H+R+RBI"
+        line = _v3_safe_num(row.get("Line") if row.get("Line") not in (None, "") else row.get("Best Line"), None)
+        side = _ow_hrr_side(row)
+        if side not in {"OVER", "UNDER"} and line is not None:
+            proj = _v3_safe_num(row.get("Projection") if row.get("Projection") not in (None, "") else row.get("Best Projection"), None)
+            if proj is not None and float(proj) != float(line):
+                side = "OVER" if float(proj) > float(line) else "UNDER"
+                row["Saved Side Source"] = "INFERRED_FROM_SAVED_PROJECTION"
+        if line is None or side not in {"OVER", "UNDER"}:
+            info["skipped"] += 1
+            continue
+        info["eligible"] += 1
+        player = row.get("Player") or row.get("UD Player")
+        player_id = row.get("Player ID") or _mlb_search_player_id_by_name(player)
+        game_pk = row.get("Game PK")
+        if not game_pk:
+            temp = {**row, "Snapshot Date": snap_date}
+            game_pk = _ow_hrr_resolve_game_pk(temp, force_lookup=True)
+        snap = dict(row)
+        snap.update({
+            "Market": "H+R+RBI",
+            "Snapshot Date": snap_date,
+            "Pregame Timestamp": now_stamp,
+            "official_snapshot_saved_at": now_stamp,
+            "snapshot_type": "HRR_BEFORE_GAME",
+            "snapshot_source": source_label,
+            "Player ID": player_id,
+            "Game PK": game_pk,
+            "Line": float(line),
+            "Saved Line": float(line),
+            "Pick Side": side,
+            "Saved Pick Side": side,
+            "Saved Pick": row.get("Pick") or row.get("Best Pick") or side,
+            "Saved Projection": row.get("Projection") if row.get("Projection") not in (None, "") else row.get("Best Projection"),
+            "Saved Confidence": row.get("Confidence"),
+            "Saved Official Status": row.get("Official Play Filter"),
+            "Saved Model Version": row.get("Projection Version") or OW_FINAL_LINE_PROJECTION_VERSION,
+            "Pregame Rank": int(_v3_safe_num(row.get("Rank"), idx) or idx),
+            "HRR Snapshot Locked": True,
+            "HRR Grade Version": "PENDING",
+            "graded": False,
+            "graded_result": "",
+            "Grade Status": "SAVED / WAITING FINAL",
+            "Official Results Source": OW_HRR_OFFICIAL_RESULTS_VERSION,
+        })
+        # Preserve the current audit/shadow fields exactly as they existed pregame.
+        for k, v in _ow_hrr_environment_shadow_fields(row).items():
+            if snap.get(k) in (None, ""):
+                snap[k] = v
+        key = _ow_hrr_snapshot_key(snap)
+        expected_keys.add(key)
+        snap["HRR Snapshot Key"] = key
+        snap["pick_id"] = row.get("pick_id") or key
+        if key in d_index:
+            # Already saved is still a verified pregame row; mirror it to legacy if needed.
+            if key not in l_keys:
+                legacy.append(dict(dedicated[d_index[key]])); l_keys.add(key)
+            info["skipped"] += 1
+            continue
+        d_index[key] = len(dedicated)
+        dedicated.append(snap)
+        if key not in l_keys:
+            legacy.append(dict(snap)); l_keys.add(key)
+        info["added"] += 1
+
+    ok1, err1 = _ow_hrr_atomic_save(OW_HRR_SNAPSHOT_LOG, dedicated[-30000:])
+    ok2, err2 = _ow_hrr_atomic_save(OW_BATTER_PICK_LOG, legacy[-30000:])
+    check = load_json(OW_HRR_SNAPSHOT_LOG, []) if ok1 else []
+    check_keys = {_ow_hrr_snapshot_key(r) for r in check if isinstance(r, dict)} if isinstance(check, list) else set()
+    info["verified"] = sum(1 for k in expected_keys if k in check_keys)
+    if not ok1 or info["verified"] < len(expected_keys):
+        info["error"] = err1 or f"Dedicated HRR save verification failed ({info['verified']}/{len(expected_keys)} rows found after write)."
+    elif not ok2:
+        info["error"] = f"Dedicated HRR save verified, but legacy learning mirror failed: {err2}"
+    st.session_state["ow_hrr_last_save_info"] = info
+    return int(info["added"])
 
 def _ow_hrr_result_badge(result):
     return {
@@ -41895,12 +42012,23 @@ def _ow_hrr_grade_value(actual, line, side, started=True):
 
 def _ow_grade_hrr_snapshots(force_regrade=False):
     """Dedicated persistent HRR grader. Batter Fantasy grading is never called or mutated here."""
-    picks = load_json(OW_BATTER_PICK_LOG, [])
+    legacy_picks = load_json(OW_BATTER_PICK_LOG, [])
+    dedicated_picks = load_json(OW_HRR_SNAPSHOT_LOG, [])
     shared_results = load_json(OW_BATTER_RESULT_LOG, [])
     hrr_results = load_json(OW_HRR_GRADE_LOG, [])
-    picks = picks if isinstance(picks, list) else []
+    legacy_picks = legacy_picks if isinstance(legacy_picks, list) else []
+    dedicated_picks = dedicated_picks if isinstance(dedicated_picks, list) else []
     shared_results = shared_results if isinstance(shared_results, list) else []
     hrr_results = hrr_results if isinstance(hrr_results, list) else []
+    # Dedicated HRR snapshots are the source of truth. Merge any legacy HRR saves for backward compatibility.
+    picks = list(legacy_picks)
+    existing_hrr_keys = {_ow_hrr_snapshot_key(r) for r in picks if isinstance(r, dict) and _ow_hrr_is_market(r)}
+    for r in dedicated_picks:
+        if not isinstance(r, dict):
+            continue
+        k = _ow_hrr_snapshot_key(r)
+        if k not in existing_hrr_keys:
+            picks.append(dict(r)); existing_hrr_keys.add(k)
     hrr_index = {_ow_hrr_snapshot_key(r): i for i, r in enumerate(hrr_results) if isinstance(r, dict)}
     shared_index = {_ow_hrr_snapshot_key(r): i for i, r in enumerate(shared_results) if isinstance(r, dict) and _ow_hrr_is_market(r)}
 
@@ -41909,9 +42037,10 @@ def _ow_grade_hrr_snapshots(force_regrade=False):
         "waiting_final": 0, "postponed": 0, "cancelled": 0, "suspended": 0, "unresolved": 0,
         "recovered_game_ids": 0, "recovered_player_ids": 0, "results_written": 0, "results_updated": 0,
         "wins": 0, "losses": 0, "pushes": 0, "voids": 0,
+        "official_boxscores_fetched": 0, "official_scoreboards_fetched": 0,
     }
     reasons = []
-    status_cache, box_cache = {}, {}
+    status_cache, box_cache, official_game_box_cache = {}, {}, {}
     final_games = set()
 
     def persist_result(p, include_shared=True):
@@ -41945,8 +42074,10 @@ def _ow_grade_hrr_snapshots(force_regrade=False):
             continue
 
         if game_pk not in status_cache:
-            status_cache[game_pk] = _ow_hrr_game_status_context(game_pk)
+            status_cache[game_pk] = _ow_hrr_game_status_context(game_pk, _ow_hrr_saved_date(p))
         gs = status_cache.get(game_pk) or {}
+        if gs.get("source"):
+            counters["official_scoreboards_fetched"] += 1
         state = str(gs.get("state") or "UNKNOWN").upper()
         p["Game Grade State"] = state
         p["Game Detailed State"] = gs.get("detailed")
@@ -41965,9 +42096,29 @@ def _ow_grade_hrr_snapshots(force_regrade=False):
         if player_id and not p.get("Player ID"):
             p["Player ID"] = player_id; counters["recovered_player_ids"] += 1
         bkey = (str(game_pk), str(player_id or ""), _v3_norm_name(p.get("Player")), _ow_team_abbr(p.get("Team")))
+        if str(game_pk) not in official_game_box_cache:
+            official_game_box_cache[str(game_pk)] = _ow_hrr_official_boxscore(game_pk)
+            if official_game_box_cache[str(game_pk)]:
+                counters["official_boxscores_fetched"] += 1
         if bkey not in box_cache:
-            box_cache[bkey] = _ow_hrr_boxscore_context(game_pk, player_id, p.get("Player") or p.get("UD Player"), p.get("Team"))
+            box_cache[bkey] = _ow_hrr_boxscore_context(
+                game_pk, player_id, p.get("Player") or p.get("UD Player"), p.get("Team"),
+                prefetched_box=official_game_box_cache.get(str(game_pk))
+            )
         actual_ctx = box_cache.get(bkey)
+        # If a stale/wrong saved gamePk was attached, recover once from the official schedule and retry.
+        if (not actual_ctx or actual_ctx.get("Match Error")):
+            recovered_pk = _ow_hrr_resolve_game_pk(p, force_lookup=True)
+            if recovered_pk and str(recovered_pk) != str(game_pk):
+                game_pk = recovered_pk; p["Game PK"] = recovered_pk; counters["recovered_game_ids"] += 1
+                status_cache[game_pk] = _ow_hrr_game_status_context(game_pk, _ow_hrr_saved_date(p))
+                if status_cache[game_pk].get("is_final"):
+                    final_games.add(str(game_pk))
+                    official_game_box_cache[str(game_pk)] = _ow_hrr_official_boxscore(game_pk)
+                    if official_game_box_cache[str(game_pk)]: counters["official_boxscores_fetched"] += 1
+                    bkey = (str(game_pk), str(player_id or ""), _v3_norm_name(p.get("Player")), _ow_team_abbr(p.get("Team")))
+                    box_cache[bkey] = _ow_hrr_boxscore_context(game_pk, player_id, p.get("Player") or p.get("UD Player"), p.get("Team"), prefetched_box=official_game_box_cache.get(str(game_pk)))
+                    actual_ctx = box_cache.get(bkey)
         if not actual_ctx or actual_ctx.get("Match Error"):
             counters["unresolved"] += 1; counters["unmatched"] += 1
             reason = (actual_ctx or {}).get("Match Error") or "FINAL_STATS_NOT_MATCHED"
@@ -42026,23 +42177,24 @@ def _ow_grade_hrr_snapshots(force_regrade=False):
 
     # Persist picks and results atomically when the app's proven atomic writer is available.
     save_errors = []
-    if "_ow_bfs_atomic_save_json" in globals():
-        for save_path, payload in [(OW_BATTER_PICK_LOG, picks[-20000:]), (OW_HRR_GRADE_LOG, hrr_results[-20000:]), (OW_BATTER_RESULT_LOG, shared_results[-20000:])]:
-            ok, err = _ow_bfs_atomic_save_json(save_path, payload)
-            if not ok and err: save_errors.append(str(err))
-    else:
-        try: save_json(OW_BATTER_PICK_LOG, picks[-20000:])
-        except Exception as e: save_errors.append(str(e))
-        try: save_json(OW_HRR_GRADE_LOG, hrr_results[-20000:])
-        except Exception as e: save_errors.append(str(e))
-        try: save_json(OW_BATTER_RESULT_LOG, shared_results[-20000:])
-        except Exception as e: save_errors.append(str(e))
+    dedicated_out = [dict(x) for x in picks if isinstance(x, dict) and _ow_hrr_is_market(x)]
+    for save_path, payload in [
+        (OW_BATTER_PICK_LOG, picks[-30000:]),
+        (OW_HRR_SNAPSHOT_LOG, dedicated_out[-30000:]),
+        (OW_HRR_GRADE_LOG, hrr_results[-30000:]),
+        (OW_BATTER_RESULT_LOG, shared_results[-30000:]),
+    ]:
+        ok, err = _ow_hrr_atomic_save(save_path, payload)
+        if not ok and err:
+            save_errors.append(f"{os.path.basename(save_path)}: {err}")
 
     return {
         **counters,
         "final_games_found": len(final_games),
         "saved_hrr_rows": sum(1 for p in picks if isinstance(p, dict) and _ow_hrr_is_market(p)),
+        "dedicated_hrr_rows": len([x for x in dedicated_out if isinstance(x, dict)]),
         "result_rows": len(hrr_results), "save_error": "; ".join(save_errors),
+        "official_results_source": OW_HRR_OFFICIAL_RESULTS_VERSION,
         "reasons": reasons[:50], "version": OW_HRR_GRADING_VERSION, "environment_version": OW_HRR_ENV_V2_VERSION,
     }
 
@@ -42319,13 +42471,14 @@ def _ow_render_hrr_grading_results():
     if isinstance(info, dict):
         with st.expander("HRR grading debug", expanded=False):
             st.write({
-                "Saved HRR rows":info.get("saved_hrr_rows"), "Checked this run":info.get("checked"), "Already graded":info.get("already_graded"),
-                "Final games found":info.get("final_games_found"), "Players matched":info.get("matched"), "Players unmatched":info.get("unmatched"),
+                "Saved HRR rows":info.get("saved_hrr_rows"), "Dedicated HRR snapshots":info.get("dedicated_hrr_rows"), "Checked this run":info.get("checked"), "Already graded":info.get("already_graded"),
+                "Final games found":info.get("final_games_found"), "Official scoreboards checked":info.get("official_scoreboards_fetched"), "Official boxscores fetched":info.get("official_boxscores_fetched"),
+                "Players matched":info.get("matched"), "Players unmatched":info.get("unmatched"),
                 "Graded this run":info.get("graded"), "Waiting final":info.get("waiting_final"), "Postponed":info.get("postponed"),
                 "Cancelled":info.get("cancelled"), "Suspended":info.get("suspended"), "Unresolved":info.get("unresolved"),
                 "Recovered game IDs":info.get("recovered_game_ids"), "Recovered player IDs":info.get("recovered_player_ids"),
                 "New persistent rows":info.get("results_written"), "Updated persistent rows":info.get("results_updated"),
-                "Save error":info.get("save_error") or "none", "Grade version":info.get("version"), "Environment version":info.get("environment_version"),
+                "Save error":info.get("save_error") or "none", "Official results source":info.get("official_results_source"), "Grade version":info.get("version"), "Environment version":info.get("environment_version"),
             })
             if info.get("reasons"):
                 st.write("Unresolved reasons:", info.get("reasons"))
