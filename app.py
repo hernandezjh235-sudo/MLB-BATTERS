@@ -27876,20 +27876,36 @@ def render_v3_batter_learning_lab_tab():
     pcol = _v3_col(df, ["Player", "Batter", "Name", "player"])
     result_col = _v3_col(df, ["Result", "graded_result", "Win/Loss", "Outcome"])
     if result_col:
-        wr = df[result_col].astype(str).str.upper().isin(["WIN","W","TRUE","✅"]).mean() * 100
-        c2.metric("Logged WR", f"{wr:.1f}%")
+        _res = df[result_col].fillna("").astype(str).str.strip().str.upper()
+        _gradeable = _res.isin(["WIN","LOSS","W","L","TRUE","FALSE","✅","❌"])
+        _wins = _res.isin(["WIN","W","TRUE","✅"])
+        wr = (_wins[_gradeable].mean() * 100) if _gradeable.any() else None
+        c2.metric("Gradeable WR", "—" if wr is None else f"{wr:.1f}%")
     else:
-        c2.metric("Logged WR", "—")
+        c2.metric("Gradeable WR", "—")
     c3.metric("Markets", int(df[mcol].nunique()) if mcol else "—")
     c4.metric("Mode", "Batter")
 
     st.markdown("#### Market Learning")
     if mcol and result_col:
         d = df.copy()
-        d["_win"] = d[result_col].astype(str).str.upper().isin(["WIN","W","TRUE","✅"]).astype(int)
-        out = d.groupby(mcol).agg(Rows=("_win","count"), Win_Rate=("_win","mean")).reset_index()
-        out["Win_Rate"] = (out["Win_Rate"] * 100).round(1)
-        st.dataframe(out.sort_values("Rows", ascending=False), use_container_width=True, hide_index=True)
+        d["_result_norm"] = d[result_col].fillna("").astype(str).str.strip().str.upper()
+        d["_win"] = d["_result_norm"].isin(["WIN","W","TRUE","✅"]).astype(int)
+        d["_loss"] = d["_result_norm"].isin(["LOSS","L","FALSE","❌"]).astype(int)
+        d["_gradeable"] = (d["_win"] + d["_loss"]).clip(upper=1)
+        market_total = d.groupby(mcol, dropna=False).size().rename("Rows").reset_index()
+        gradeable = d[d["_gradeable"] == 1].copy()
+        if not gradeable.empty:
+            gout = gradeable.groupby(mcol, dropna=False).agg(Gradeable=("_gradeable","count"), Wins=("_win","sum"), Losses=("_loss","sum")).reset_index()
+            out = market_total.merge(gout, on=mcol, how="left")
+        else:
+            out = market_total.copy(); out["Gradeable"] = 0; out["Wins"] = 0; out["Losses"] = 0
+        for _c in ["Gradeable","Wins","Losses"]:
+            out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0).astype(int)
+        out["Other"] = (pd.to_numeric(out["Rows"], errors="coerce").fillna(0).astype(int) - out["Gradeable"]).clip(lower=0)
+        out["Win_Rate"] = np.where(out["Gradeable"] > 0, (out["Wins"] / out["Gradeable"] * 100).round(1), np.nan)
+        st.caption("Win rate is WIN / (WIN + LOSS). Pushes, voids, PASS/no-action and unresolved rows are shown as Other and do not lower the win rate.")
+        st.dataframe(out.sort_values("Gradeable", ascending=False), use_container_width=True, hide_index=True)
     else:
         st.info("Market result columns not found yet. Future batter grading will populate this.")
 
@@ -27915,7 +27931,7 @@ def render_v3_batter_learning_lab_tab():
             s4.metric("Win Rate", "—" if total <= 0 else f"{wins / total * 100:.1f}%")
             if pushes:
                 st.caption(f"Pushes/no-action rows are tracked separately: {int(pushes)} push.")
-        clear_cols = [c for c in ["graded_at", "Snapshot Date", "Player", "Market", "Pick", "Pick Side", "Line", "Projection", "HR Projection", "Actual", "Actual H+R+RBI", "Actual HR", "Actual PA", "graded_result", "Grade Status", "Projection Error", "Team", "Opponent", "Opp Pitcher", "Pitcher Hand", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Official Play Filter"] if c in cleared.columns]
+        clear_cols = [c for c in ["graded_at", "Snapshot Date", "Rank", "FS Shadow Rank", "Player", "Market", "Pick", "Pick Side", "Evaluation Side", "Model Side", "Model Direction", "Line", "Projection", "Median", "FS Shadow Calibration Projection", "FS Shadow Calibration Delta", "FS Shadow Trust Score", "FS Shadow Tier", "HR Projection", "HRR Shadow Calibration Projection", "HRR Shadow Calibration Delta", "HRR Shadow Trust Score", "Shadow Play Label", "Model Win Probability %", "Win Probability %", "Confidence", "Best Play Score", "Decision Gate", "Official Status", "Actual", "Actual H+R+RBI", "Actual HR", "Actual PA", "graded_result", "Grade Status", "Projection Error", "FS Shadow Projection Error", "HRR Shadow Calibration Projection Error", "Team", "Opponent", "Opp Pitcher", "Pitcher Hand", "Pitcher Matchup Verified", "Lineup Confirmed", "Pitcher Confirmed", "Data Score", "Data Confidence", "Overall Rating", "No-Bet Risk Flags", "Official Play Filter"] if c in cleared.columns]
         st.dataframe(cleared[clear_cols].tail(150) if clear_cols else cleared.tail(150), use_container_width=True, hide_index=True)
     else:
         st.info("No cleared batter results yet. Save before-game snapshots, then grade after games go final.")
@@ -27942,7 +27958,7 @@ def render_v3_batter_learning_lab_tab():
             st.info("Need more graded rows before signal audit can populate.")
 
     st.markdown("#### Recent Batter Grade Rows")
-    show_cols = [c for c in ["Date","Snapshot Date","Player","Market","Pick","Line","Projection","HR Projection","Edge","Actual","Actual H+R+RBI","Actual HR","Result","graded_result","Grade Status","Projected PA","Actual PA","Lineup Slot","Pitcher Hand"] if c in df.columns]
+    show_cols = [c for c in ["Date","Snapshot Date","Rank","FS Shadow Rank","Player","Market","Pick","Pick Side","Evaluation Side","Model Side","Model Direction","Line","Projection","Median","FS Shadow Calibration Projection","FS Shadow Trust Score","HR Projection","HRR Shadow Calibration Projection","HRR Shadow Trust Score","Edge","Model Win Probability %","Confidence","Actual","Actual H+R+RBI","Actual HR","Result","graded_result","Grade Status","Projection Error","FS Shadow Projection Error","HRR Shadow Calibration Projection Error","Projected PA","Actual PA","Lineup Slot","Pitcher Hand","Pitcher Matchup Verified","Lineup Confirmed","Pitcher Confirmed"] if c in df.columns]
     st.dataframe(df[show_cols].tail(100) if show_cols else df.tail(100), use_container_width=True, hide_index=True)
 
 
@@ -34085,11 +34101,13 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Prior H+R+RBI Projection": round(hrr_prior_proj, 2) if hrr_prior_proj is not None else "—",
             "Prior H+R+RBI Probability %": round(hrr_prior_prob, 1) if hrr_prior_prob is not None else "—",
             "Confidence": conf,
+            "Last 3": _ow_hit_rate_text(vals[-3:], float(line), pick)[0] if vals else "—",
             "Last 5": l5,
             "Last 10": l10,
             "Last 15": l15,
             "Last 20": l20,
             "Last 30": l30,
+            "Last 3 Avg": round(float(np.mean(vals[-3:])), 2) if vals else "—",
             "Last 5 Avg": round(float(np.mean(vals[-5:])), 2) if vals else "—",
             "Last 10 Avg": round(float(np.mean(vals[-10:])), 2) if vals else "—",
             "Last 15 Avg": round(float(np.mean(vals[-15:])), 2) if vals else "—",
@@ -36232,10 +36250,12 @@ def _ow_bfs_recent_fs_summary(profile):
         x = vals[-n:] if vals else []
         return float(np.mean(x)) if x else None
     return {
+        "L3 FS": avg(3),
         "L5 FS": avg(5),
         "L10 FS": avg(10),
         "L20 FS": avg(20),
         "Season FS/G": float(np.mean(vals)) if vals else None,
+        "L5 FS Values": vals[-5:],
         "L10 FS Values": vals[-10:],
     }
 
@@ -38966,6 +38986,9 @@ def _ow_bfs_grade_full_board_snapshots():
         r["Actual"] = actual
         proj = _v3_safe_num(r.get("Projection"), None)
         r["Projection Error"] = None if actual is None or proj is None else round(float(actual) - float(proj), 3)
+        _fs_shadow_proj = _v3_safe_num(r.get("FS Shadow Calibration Projection"), None)
+        r["FS Shadow Projection Error"] = None if actual is None or _fs_shadow_proj is None else round(float(actual) - float(_fs_shadow_proj), 3)
+        r["FS Shadow Absolute Error"] = None if r.get("FS Shadow Projection Error") is None else round(abs(float(r["FS Shadow Projection Error"])), 3)
 
         if started is False:
             result = "VOID"
@@ -40509,6 +40532,11 @@ def _ow_build_batter_fantasy_row(raw):
         if ar.get("coverage",0)>=65 and (ar.get("HR_factor",1.0)>=1.08 or ar.get("1B_factor",1.0)>=1.05): extra.append("🎯 Arsenal outcome edge")
         if ar.get("coverage",0)>=65 and ar.get("K_factor",1.0)>=1.08: extra.append("⚠️ Arsenal K risk")
         if ctx.get("Installed Data Layers",0)>=3: extra.append("💾 Installed data active")
+        recent_summary = _ow_bfs_recent_fs_summary(profile)
+        if recent_summary.get("L3 FS") is not None:
+            row["L3 FS"] = round(float(recent_summary.get("L3 FS")), 2)
+        if recent_summary.get("L5 FS") is not None:
+            row["L5 FS"] = round(float(recent_summary.get("L5 FS")), 2)
         existing=[x.strip() for x in str(row.get("Flags") or "").split("|") if x.strip()]; row["Flags"]=" | ".join(dict.fromkeys(extra+existing))[:900]
     except Exception as e:
         row["V3 Formula Enrichment Error"]=str(e)[:180]
@@ -42154,6 +42182,9 @@ def _ow_grade_hrr_snapshots(force_regrade=False):
         shadow_proj = _v3_safe_num(p.get("HRR Environment V2 Projection"), None)
         p["Environment V2 Projection Error"] = None if shadow_proj is None or actual is None else round(float(actual) - float(shadow_proj), 3)
         p["Environment V2 Absolute Error"] = None if p.get("Environment V2 Projection Error") is None else round(abs(float(p["Environment V2 Projection Error"])), 3)
+        _hrr_cal_proj = _v3_safe_num(p.get("HRR Shadow Calibration Projection"), None)
+        p["HRR Shadow Calibration Projection Error"] = None if _hrr_cal_proj is None or actual is None else round(float(actual) - float(_hrr_cal_proj), 3)
+        p["HRR Shadow Calibration Absolute Error"] = None if p.get("HRR Shadow Calibration Projection Error") is None else round(abs(float(p["HRR Shadow Calibration Projection Error"])), 3)
         # Component error tells us whether Hits, Runs, or RBI is responsible for HRR miss-calibration.
         for lbl, pcol, acol in [("Hits", "Projected Hits", "Actual H"), ("Runs", "Projected Runs", "Actual R"), ("RBI", "Projected RBI", "Actual RBI")]:
             pv = _v3_safe_num(p.get(pcol), None); av = _v3_safe_num(p.get(acol), None)
@@ -42979,6 +43010,971 @@ def _ow_bfs_card_html(row):
         f"<b style='color:{cross_color}'>CROSS {html.escape(str(cross))}</b></div>"
     )
     return body.replace("<div class=\"ow-bfs-flags\">", snippet + "<div class=\"ow-bfs-flags\">", 1)
+
+
+
+# ============================================================
+# DUAL BATTER CALIBRATION V1 — SHADOW / AUDIT ONLY
+# Added after Aug. 18 Fantasy audit + Aug. 15 HRR selection audit.
+# CRITICAL: This block DOES NOT overwrite the production Fantasy projection,
+# production HRR projection, saved lines/sides, or either grading formula.
+# It creates side-by-side shadow projections/trust ranks so future untouched
+# slates can prove whether calibration helps before any production promotion.
+# ============================================================
+OW_BATTER_DUAL_CAL_VERSION = "BFS_HRR_DUAL_SHADOW_CAL_V1_2026_08_19"
+OW_BATTER_DUAL_CAL_MODE = "SHADOW_AUDIT_ONLY"
+
+
+def _ow_shadow_truthy(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().upper() in {"1","TRUE","YES","Y","CONFIRMED","VERIFIED","ACTIVE","OK"}
+
+
+def _ow_bfs_shadow_bucket_profile():
+    """Residual bias of the *current* Fantasy projection by projection bucket.
+
+    Uses only the production calibration history already accepted by the app.
+    Small samples never move a projection. This is shadow-only and intentionally
+    partial so one slate cannot cause a large correction.
+    """
+    try:
+        cal = _ow_bfs_calibration_profile() if "_ow_bfs_calibration_profile" in globals() else {}
+        rows = list((cal or {}).get("rows") or [])
+    except Exception:
+        rows = []
+    buckets = {"LT8": [], "8_TO_9": [], "GE9": []}
+    edge_buckets = {"LT1": [], "1_TO_3": [], "GE3": []}
+    for r in rows:
+        actual = _ow_cross_num(r.get("_actual") if r.get("_actual") is not None else r.get("Actual FPTS") if r.get("Actual FPTS") is not None else r.get("Actual"), None)
+        proj = _ow_cross_num(r.get("_proj") if r.get("_proj") is not None else r.get("Projection"), None)
+        line = _ow_cross_num(r.get("Line"), None)
+        if actual is None or proj is None:
+            continue
+        residual = float(actual) - float(proj)
+        pkey = "LT8" if proj < 8.0 else "8_TO_9" if proj < 9.0 else "GE9"
+        buckets[pkey].append(residual)
+        if line is not None:
+            gap = abs(float(proj) - float(line))
+            ekey = "LT1" if gap < 1.0 else "1_TO_3" if gap < 3.0 else "GE3"
+            edge_buckets[ekey].append(residual)
+    def pack(vals):
+        return {
+            "samples": len(vals),
+            "bias": None if not vals else round(float(np.mean(vals)), 3),
+            "mae": None if not vals else round(float(np.mean(np.abs(vals))), 3),
+        }
+    return {
+        "projection": {k: pack(v) for k, v in buckets.items()},
+        "edge": {k: pack(v) for k, v in edge_buckets.items()},
+        "total_samples": len(rows),
+    }
+
+
+def _ow_bfs_shadow_calibration_fields(row, profile=None):
+    r = dict(row or {})
+    raw = _ow_cross_num(r.get("Projection"), None)
+    median = _ow_cross_num(r.get("Median"), raw)
+    line = _ow_cross_num(r.get("Line"), None)
+    if raw is None:
+        return {
+            "FS Shadow Calibration Version": OW_BATTER_DUAL_CAL_VERSION,
+            "FS Shadow Calibration Mode": OW_BATTER_DUAL_CAL_MODE,
+            "FS Shadow Calibration Projection": None,
+            "FS Shadow Trust Score": 0.0,
+            "FS Shadow Tier": "CAUTION",
+            "FS Shadow Reason": "missing production projection",
+        }
+    median = raw if median is None else median
+    # Mean/median centralization: enough to reduce tail inflation without erasing upside.
+    central = 0.70 * float(raw) + 0.30 * float(median)
+    prof = profile or _ow_bfs_shadow_bucket_profile()
+    pkey = "LT8" if raw < 8.0 else "8_TO_9" if raw < 9.0 else "GE9"
+    pinfo = ((prof or {}).get("projection") or {}).get(pkey) or {}
+    empirical_adj = 0.0
+    if int(pinfo.get("samples") or 0) >= 25 and pinfo.get("bias") is not None:
+        # Learn slowly: only 25% of residual bucket bias, tightly capped.
+        empirical_adj = float(clamp(float(pinfo.get("bias")) * 0.25, -0.75, 0.55))
+    shadow = float(max(0.0, central + empirical_adj))
+    delta = shadow - float(raw)
+    shadow_edge = None if line is None else shadow - float(line)
+    shadow_side = None if shadow_edge is None else "HIGHER" if shadow_edge > 0 else "LOWER" if shadow_edge < 0 else "PUSH"
+    prod_side = str(r.get("Model Direction") or r.get("Model Side") or "").upper()
+    agreement = "NEUTRAL" if shadow_side in {None,"PUSH"} or prod_side not in {"HIGHER","LOWER"} else "AGREE" if shadow_side == prod_side else "DISAGREE"
+
+    mean_median_gap = abs(float(raw) - float(median))
+    raw_gap = 0.0 if line is None else abs(float(raw) - float(line))
+    data_score = _ow_cross_num(r.get("Data Score"), 50.0) or 50.0
+    confidence = _ow_cross_num(r.get("Confidence"), 50.0) or 50.0
+    volatility = str(r.get("Volatility") or "NORMAL").upper()
+    distribution_conflict = str(r.get("Distribution Conflict") or "NO").upper() == "YES"
+    lineup_ok = _ow_shadow_truthy(r.get("Lineup Confirmed"))
+    pitcher_ok = _ow_shadow_truthy(r.get("Pitcher Confirmed"))
+    matchup_val = r.get("Pitcher Matchup Verified")
+    matchup_known = matchup_val not in (None, "", "—", "nan")
+    matchup_ok = _ow_shadow_truthy(matchup_val) if matchup_known else False
+
+    trust = 82.0
+    reasons = []
+    if mean_median_gap >= 3.0: trust -= 20; reasons.append(f"mean/median gap {mean_median_gap:.1f}")
+    elif mean_median_gap >= 2.0: trust -= 13; reasons.append(f"mean/median gap {mean_median_gap:.1f}")
+    elif mean_median_gap >= 1.0: trust -= 6
+    if raw_gap >= 4.0: trust -= 18; reasons.append(f"extreme market gap {raw_gap:.1f}")
+    elif raw_gap >= 3.0: trust -= 12; reasons.append(f"large market gap {raw_gap:.1f}")
+    if raw >= 9.0: trust -= 8; reasons.append("9+ projection requires proof")
+    elif raw >= 8.0: trust -= 4
+    if data_score < 60: trust -= 10; reasons.append(f"data {data_score:.0f}/100")
+    if confidence < 65: trust -= 7
+    if not lineup_ok: trust -= 8; reasons.append("lineup not confirmed")
+    if not pitcher_ok: trust -= 8; reasons.append("pitcher not confirmed")
+    if matchup_known and not matchup_ok: trust -= 5; reasons.append("pitcher matchup unverified")
+    if distribution_conflict: trust -= 10; reasons.append("mean/distribution conflict")
+    if volatility == "VOLATILE": trust -= 7; reasons.append("volatile distribution")
+    if agreement == "DISAGREE": trust -= 12; reasons.append("shadow side disagrees")
+    elif agreement == "AGREE": trust += 3
+    trust = float(clamp(trust, 0.0, 100.0))
+    tier = "ELITE TRUST" if trust >= 82 and agreement != "DISAGREE" else "STABLE" if trust >= 68 and agreement != "DISAGREE" else "REVIEW" if trust >= 52 else "CAUTION"
+    if not reasons:
+        reasons.append("central projection and data context are stable")
+    return {
+        "FS Shadow Calibration Version": OW_BATTER_DUAL_CAL_VERSION,
+        "FS Shadow Calibration Mode": OW_BATTER_DUAL_CAL_MODE,
+        "FS Production Projection": round(float(raw), 2),
+        "FS Shadow Calibration Projection": round(float(shadow), 2),
+        "FS Shadow Calibration Delta": round(float(delta), 2),
+        "FS Shadow Calibration Edge": None if shadow_edge is None else round(float(shadow_edge), 2),
+        "FS Shadow Calibration Side": shadow_side,
+        "FS Shadow Production Agreement": agreement,
+        "FS Shadow Mean-Median Gap": round(float(mean_median_gap), 2),
+        "FS Shadow Raw Market Gap": round(float(raw_gap), 2),
+        "FS Shadow Historical Bucket": pkey,
+        "FS Shadow Historical Samples": int(pinfo.get("samples") or 0),
+        "FS Shadow Historical Residual Bias": pinfo.get("bias"),
+        "FS Shadow Empirical Adjustment": round(float(empirical_adj), 3),
+        "FS Shadow Trust Score": round(float(trust), 1),
+        "FS Shadow Tier": tier,
+        "FS Shadow Reason": " | ".join(reasons),
+        "FS Learning Data Quality": "TRAIN-SAFE" if lineup_ok and pitcher_ok and data_score >= 60 and not distribution_conflict else "AUDIT-ONLY",
+    }
+
+
+def _ow_hrr_shadow_calibration_profile():
+    """Conservative residual profile from persistent HRR grades. Never changes production."""
+    rows = []
+    try:
+        rows = load_json(OW_HRR_GRADE_LOG, []) if "OW_HRR_GRADE_LOG" in globals() else []
+    except Exception:
+        rows = []
+    good = []
+    by_side = {"OVER": [], "UNDER": []}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        actual = _ow_cross_num(r.get("Actual H+R+RBI") if r.get("Actual H+R+RBI") is not None else r.get("Actual"), None)
+        proj = _ow_cross_num(r.get("Saved Projection") if r.get("Saved Projection") not in (None,"") else r.get("Projection"), None)
+        if actual is None or proj is None:
+            continue
+        residual = float(actual) - float(proj)
+        good.append(residual)
+        side = _ow_hrr_side(r) if "_ow_hrr_side" in globals() else None
+        if side in by_side:
+            by_side[side].append(residual)
+    def pack(vals):
+        return {"samples":len(vals), "bias":None if not vals else round(float(np.mean(vals)),3), "mae":None if not vals else round(float(np.mean(np.abs(vals))),3)}
+    return {"all":pack(good), "side":{k:pack(v) for k,v in by_side.items()}}
+
+
+def _ow_hrr_shadow_calibration_fields(row, profile=None):
+    r = dict(row or {})
+    prod = _ow_cross_num(r.get("Projection"), None)
+    line = _ow_cross_num(r.get("Line"), None)
+    if prod is None:
+        return {
+            "HRR Shadow Calibration Version": OW_BATTER_DUAL_CAL_VERSION,
+            "HRR Shadow Calibration Mode": OW_BATTER_DUAL_CAL_MODE,
+            "HRR Shadow Calibration Projection": None,
+            "HRR Shadow Trust Score": 0.0,
+            "HRR Shadow Tier V2": "PASS / RESEARCH",
+            "HRR Shadow Calibration Reason": "missing production projection",
+        }
+    side = _ow_cross_hrr_side(r)
+    env_proj = _ow_cross_num(r.get("HRR Environment V2 Projection"), None)
+    env_support, env_fit = _ow_hrr_shadow_environment_support(r, side) if "_ow_hrr_shadow_environment_support" in globals() else ("NEUTRAL", 50.0)
+    context_ok = str(r.get("Shadow Context Confirmed") or "").upper() == "YES"
+    if not context_ok:
+        lineup_txt = str(r.get("Lineup Status") or "").upper()
+        context_ok = _ow_shadow_truthy(r.get("Pitcher Confirmed")) and _ow_shadow_truthy(r.get("Pitcher Matchup Verified")) and "CONFIRMED" in lineup_txt
+
+    # Environment is only a small secondary blend because production HRR already performed well at the top.
+    env_weight = 0.0
+    if env_proj is not None:
+        if env_support == "SUPPORT" and context_ok: env_weight = 0.12
+        elif env_support in {"SUPPORT","NEUTRAL","MIXED"}: env_weight = 0.06
+        elif env_support == "CONTRADICT": env_weight = 0.03
+    shadow = (1.0-env_weight) * float(prod) + env_weight * float(env_proj if env_proj is not None else prod)
+
+    prof = profile or _ow_hrr_shadow_calibration_profile()
+    sinfo = (((prof or {}).get("side") or {}).get(side) or {}) if side in {"OVER","UNDER"} else {}
+    empirical_adj = 0.0
+    if int(sinfo.get("samples") or 0) >= 30 and sinfo.get("bias") is not None:
+        empirical_adj = float(clamp(float(sinfo.get("bias")) * 0.20, -0.22, 0.22))
+    shadow += empirical_adj
+    shadow = max(0.0, float(shadow))
+    delta = shadow - float(prod)
+    shadow_edge = None if line is None else shadow - float(line)
+    shadow_side = None if shadow_edge is None else "OVER" if shadow_edge > 0 else "UNDER" if shadow_edge < 0 else "PUSH"
+    agreement = "NEUTRAL" if shadow_side in {None,"PUSH"} or side not in {"OVER","UNDER"} else "AGREE" if shadow_side == side else "DISAGREE"
+
+    conf = _ow_cross_num(r.get("Confidence"), None)
+    edge = abs(_ow_cross_num(r.get("Edge"), 0.0) or 0.0)
+    rank = int(_ow_cross_num(r.get("Rank"), 9999) or 9999)
+    data = _ow_cross_num(r.get("Final Data Quality Score"), _ow_cross_num(r.get("Data Confidence"), 50.0)) or 50.0
+    cross = str(r.get("Cross-Market Agreement") or "NEUTRAL").upper()
+    low_conf_over = side == "OVER" and conf is not None and conf < 8.5
+
+    conf_score = 50.0 if conf is None else clamp((float(conf)-5.0)/5.0*100.0, 0.0, 100.0)
+    edge_score = clamp(45.0 + edge * 30.0, 0.0, 100.0)
+    rank_score = 92.0 if rank <= 10 else 82.0 if rank <= 30 else 72.0 if rank <= 60 else 52.0 if rank <= 80 else 25.0
+    context_score = 100.0 if context_ok else 45.0
+    cross_score = _ow_cross_consensus_score(cross) if "_ow_cross_consensus_score" in globals() else 50.0
+    trust = 0.34*conf_score + 0.20*edge_score + 0.16*rank_score + 0.10*float(env_fit) + 0.08*context_score + 0.07*float(data) + 0.05*float(cross_score)
+    reasons=[]
+    if low_conf_over: trust -= 18; reasons.append("low-confidence OVER")
+    if rank >= 81: trust -= 18; reasons.append("rank 81+ research zone")
+    if env_support == "CONTRADICT": trust -= 7; reasons.append("environment contradicts")
+    if cross == "DISAGREE": trust -= 7; reasons.append("FS/HRR disagreement")
+    if agreement == "DISAGREE": trust -= 12; reasons.append("shadow projection flips side")
+    if not context_ok: trust -= 7; reasons.append("matchup/lineup not fully confirmed")
+    trust = float(clamp(trust,0,100))
+    tier = "🔥 ELITE" if trust >= 82 and agreement != "DISAGREE" else "🟢 STRONG" if trust >= 70 and agreement != "DISAGREE" else "🟡 LEAN" if trust >= 54 else "🔴 PASS / RESEARCH"
+    if not reasons:
+        reasons.append("confidence/edge/rank/environment remain aligned")
+    return {
+        "HRR Shadow Calibration Version": OW_BATTER_DUAL_CAL_VERSION,
+        "HRR Shadow Calibration Mode": OW_BATTER_DUAL_CAL_MODE,
+        "HRR Production Projection": round(float(prod),2),
+        "HRR Shadow Calibration Projection": round(float(shadow),2),
+        "HRR Shadow Calibration Delta": round(float(delta),2),
+        "HRR Shadow Calibration Edge": None if shadow_edge is None else round(float(shadow_edge),2),
+        "HRR Shadow Calibration Side": shadow_side,
+        "HRR Shadow Production Agreement": agreement,
+        "HRR Shadow Environment Weight": round(float(env_weight),3),
+        "HRR Shadow Historical Side Samples": int(sinfo.get("samples") or 0),
+        "HRR Shadow Historical Residual Bias": sinfo.get("bias"),
+        "HRR Shadow Empirical Adjustment": round(float(empirical_adj),3),
+        "HRR Shadow Trust Score": round(float(trust),1),
+        "HRR Shadow Tier V2": tier,
+        "HRR Shadow Calibration Reason": " | ".join(reasons),
+    }
+
+
+# Add Fantasy shadow fields AFTER the production full-board rank is complete.
+# Production Rank/Projection/Direction/Official Status are preserved exactly.
+_ow_bfs_rank_full_board_before_dual_cal = _ow_bfs_rank_full_board
+
+def _ow_bfs_rank_full_board(df):
+    base = _ow_bfs_rank_full_board_before_dual_cal(df)
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    prof = _ow_bfs_shadow_bucket_profile()
+    rows=[]
+    for _,rr in base.iterrows():
+        r=rr.to_dict(); r.update(_ow_bfs_shadow_calibration_fields(r, prof)); rows.append(r)
+    d=pd.DataFrame(rows)
+    # Independent shadow ranking only; never overwrite production Rank.
+    shadow_scores=[]
+    for _,rr in d.iterrows():
+        r=rr.to_dict()
+        trust=_ow_cross_num(r.get("FS Shadow Trust Score"),0.0) or 0.0
+        sedge=abs(_ow_cross_num(r.get("FS Shadow Calibration Edge"),0.0) or 0.0)
+        prob=_ow_cross_num(r.get("Model Win Probability %"),50.0) or 50.0
+        agree=str(r.get("FS Shadow Production Agreement") or "NEUTRAL").upper()
+        score=0.55*trust + 0.25*clamp(45.0+sedge*16.0,0,100) + 0.20*prob
+        if agree == "DISAGREE": score -= 12
+        shadow_scores.append(round(float(clamp(score,0,100)),1))
+    d["FS Shadow Best Play Score"] = shadow_scores
+    order = d.sort_values(["FS Shadow Best Play Score","FS Shadow Trust Score"], ascending=[False,False], kind="mergesort").index.tolist()
+    rank_map={idx:i+1 for i,idx in enumerate(order)}
+    d["FS Shadow Rank"]=[rank_map.get(idx) for idx in d.index]
+    return d
+
+
+# Upgrade HRR shadow diagnostics without changing the production rank or projection.
+_ow_rank_hrr_best_first_before_dual_cal = _ow_rank_hrr_best_first
+
+def _ow_rank_hrr_best_first(df):
+    base = _ow_rank_hrr_best_first_before_dual_cal(df)
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    prof = _ow_hrr_shadow_calibration_profile()
+    rows=[]
+    for _,rr in base.iterrows():
+        r=rr.to_dict(); r.update(_ow_hrr_shadow_calibration_fields(r, prof)); rows.append(r)
+    d=pd.DataFrame(rows)
+    order=d.sort_values(["HRR Shadow Trust Score","Best Play Score"], ascending=[False,False], kind="mergesort").index.tolist() if "Best Play Score" in d.columns else d.sort_values(["HRR Shadow Trust Score"], ascending=[False], kind="mergesort").index.tolist()
+    rank_map={idx:i+1 for i,idx in enumerate(order)}
+    d["HRR Shadow Rank V2"]=[rank_map.get(idx) for idx in d.index]
+    return d
+
+
+# Lightweight shadow audit panels. These do not lengthen every mobile card.
+_render_v3_batter_fantasy_tab_before_dual_cal = render_v3_batter_fantasy_tab
+
+def render_v3_batter_fantasy_tab():
+    _render_v3_batter_fantasy_tab_before_dual_cal()
+    d = st.session_state.get("ow_bfs_df")
+    if not isinstance(d,pd.DataFrame) or d.empty:
+        return
+    # Re-run only the cheap ranking wrapper so the current session receives shadow fields.
+    d = _ow_bfs_rank_full_board(d)
+    st.session_state["ow_bfs_df"] = d
+    with st.expander("🧪 Batter Fantasy Calibration V2 — SHADOW / AUDIT ONLY", expanded=False):
+        st.caption("Production FS projection, Higher/Lower direction, scoring, grading and Official gate are untouched. Shadow calibration blends mean/median, learns slowly from residual bias, and flags extreme projection/market gaps.")
+        cols=[c for c in ["Rank","FS Shadow Rank","Player","Line","Projection","Median","FS Shadow Calibration Projection","FS Shadow Calibration Delta","FS Shadow Calibration Edge","Model Direction","FS Shadow Calibration Side","FS Shadow Production Agreement","FS Shadow Trust Score","FS Shadow Tier","FS Learning Data Quality","Model Win Probability %","Confidence","Data Score","Volatility","FS Shadow Historical Samples","FS Shadow Historical Residual Bias","FS Shadow Reason"] if c in d.columns]
+        st.dataframe(d[cols].sort_values(["FS Shadow Rank"], ascending=True).head(60), use_container_width=True, hide_index=True)
+
+
+_render_v3_batter_research_tab_before_dual_cal = render_v3_batter_research_tab
+
+def render_v3_batter_research_tab(market="HRR"):
+    _render_v3_batter_research_tab_before_dual_cal(market)
+    if str(market).upper() not in {"HRR","H+R+RBI","HITS+RUNS+RBI"}:
+        return
+    d=st.session_state.get("ow_hrr_live_df")
+    if not isinstance(d,pd.DataFrame) or d.empty:
+        return
+    d=_ow_rank_hrr_best_first(d)
+    st.session_state["ow_hrr_live_df"] = d
+    with st.expander("🧪 HRR Calibration / Trust V2 — SHADOW / AUDIT ONLY", expanded=False):
+        st.caption("Production H+R+RBI projection and pick remain untouched. V2 lightly blends the existing Environment projection only as confirmation, applies slow historical residual correction when sample size is sufficient, and creates an independent trust rank.")
+        cols=[c for c in ["Rank","HRR Shadow Rank V2","Player","Line","Projection","HRR Environment V2 Projection","HRR Shadow Calibration Projection","HRR Shadow Calibration Delta","Pick","HRR Shadow Calibration Side","HRR Shadow Production Agreement","Confidence","Edge","Best Play Score","HRR Shadow Trust Score","HRR Shadow Tier V2","Shadow Play Label","Shadow Environment Support","Cross-Market Agreement","HRR Shadow Historical Side Samples","HRR Shadow Historical Residual Bias","HRR Shadow Calibration Reason"] if c in d.columns]
+        st.dataframe(d[cols].sort_values(["HRR Shadow Rank V2"], ascending=True).head(80), use_container_width=True, hide_index=True)
+
+
+# Add a corrected dual-market calibration comparison beneath the existing Learning Lab.
+_render_v3_batter_learning_lab_tab_before_dual_cal = render_v3_batter_learning_lab_tab
+
+def render_v3_batter_learning_lab_tab():
+    _render_v3_batter_learning_lab_tab_before_dual_cal()
+    st.divider(); st.markdown("#### 🧪 Current vs Shadow Projection Audit")
+    fs = _ow_bfs_history_frame() if "_ow_bfs_history_frame" in globals() else pd.DataFrame()
+    hrr_rows = load_json(OW_HRR_GRADE_LOG, []) if "OW_HRR_GRADE_LOG" in globals() else []
+    hrr = pd.DataFrame(hrr_rows) if isinstance(hrr_rows,list) and hrr_rows else pd.DataFrame()
+    audit=[]
+    if isinstance(fs,pd.DataFrame) and not fs.empty:
+        f=fs.copy(); res=f.get("graded_result",pd.Series("",index=f.index)).fillna("").astype(str).str.upper(); f=f[res.isin(["WIN","LOSS"])].copy()
+        act=pd.to_numeric(f.get("Actual FPTS",f.get("Actual")),errors="coerce") if not f.empty else pd.Series(dtype=float)
+        prod=pd.to_numeric(f.get("Projection"),errors="coerce") if not f.empty else pd.Series(dtype=float)
+        sh=pd.to_numeric(f.get("FS Shadow Calibration Projection"),errors="coerce") if "FS Shadow Calibration Projection" in f.columns else pd.Series(np.nan,index=f.index)
+        valid=act.notna() & prod.notna()
+        sval=act.notna() & sh.notna()
+        audit.append({"Market":"Batter Fantasy","Gradeable":int(len(f)),"Current MAE":None if not valid.any() else round(float((act[valid]-prod[valid]).abs().mean()),3),"Shadow MAE":None if not sval.any() else round(float((act[sval]-sh[sval]).abs().mean()),3),"Shadow Samples":int(sval.sum())})
+    if isinstance(hrr,pd.DataFrame) and not hrr.empty:
+        res=hrr.get("graded_result",pd.Series("",index=hrr.index)).fillna("").astype(str).str.upper(); h=hrr[res.isin(["WIN","LOSS","PUSH","VOID"])].copy()
+        act=pd.to_numeric(h.get("Actual H+R+RBI",h.get("Actual")),errors="coerce") if not h.empty else pd.Series(dtype=float)
+        prod=pd.to_numeric(h.get("Saved Projection",h.get("Projection")),errors="coerce") if not h.empty else pd.Series(dtype=float)
+        sh=pd.to_numeric(h.get("HRR Shadow Calibration Projection"),errors="coerce") if "HRR Shadow Calibration Projection" in h.columns else pd.Series(np.nan,index=h.index)
+        valid=act.notna() & prod.notna(); sval=act.notna() & sh.notna()
+        audit.append({"Market":"H+R+RBI","Gradeable":int(res.isin(["WIN","LOSS"]).sum()),"Current MAE":None if not valid.any() else round(float((act[valid]-prod[valid]).abs().mean()),3),"Shadow MAE":None if not sval.any() else round(float((act[sval]-sh[sval]).abs().mean()),3),"Shadow Samples":int(sval.sum())})
+    if audit:
+        st.dataframe(pd.DataFrame(audit),use_container_width=True,hide_index=True)
+    st.caption("Shadow calibration must beat current projection MAE and remain stable across multiple untouched slates before any production formula is changed.")
+
+
+
+# ============================================================
+# BATTER FACTOR CALIBRATION V2 + CLEAN UPSIDE CARDS
+# Added 2026-08-19.
+#
+# SAFETY:
+# - Batter Fantasy event probabilities/scoring/simulation remain untouched.
+# - HRR production projection remains untouched.
+# - This layer strengthens factor-aware selection/shadow calibration and UI only.
+# - Skill / Match / Form / Contact are surfaced as explicit selection signals.
+# - Recent form is sample-aware and never allowed to dominate true talent.
+# ============================================================
+OW_BATTER_FACTOR_CAL_V2_VERSION = "BFS_HRR_FACTOR_CAL_V3_L3_L5_2026_08_19"
+
+
+def _ow_factor_num(row, key, default=None):
+    try:
+        return _ow_cross_num((row or {}).get(key), default)
+    except Exception:
+        try:
+            return _v3_safe_num((row or {}).get(key), default)
+        except Exception:
+            return default
+
+
+def _ow_bfs_recent_form_v2(row):
+    """Stable recent-form signal for selection/shadow calibration.
+
+    The production event model already blends season + recent 30d + recent 15d
+    per-PA rates. This helper is intentionally secondary so L5 noise cannot take over.
+    """
+    r = dict(row or {})
+    l3 = _ow_factor_num(r, "L3 FS", None)
+    l5 = _ow_factor_num(r, "L5 FS", None)
+    season = _ow_factor_num(r, "Season FS/G", None)
+    recent_x = _ow_factor_num(r, "Recent 15d xwOBA", None)
+    base_x = _ow_factor_num(r, "wOBA/xwOBA", None)
+    legacy_form = _ow_factor_num(r, "Form", None)
+
+    pieces = []
+    notes = []
+    if season is not None and l3 is not None:
+        d3 = float(l3) - float(season)
+        pieces.append((float(clamp(50.0 + d3 * 3.2, 20.0, 82.0)), 0.40))
+        notes.append(f"L3 vs season {d3:+.2f}")
+    if season is not None and l5 is not None:
+        d5 = float(l5) - float(season)
+        pieces.append((float(clamp(50.0 + d5 * 3.0, 20.0, 82.0)), 0.35))
+        notes.append(f"L5 vs season {d5:+.2f}")
+    if recent_x is not None and base_x is not None:
+        dx = float(recent_x) - float(base_x)
+        pieces.append((float(clamp(50.0 + dx * 190.0, 18.0, 84.0)), 0.18))
+        notes.append(f"15d xwOBA {dx:+.3f}")
+    if legacy_form is not None:
+        pieces.append((float(clamp(legacy_form, 5.0, 99.0)), 0.12))
+    if not pieces:
+        return {"score": 50.0, "coverage": 0, "note": "recent form unavailable", "l3": l3, "l5": l5, "season": season}
+    sw = sum(w for _, w in pieces) or 1.0
+    score = sum(v * w for v, w in pieces) / sw
+    return {
+        "score": round(float(clamp(score, 10.0, 90.0)), 1),
+        "coverage": len(pieces),
+        "note": " | ".join(notes[:3]) if notes else "recent form blended",
+        "l3": l3, "l5": l5, "season": season,
+    }
+
+
+def _ow_bfs_factor_support_v2(row):
+    r = dict(row or {})
+    vals = {
+        "skill": _ow_factor_num(r, "Skill", None),
+        "match": _ow_factor_num(r, "Match", None),
+        "contact": _ow_factor_num(r, "Contact", None),
+        "form": _ow_factor_num(r, "Form", None),
+    }
+    recent = _ow_bfs_recent_form_v2(r)
+    if vals["form"] is None and recent.get("coverage", 0):
+        vals["form"] = recent.get("score")
+    weights = {"skill": 0.23, "match": 0.25, "contact": 0.29, "form": 0.23}
+    avail = [(float(vals[k]), weights[k]) for k in weights if vals.get(k) is not None]
+    if avail:
+        sw = sum(w for _, w in avail) or 1.0
+        support = sum(v * w for v, w in avail) / sw
+    else:
+        support = 50.0
+    if recent.get("coverage", 0):
+        support = 0.86 * support + 0.14 * float(recent.get("score", 50.0))
+    coverage = int(round(len(avail) / 4.0 * 100.0))
+    label = "ELITE SUPPORT" if support >= 75 else "STRONG SUPPORT" if support >= 65 else "NEUTRAL" if support >= 47 else "WEAK SUPPORT"
+    return {
+        "FS Factor Support Score": round(float(clamp(support, 0, 100)), 1),
+        "FS Factor Coverage %": coverage,
+        "FS Factor Support Label": label,
+        "FS Recent Form Score V2": recent.get("score"),
+        "FS Recent Form Coverage": recent.get("coverage"),
+        "FS Recent Form Note": recent.get("note"),
+        "FS Recent L3": recent.get("l3"),
+        "FS Recent L5": recent.get("l5"),
+        "FS Season FPTS/G": recent.get("season"),
+    }
+
+
+# Upgrade the existing shadow calibration only. Production projection is not overwritten.
+_ow_bfs_shadow_calibration_fields_before_factor_v2 = _ow_bfs_shadow_calibration_fields
+
+def _ow_bfs_shadow_calibration_fields(row, profile=None):
+    r = dict(row or {})
+    base = dict(_ow_bfs_shadow_calibration_fields_before_factor_v2(r, profile) or {})
+    factors = _ow_bfs_factor_support_v2(r)
+    base.update(factors)
+
+    raw = _ow_factor_num(r, "Projection", None)
+    line = _ow_factor_num(r, "Line", None)
+    shadow = _ow_factor_num(base, "FS Shadow Calibration Projection", raw)
+    if raw is None or shadow is None:
+        base["FS Factor Calibration Version"] = OW_BATTER_FACTOR_CAL_V2_VERSION
+        return base
+
+    support = float(factors.get("FS Factor Support Score", 50.0) or 50.0)
+    recent_score = float(factors.get("FS Recent Form Score V2", 50.0) or 50.0)
+    coverage = int(factors.get("FS Factor Coverage %", 0) or 0)
+    data = float(_ow_factor_num(r, "Data Score", 50.0) or 50.0)
+    skill = float(_ow_factor_num(r, "Skill", 50.0) or 50.0)
+    match = float(_ow_factor_num(r, "Match", 50.0) or 50.0)
+    contact = float(_ow_factor_num(r, "Contact", 50.0) or 50.0)
+    form = float(_ow_factor_num(r, "Form", recent_score) or recent_score)
+
+    factor_adj = float(clamp((support - 50.0) / 50.0 * 0.28, -0.28, 0.28)) if coverage >= 75 else 0.0
+    recent_adj = float(clamp((recent_score - 50.0) / 50.0 * 0.18, -0.18, 0.18)) if factors.get("FS Recent Form Coverage", 0) >= 2 else 0.0
+
+    interaction_adj = 0.0
+    if min(skill, match, contact, form) >= 68 and data >= 65:
+        interaction_adj = 0.10
+    elif sum(x <= 40 for x in [skill, match, contact, form]) >= 2:
+        interaction_adj = -0.10
+
+    high_end_guard = 0.0
+    if float(raw) >= 9.0 and (support < 66 or recent_score < 52 or contact < 58):
+        high_end_guard = -float(clamp((float(raw) - 8.8) * 0.12, 0.0, 0.38))
+    elif float(raw) >= 8.0 and support < 55:
+        high_end_guard = -0.08
+
+    add = float(clamp(factor_adj + recent_adj + interaction_adj + high_end_guard, -0.48, 0.38))
+    shadow2 = max(0.0, float(shadow) + add)
+    edge2 = None if line is None else shadow2 - float(line)
+    side2 = None if edge2 is None else "HIGHER" if edge2 > 0 else "LOWER" if edge2 < 0 else "PUSH"
+    prod_side = str(r.get("Model Direction") or r.get("Model Side") or "").upper()
+    agreement2 = "NEUTRAL" if side2 in {None, "PUSH"} or prod_side not in {"HIGHER", "LOWER"} else "AGREE" if side2 == prod_side else "DISAGREE"
+
+    trust = float(_ow_factor_num(base, "FS Shadow Trust Score", 50.0) or 50.0)
+    trust += (support - 50.0) * 0.16
+    trust += (recent_score - 50.0) * 0.08
+    if coverage < 75:
+        trust -= 4.0
+    if agreement2 == "DISAGREE":
+        trust -= 8.0
+    trust = float(clamp(trust, 0, 100))
+    tier = "ELITE TRUST" if trust >= 82 and agreement2 != "DISAGREE" else "STABLE" if trust >= 68 and agreement2 != "DISAGREE" else "REVIEW" if trust >= 52 else "CAUTION"
+
+    reason = str(base.get("FS Shadow Reason") or "")
+    factor_reason = f"factor {support:.0f}/100; recent {recent_score:.0f}/100; adj {add:+.2f}"
+    base.update({
+        "FS Factor Calibration Version": OW_BATTER_FACTOR_CAL_V2_VERSION,
+        "FS Shadow Calibration Projection": round(shadow2, 2),
+        "FS Shadow Calibration Delta": round(shadow2 - float(raw), 2),
+        "FS Shadow Calibration Edge": None if edge2 is None else round(edge2, 2),
+        "FS Shadow Calibration Side": side2,
+        "FS Shadow Production Agreement": agreement2,
+        "FS Factor Projection Adjustment": round(add, 3),
+        "FS Factor Core Adjustment": round(factor_adj, 3),
+        "FS Recent Form Adjustment": round(recent_adj, 3),
+        "FS High-End Guard Adjustment": round(high_end_guard, 3),
+        "FS Shadow Trust Score": round(trust, 1),
+        "FS Shadow Tier": tier,
+        "FS Shadow Reason": (reason + " | " + factor_reason).strip(" |"),
+    })
+    return base
+
+
+# Factor-aware Fantasy ranking. Projection, line, direction and grading are untouched.
+_ow_bfs_rank_full_board_before_factor_v2 = _ow_bfs_rank_full_board
+
+def _ow_bfs_rank_full_board(df):
+    base = _ow_bfs_rank_full_board_before_factor_v2(df)
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    rows = []
+    for _, rr in base.iterrows():
+        r = rr.to_dict()
+        r.update(_ow_bfs_factor_support_v2(r))
+        win = float(_ow_factor_num(r, "Model Win Probability %", 50.0) or 50.0)
+        conf = float(_ow_factor_num(r, "Confidence", 50.0) or 50.0)
+        data = float(_ow_factor_num(r, "Data Score", 50.0) or 50.0)
+        skill = float(_ow_factor_num(r, "Skill", 50.0) or 50.0)
+        match = float(_ow_factor_num(r, "Match", 50.0) or 50.0)
+        contact = float(_ow_factor_num(r, "Contact", 50.0) or 50.0)
+        form0 = float(_ow_factor_num(r, "Form", 50.0) or 50.0)
+        recent = float(_ow_factor_num(r, "FS Recent Form Score V2", form0) or form0)
+        form = 0.70 * form0 + 0.30 * recent
+        envfit = float(_ow_factor_num(r, "Side Environment Fit", 50.0) or 50.0)
+        consensus = float(_ow_factor_num(r, "Cross-Market Consensus Score", 50.0) or 50.0)
+        legacy = _ow_factor_num(r, "Best Play Score", None)
+        r["Legacy Best Play Score"] = legacy
+        score = (
+            0.36 * win + 0.12 * conf + 0.10 * data +
+            0.08 * skill + 0.08 * match + 0.10 * contact + 0.08 * form +
+            0.05 * envfit + 0.03 * consensus
+        )
+        if "STRONG CONFLICT" in str(r.get("Cross-Market Guardrail") or "").upper():
+            score -= 10.0
+        elif str(r.get("Cross-Market Agreement") or "").upper() == "DISAGREE":
+            score -= 3.0
+        r["FS Factor Best Play Score"] = round(float(clamp(score, 0, 100)), 1)
+        r["Best Play Score"] = r["FS Factor Best Play Score"]
+        rows.append(r)
+    d = pd.DataFrame(rows)
+    d = d.sort_values(["FS Factor Best Play Score", "Model Win Probability %", "Confidence"], ascending=[False, False, False], kind="mergesort", na_position="last").reset_index(drop=True)
+    d["Rank"] = np.arange(1, len(d) + 1, dtype=int)
+    d["FS Factor Rank V2"] = d["Rank"]
+    return d
+
+
+# HRR: strengthen only the shadow calibration/trust layer using component + recent consistency.
+_ow_hrr_shadow_calibration_fields_before_factor_v2 = _ow_hrr_shadow_calibration_fields
+
+def _ow_hrr_shadow_calibration_fields(row, profile=None):
+    r = dict(row or {})
+    base = dict(_ow_hrr_shadow_calibration_fields_before_factor_v2(r, profile) or {})
+    prod = _ow_factor_num(r, "Projection", None)
+    line = _ow_factor_num(r, "Line", None)
+    shadow = _ow_factor_num(base, "HRR Shadow Calibration Projection", prod)
+    if prod is None or shadow is None:
+        base["HRR Factor Calibration Version"] = OW_BATTER_FACTOR_CAL_V2_VERSION
+        return base
+
+    component = _ow_factor_num(r, "Component Projection", None)
+    l3 = _ow_factor_num(r, "Last 3 Avg", None)
+    l5 = _ow_factor_num(r, "Last 5 Avg", None)
+    recent_vals = [(l3, 0.45), (l5, 0.55)]
+    recent_vals = [(float(v), w) for v, w in recent_vals if v is not None]
+    recent_blend = None
+    if recent_vals:
+        sw = sum(w for _, w in recent_vals) or 1.0
+        recent_blend = sum(v * w for v, w in recent_vals) / sw
+
+    comp_adj = 0.0 if component is None else float(clamp((float(component) - float(prod)) * 0.08, -0.10, 0.10))
+    recent_adj = 0.0 if recent_blend is None else float(clamp((float(recent_blend) - float(prod)) * 0.055, -0.10, 0.10))
+    add = float(clamp(comp_adj + recent_adj, -0.16, 0.16))
+    shadow2 = max(0.0, float(shadow) + add)
+    edge2 = None if line is None else shadow2 - float(line)
+    side2 = None if edge2 is None else "OVER" if edge2 > 0 else "UNDER" if edge2 < 0 else "PUSH"
+    prod_side = _ow_cross_hrr_side(r)
+    agreement2 = "NEUTRAL" if side2 in {None, "PUSH"} or prod_side not in {"OVER", "UNDER"} else "AGREE" if side2 == prod_side else "DISAGREE"
+
+    trust = float(_ow_factor_num(base, "HRR Shadow Trust Score", 50.0) or 50.0)
+    if component is not None:
+        comp_gap = abs(float(component) - float(prod))
+        trust += 3.0 if comp_gap <= 0.35 else -4.0 if comp_gap >= 1.0 else 0.0
+    else:
+        comp_gap = None
+    if recent_blend is not None:
+        recent_gap = abs(float(recent_blend) - float(prod))
+        trust += 2.0 if recent_gap <= 0.45 else -3.0 if recent_gap >= 1.4 else 0.0
+    else:
+        recent_gap = None
+    if agreement2 == "DISAGREE":
+        trust -= 8.0
+    trust = float(clamp(trust, 0, 100))
+    tier = "🔥 ELITE" if trust >= 82 and agreement2 != "DISAGREE" else "🟢 STRONG" if trust >= 70 and agreement2 != "DISAGREE" else "🟡 LEAN" if trust >= 54 else "🔴 PASS / RESEARCH"
+    reason = str(base.get("HRR Shadow Calibration Reason") or "")
+    base.update({
+        "HRR Factor Calibration Version": OW_BATTER_FACTOR_CAL_V2_VERSION,
+        "HRR Shadow Calibration Projection": round(shadow2, 2),
+        "HRR Shadow Calibration Delta": round(shadow2 - float(prod), 2),
+        "HRR Shadow Calibration Edge": None if edge2 is None else round(edge2, 2),
+        "HRR Shadow Calibration Side": side2,
+        "HRR Shadow Production Agreement": agreement2,
+        "HRR Component Consistency Gap": None if comp_gap is None else round(comp_gap, 2),
+        "HRR Recent Blend V2": None if recent_blend is None else round(recent_blend, 2),
+        "HRR Recent Consistency Gap": None if recent_gap is None else round(recent_gap, 2),
+        "HRR Factor Projection Adjustment": round(add, 3),
+        "HRR Shadow Trust Score": round(trust, 1),
+        "HRR Shadow Tier V2": tier,
+        "HRR Shadow Calibration Reason": (reason + f" | component/recent adj {add:+.2f}").strip(" |"),
+    })
+    return base
+
+
+# Enrich Batter Upside with Fantasy quality factors + HRR-specific L3/L5 recent-form support.
+# IMPORTANT: this changes Batter Upside RANKING ONLY. It does NOT overwrite the production
+# HRR projection, HRR side, HRR grading, Batter Fantasy projection, or Batter Fantasy grading.
+_build_v3_batter_upside_board_before_factor_ui_v2 = build_v3_batter_upside_board_final
+
+
+def _ow_hrr_l3_l5_upside_support(hrr_row):
+    """Side-aware L3/L5 HRR support for Batter Upside ranking.
+
+    L3 is the fast trend signal and L5 is the stabilizer/confirmation window.  The score
+    is intentionally capped and used only inside the Batter Upside ranking so a short hot
+    streak cannot rewrite the production H+R+RBI projection.
+    """
+    r = dict(hrr_row or {})
+    line = _ow_factor_num(r, "Line", None)
+    side = _ow_cross_hrr_side(r) if "_ow_cross_hrr_side" in globals() else str(r.get("Pick") or "").upper()
+    l3 = _ow_factor_num(r, "Last 3 Avg", None)
+    l5 = _ow_factor_num(r, "Last 5 Avg", None)
+    available = [(l3, 0.45, "L3"), (l5, 0.55, "L5")]
+    available = [(float(v), w, label) for v, w, label in available if v is not None]
+    if line is None or side not in {"OVER", "UNDER"} or not available:
+        return {
+            "HRR L3 Avg": l3,
+            "HRR L5 Avg": l5,
+            "HRR L3/L5 Blend": None,
+            "HRR Recent Form Score": 50.0,
+            "HRR Recent Form Alignment": "NO CLEAN L3/L5",
+            "HRR Recent Form Note": "L3/L5 held neutral because line/side/recent data is incomplete",
+        }
+
+    sw = sum(w for _, w, _ in available) or 1.0
+    blend = sum(v * w for v, w, _ in available) / sw
+    direction = 1.0 if side == "OVER" else -1.0
+    signed_margin = direction * (float(blend) - float(line))
+
+    # One full HRR of recent-form separation is meaningful, but short samples are not allowed
+    # to become a dominant signal.  The margin contribution is therefore bounded.
+    score = 50.0 + float(clamp(signed_margin * 18.0, -30.0, 30.0))
+    alignment = "MIXED"
+    note_bits = [f"{side} {float(line):.1f}", f"blend {blend:.2f}"]
+
+    if l3 is not None and l5 is not None:
+        l3_support = direction * (float(l3) - float(line)) > 0
+        l5_support = direction * (float(l5) - float(line)) > 0
+        if l3_support and l5_support:
+            score += 6.0
+            alignment = "BOTH SUPPORT"
+        elif (not l3_support) and (not l5_support):
+            score -= 6.0
+            alignment = "BOTH AGAINST"
+        else:
+            score -= 2.0
+            alignment = "SPLIT"
+
+        # Let L3 identify acceleration/deceleration, while keeping the movement tiny.
+        trend = direction * (float(l3) - float(l5))
+        score += float(clamp(trend * 4.0, -4.0, 4.0))
+        if abs(float(l3) - float(l5)) <= 0.35:
+            score += 2.0
+            note_bits.append("L3/L5 stable")
+        note_bits.extend([f"L3 {float(l3):.2f}", f"L5 {float(l5):.2f}"])
+    else:
+        # A single available window remains useful but is deliberately shrunk toward neutral.
+        score = 50.0 + (score - 50.0) * 0.70
+        alignment = "ONE WINDOW"
+        note_bits.append("single recent window")
+
+    score = round(float(clamp(score, 0.0, 100.0)), 1)
+    return {
+        "HRR L3 Avg": None if l3 is None else round(float(l3), 2),
+        "HRR L5 Avg": None if l5 is None else round(float(l5), 2),
+        "HRR L3/L5 Blend": round(float(blend), 2),
+        "HRR Recent Form Score": score,
+        "HRR Recent Form Alignment": alignment,
+        "HRR Recent Form Note": " | ".join(note_bits),
+    }
+
+
+def build_v3_batter_upside_board_final():
+    df = _build_v3_batter_upside_board_before_factor_ui_v2()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    bfs_map = _ow_current_bfs_map() if "_ow_current_bfs_map" in globals() else {}
+    hrr_map = _ow_current_hrr_map() if "_ow_current_hrr_map" in globals() else {}
+    rows = []
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        key = _ow_cross_norm_player(r.get("Player"))
+        bfs = bfs_map.get(key, {}) or {}
+        hrr = hrr_map.get(key, {}) or {}
+        for field in [
+            "Skill", "Match", "Form", "Contact", "Confidence", "Data Score", "Model Direction",
+            "Model Win Probability %", "FS Shadow Trust Score", "FS Shadow Tier", "FS Shadow Calibration Projection",
+            "L3 FS", "L5 FS", "Season FS/G", "Recent 15d xwOBA", "wOBA/xwOBA",
+        ]:
+            if bfs.get(field) not in (None, "", "—"):
+                r[field] = bfs.get(field)
+        for field in [
+            "Opp Pitcher", "Pitcher Hand", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Projected PA",
+            "Shadow Play Label", "Shadow Environment Support", "HRR Shadow Trust Score", "HRR Shadow Tier V2",
+        ]:
+            if r.get(field) in (None, "", "—") and hrr.get(field) not in (None, "", "—"):
+                r[field] = hrr.get(field)
+
+        # HRR-specific recent form is copied with explicit names so it cannot collide with
+        # Batter Fantasy Form or production HRR fields.
+        hrr_recent_ctx = _ow_hrr_l3_l5_upside_support(hrr)
+        r.update(hrr_recent_ctx)
+        if hrr.get("HRR Shadow Trust Score") not in (None, "", "—"):
+            r["HRR Shadow Trust Score"] = hrr.get("HRR Shadow Trust Score")
+        if hrr.get("Confidence") not in (None, "", "—"):
+            r["HRR Confidence"] = hrr.get("Confidence")
+        if hrr.get("Edge") not in (None, "", "—"):
+            r["HRR Production Edge"] = hrr.get("Edge")
+        if hrr.get("Win Probability %") not in (None, "", "—"):
+            r["HRR Win Probability %"] = hrr.get("Win Probability %")
+
+        r.update(_ow_bfs_factor_support_v2(r))
+
+        likely = float(_ow_factor_num(r, "Likely Score", 50.0) or 50.0)
+        upside = float(_ow_factor_num(r, "Upside Score", 50.0) or 50.0)
+        prob = float(_ow_factor_num(r, "Best Win/Hit %", 50.0) or 50.0)
+        envfit = float(_ow_factor_num(r, "Side Environment Fit", 50.0) or 50.0)
+        skill = float(_ow_factor_num(r, "Skill", 50.0) or 50.0)
+        match = float(_ow_factor_num(r, "Match", 50.0) or 50.0)
+        contact = float(_ow_factor_num(r, "Contact", 50.0) or 50.0)
+        form0 = float(_ow_factor_num(r, "Form", 50.0) or 50.0)
+        recent_fs = float(_ow_factor_num(r, "FS Recent Form Score V2", form0) or form0)
+        form = 0.70 * form0 + 0.30 * recent_fs
+        consensus = float(_ow_factor_num(r, "Cross-Market Consensus Score", _ow_cross_consensus_score(r.get("Cross-Market Agreement")) if "_ow_cross_consensus_score" in globals() else 50.0) or 50.0)
+
+        market_txt = str(r.get("Best Market") or r.get("Market") or "").upper()
+        is_hrr = ("H+R+RBI" in market_txt) or ("HRR" in market_txt) or ("HITS + RUNS + RBI" in market_txt)
+        hrr_recent = float(_ow_factor_num(r, "HRR Recent Form Score", 50.0) or 50.0)
+        hrr_trust = float(_ow_factor_num(r, "HRR Shadow Trust Score", 50.0) or 50.0)
+
+        if is_hrr:
+            # HRR Batter Upside is explicitly designed to find the BEST plays to win.
+            # Production likelihood remains the anchor; L3/L5 gets a meaningful but controlled
+            # 10% role, with 4% for shadow trust.  This is ranking only, not projection math.
+            best = (
+                0.35*likely + 0.13*upside + 0.12*prob + 0.08*envfit +
+                0.05*skill + 0.05*match + 0.06*contact +
+                0.10*hrr_recent + 0.04*hrr_trust + 0.02*consensus
+            )
+            r["Upside Form Score"] = round(hrr_recent, 1)
+            r["Upside Form Source"] = "HRR L3/L5"
+            r["Batter Upside HRR L3/L5 Active"] = "YES"
+        else:
+            # Home Run / other batter markets keep the existing factor mix.
+            best = 0.39*likely + 0.14*upside + 0.13*prob + 0.08*envfit + 0.06*skill + 0.06*match + 0.07*contact + 0.05*form + 0.02*consensus
+            r["Upside Form Score"] = round(form, 1)
+            r["Upside Form Source"] = "FS/GENERAL FORM"
+            r["Batter Upside HRR L3/L5 Active"] = "NO"
+
+        if str(r.get("Cross-Market Agreement") or "").upper() == "DISAGREE":
+            best -= 3.0
+        r["Best Play Score"] = round(float(clamp(best, 0, 100)), 1)
+        rows.append(r)
+    d = pd.DataFrame(rows)
+    d = d.sort_values(["Best Play Score", "Likely Score", "Upside Score"], ascending=[False, False, False], kind="mergesort", na_position="last").reset_index(drop=True)
+    d["Rank"] = np.arange(1, len(d)+1, dtype=int)
+    return d
+
+
+def _ow_upside_clean_cards_v2(df, max_rows=None):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No batter upside cards to show.")
+        return
+    d = df.copy()
+    if "Best Play Score" in d.columns:
+        d = d.sort_values(["Best Play Score"], ascending=False, kind="mergesort", na_position="last")
+    if max_rows:
+        d = d.head(int(max_rows))
+
+    def esc(v):
+        return html.escape(str(v if v not in (None, "", "None", "nan") else "—"))
+    def n(v, default=50.0):
+        x = _ow_factor_num({"x": v}, "x", None)
+        return float(default if x is None else x)
+    def fmt(v, digits=1):
+        try:
+            x = float(v)
+            if not np.isfinite(x):
+                return "—"
+            return f"{x:.{digits}f}"
+        except Exception:
+            return esc(v)
+    def bar(label, value, fill):
+        vv = float(clamp(n(value), 0, 100))
+        return f"<div class='ow-up-factor'><div><span>{esc(label)}</span><b>{vv:.0f}</b></div><div class='ow-up-track'><i style='width:{vv:.0f}%;background:{fill}'></i></div></div>"
+
+    st.markdown("""
+    <style>
+    .ow-up-grid{display:grid;grid-template-columns:1fr;gap:12px;margin:10px 0 14px}
+    .ow-up-card{min-width:0;background:linear-gradient(145deg,rgba(95,16,151,.18),#080b12 34%,#0b111c 76%,rgba(177,126,15,.11));border:1px solid rgba(244,194,56,.86);border-radius:14px;padding:11px 12px 10px;box-shadow:inset 0 1px 0 rgba(219,39,255,.30),0 7px 22px rgba(0,0,0,.32);box-sizing:border-box;overflow:hidden}
+    .ow-up-head{display:flex;justify-content:space-between;align-items:center;gap:9px;border:1px solid rgba(218,39,255,.72);border-radius:9px;padding:7px 9px}
+    .ow-up-name{font-size:15px;font-weight:900;color:#f7f7fb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+    .ow-up-best{font-size:10px;font-weight:900;color:#ffd24a;white-space:nowrap}
+    .ow-up-meta{font-size:9px;color:#969caf;margin:7px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ow-up-chips{display:grid;grid-template-columns:1.05fr .9fr 1fr;gap:6px;margin-bottom:8px}
+    .ow-up-chip{border:1px solid rgba(242,196,58,.60);border-radius:9px;padding:6px 5px;text-align:center;font-size:9px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#f4c63b}
+    .ow-up-chip.market{border-color:#d929ff;color:#e760ff}.ow-up-chip.good{border-color:#39e99b;color:#39e99b}
+    .ow-up-factors{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 9px;margin:5px 0 8px}
+    .ow-up-factor>div:first-child{display:flex;justify-content:space-between;font-size:8px;color:#a6adbd;font-weight:800;margin-bottom:3px}
+    .ow-up-factor b{color:#d8dde7}.ow-up-track{height:6px;background:#202839;border-radius:999px;overflow:hidden}.ow-up-track i{display:block;height:100%;border-radius:999px}
+    .ow-up-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:7px 0}
+    .ow-up-tile{background:#101827;border:1px solid #263248;border-radius:9px;padding:7px 8px;min-width:0}.ow-up-tile span{display:block;font-size:8px;color:#8f98ab;font-weight:800}.ow-up-tile b{display:block;font-size:12px;color:#f5f6fa;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ow-up-tile b.green{color:#42e8a0}.ow-up-tile b.cyan{color:#47d8ff}
+    .ow-up-env{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:6px}.ow-up-env div{background:rgba(17,24,39,.75);border:1px solid rgba(89,101,128,.35);border-radius:7px;padding:5px 3px;text-align:center}.ow-up-env span{display:block;font-size:7px;color:#7e8799;font-weight:800}.ow-up-env b{display:block;font-size:9px;color:#dfe5ef;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ow-up-flags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px;min-height:19px}.ow-up-flag{font-size:7px;border:1px solid rgba(255,93,127,.33);color:#ff8098;border-radius:999px;padding:3px 5px;white-space:nowrap;max-width:48%;overflow:hidden;text-overflow:ellipsis}.ow-up-flag.ok{border-color:rgba(66,232,160,.30);color:#42e8a0}
+    @media(min-width:900px){.ow-up-grid{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}.ow-up-card{height:100%}}
+    @media(max-width:520px){.ow-up-grid{gap:9px}.ow-up-card{border-radius:12px;padding:9px 10px 8px}.ow-up-head{padding:6px 8px}.ow-up-name{font-size:14px}.ow-up-meta{font-size:8px;margin:6px 1px}.ow-up-chips{gap:4px;margin-bottom:7px}.ow-up-chip{font-size:8px;padding:5px 3px}.ow-up-factors{gap:5px 7px}.ow-up-tiles{gap:4px}.ow-up-tile{padding:6px}.ow-up-env{gap:4px}.ow-up-env b{font-size:8px}}
+    </style>
+    """, unsafe_allow_html=True)
+
+    cards = []
+    for idx, (_, rr) in enumerate(d.iterrows(), start=1):
+        r = rr.to_dict()
+        rank = int(_ow_factor_num(r, "Rank", idx) or idx)
+        player = r.get("Player", "—")
+        best = r.get("Best Play Score", "—")
+        market = r.get("Best Market") or r.get("Market") or "H+R+RBI"
+        pick = r.get("Best Pick") or r.get("HRR Pick") or r.get("Pick") or "—"
+        line = r.get("Best Line") if r.get("Best Line") not in (None, "") else r.get("HRR Line")
+        proj = r.get("Best Projection") if r.get("Best Projection") not in (None, "") else r.get("HRR Projection")
+        prob = r.get("Best Win/Hit %") if r.get("Best Win/Hit %") not in (None, "") else r.get("Model Win Probability %")
+        pa = r.get("Projected PA", "—")
+        team, opp = r.get("Team", "—"), r.get("Opponent", "—")
+        pitcher = r.get("Opp Pitcher", "—")
+        phand = r.get("Pitcher Hand", "")
+        pera, pwhip, pbaa = r.get("Pitcher ERA", "—"), r.get("Pitcher WHIP", "—"), r.get("Pitcher BAA", "—")
+        skill = n(r.get("Skill")); match = n(r.get("Match")); contact = n(r.get("Contact"))
+        form = n(r.get("Upside Form Score") if r.get("Upside Form Score") not in (None, "", "—") else r.get("Form"))
+        market_upper = str(market or "").upper()
+        form_label = "L3/L5" if (("H+R+RBI" in market_upper) or ("HRR" in market_upper) or ("HITS + RUNS + RBI" in market_upper)) else "FORM"
+        hs, off, blow = r.get("High Scoring Game Score", "—"), r.get("Team Offensive Score", "—"), r.get("Blowout Score", "—")
+        cross = str(r.get("Cross-Market Agreement") or "—")
+        likely = r.get("Likely Score", "—")
+        risk_txt = str(r.get("No-Bet Risk Flags") or "").strip()
+        raw_flags = [x.strip() for x in risk_txt.replace(";", "|").split("|") if x.strip() and x.strip().lower() not in {"clean", "none", "—"}]
+        if not raw_flags:
+            raw_flags = ["clean context"]
+        flags = raw_flags[:2]
+        flag_html = "".join(f"<span class='ow-up-flag{' ok' if f.lower()=='clean context' else ''}'>{esc(f)}</span>" for f in flags)
+        meta = f"{team} vs {opp} · vs {pitcher} {str(phand)+'HP' if phand not in (None,'','—') else ''} · ERA {fmt(pera,2)} WHIP {fmt(pwhip,2)} BAA {fmt(pbaa,3)}"
+        cards.append(f"""
+        <div class='ow-up-card'>
+          <div class='ow-up-head'><div class='ow-up-name'>#{rank} {esc(player)}</div><div class='ow-up-best'>BEST {fmt(best,1)}</div></div>
+          <div class='ow-up-meta'>{esc(meta)}</div>
+          <div class='ow-up-chips'>
+            <div class='ow-up-chip market'>{esc(str(market).upper())}</div>
+            <div class='ow-up-chip'>{esc(str(pick).upper())} {fmt(line,1)}</div>
+            <div class='ow-up-chip good'>LIKELY {fmt(likely,0)}</div>
+          </div>
+          <div class='ow-up-factors'>
+            {bar('SKILL',skill,'#c82cff')}{bar('MATCH',match,'#f2c84b')}{bar(form_label,form,'#42d7a1')}{bar('CONTACT',contact,'#56c8f2')}
+          </div>
+          <div class='ow-up-tiles'>
+            <div class='ow-up-tile'><span>PROJECTION</span><b>{fmt(proj,2)}</b></div>
+            <div class='ow-up-tile'><span>WIN / HIT</span><b class='green'>{fmt(prob,1)}%</b></div>
+            <div class='ow-up-tile'><span>PA</span><b class='cyan'>{fmt(pa,1)}</b></div>
+          </div>
+          <div class='ow-up-env'>
+            <div><span>GAME</span><b>{fmt(hs,0)}</b></div><div><span>TEAM</span><b>{fmt(off,0)}</b></div><div><span>BLOWOUT</span><b>{fmt(blow,0)}</b></div><div><span>CROSS</span><b>{esc(cross)}</b></div>
+          </div>
+          <div class='ow-up-flags'>{flag_html}</div>
+        </div>
+        """)
+    st.markdown("<div class='ow-up-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def render_v3_top_batter_plays_board():
+    st.markdown('<div class="section-title-pro">🔥 Batter Upside — Best Cross-Market Opportunities</div>', unsafe_allow_html=True)
+    st.caption("Active H+R+RBI/Home Run opportunities, ranked best-to-worst. HRR cards use side-aware L3/L5 recent form as a controlled ranking signal; production projections remain untouched.")
+    df = build_v3_batter_upside_board_final()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No active Underdog batter lines matched yet. Refresh after the board posts.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("UD Players", len(df))
+    top_best = pd.to_numeric(df.get("Best Play Score"), errors="coerce") if "Best Play Score" in df.columns else pd.Series(dtype=float)
+    c2.metric("Top Best", "—" if top_best.empty or top_best.dropna().empty else f"{float(top_best.max()):.1f}")
+    c3.metric("Cross Agree", int(df.get("Cross-Market Agreement", pd.Series(dtype=str)).astype(str).str.upper().eq("AGREE").sum()) if "Cross-Market Agreement" in df.columns else "—")
+    c4.metric("Mode", "HRR + HR + FS")
+    _ow_upside_clean_cards_v2(df, max_rows=len(df))
+    with st.expander("Full Batter Upside data", expanded=False):
+        cols = [c for c in ["Rank","Player","Best Play Score","Best Market","Best Pick","Best Line","Best Projection","Best Win/Hit %","Likely Score","Upside Score","Skill","Match","Upside Form Score","Upside Form Source","Contact","HRR L3 Avg","HRR L5 Avg","HRR L3/L5 Blend","HRR Recent Form Score","HRR Recent Form Alignment","HRR Recent Form Note","HRR Shadow Trust Score","FS Recent Form Score V2","FS Factor Support Score","Projected PA","High Scoring Game Score","Team Offensive Score","Blowout Score","Cross-Market Agreement","Opp Pitcher","Pitcher Hand","Pitcher ERA","Pitcher WHIP","Pitcher BAA"] if c in df.columns]
+        st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    _ow_render_copy_paste_slate(df, "Batter Upside", "batter_upside_v2", max_rows=12)
+
+
+_render_v3_batter_fantasy_tab_before_factor_v2 = render_v3_batter_fantasy_tab
+
+def render_v3_batter_fantasy_tab():
+    _render_v3_batter_fantasy_tab_before_factor_v2()
+    d = st.session_state.get("ow_bfs_df")
+    if not isinstance(d, pd.DataFrame) or d.empty:
+        return
+    d = _ow_bfs_rank_full_board(d)
+    st.session_state["ow_bfs_df"] = d
+    with st.expander("🧭 FS Skill / Match / Form / Contact Audit", expanded=False):
+        st.caption("Recent form is sample-aware: L3 + L5 are the primary short-term windows; 15-day Statcast is supporting evidence. The production event engine already blends season + recent per-PA rates, while this V2 layer uses the four scores to improve ranking and shadow trust without rewriting scoring.")
+        cols = [c for c in ["Rank","Player","Projection","Line","Model Direction","Model Win Probability %","Skill","Match","Form","Contact","FS Recent Form Score V2","FS Factor Support Score","FS Factor Coverage %","L3 FS","L5 FS","Season FS/G","Recent 15d xwOBA","FS Shadow Calibration Projection","FS Shadow Trust Score","FS Shadow Tier","Best Play Score"] if c in d.columns]
+        st.dataframe(d[cols].head(60), use_container_width=True, hide_index=True)
 
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
