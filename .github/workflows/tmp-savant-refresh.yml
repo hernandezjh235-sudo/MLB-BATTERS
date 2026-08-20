@@ -3,6 +3,9 @@ on:
   push:
     branches:
       - tmp-savant-refresh-20260820
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -22,14 +25,6 @@ jobs:
         run: python -m pip install --quiet pandas requests
       - name: Fetch Savant data
         run: python tmp_savant_refresh.py
-      - name: Commit refresh output
-        if: always()
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add savant_refresh_output || true
-          git diff --cached --quiet || git commit -m "Temporary Savant refresh output [skip ci]"
-          git push || true
       - name: Upload refresh output
         if: always()
         uses: actions/upload-artifact@v4
