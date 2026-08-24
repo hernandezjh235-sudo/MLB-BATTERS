@@ -1,6 +1,6 @@
 {
   "deploy": {
-    "startCommand": "python patch_batter_upside_render.py && streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT",
+    "startCommand": "python patch_batter_upside_render.py && python patch_verified_current_savant.py && python verify_verified_current_savant.py && streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
