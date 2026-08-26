@@ -11386,8 +11386,59 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             if k in row and row.get(k) not in (None, "", "—"):
                 x = num(row.get(k), None)
                 if x is not None:
-                    return clamp_score(x, default)
-        return float(default)
+                    return clamp_score(x, 50 if default is None else default)
+        return None if default is None else float(default)
+
+    def weighted_real_score(row, specs, default=None):
+        """UI-only 0-100 score from real row metrics; missing inputs are reweighted."""
+        parts = []
+        for keys, center, scale, weight, higher in specs:
+            val = None
+            for k in keys:
+                if k in row:
+                    val = num(row.get(k), None)
+                    if val is not None:
+                        break
+            if val is None or not scale:
+                continue
+            z = max(-2.25, min(2.25, (float(val) - float(center)) / float(scale)))
+            if not higher:
+                z = -z
+            parts.append((z, float(weight)))
+        if not parts:
+            return default, 0
+        wsum = sum(w for _, w in parts) or 1.0
+        z = sum(zv * w for zv, w in parts) / wsum
+        score = float(clamp(50.0 + z * 18.0, 8.0, 97.0))
+        return score, len(parts)
+
+    def real_skill_score(row):
+        # Current player ability only: 2026 season/split production + Statcast quality.
+        specs = [
+            (["Split wRC+ Proxy"], 100, 30, 0.20, True),
+            (["Season wRC+ Proxy", "Profile wRC+ Proxy"], 100, 30, 0.14, True),
+            (["Savant xwOBA", "Batter xwOBA", "Recent 30d xwOBA"], 0.320, 0.065, 0.17, True),
+            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA"], 0.245, 0.045, 0.12, True),
+            (["Savant xSLG", "Batter xSLG", "Split SLG", "Season SLG"], 0.410, 0.090, 0.12, True),
+            (["Savant HardHit%", "Batter HardHit%", "Recent 15d HardHit%"], 40.0, 9.0, 0.08, True),
+            (["Savant Barrel%", "Batter Barrel%", "Recent 15d Barrel%"], 7.5, 6.0, 0.06, True),
+            (["Savant K%"], 22.0, 8.0, 0.07, False),
+            (["Savant BB%", "Season BB%", "Split BB%"], 8.5, 5.0, 0.04, True),
+        ]
+        return weighted_real_score(row, specs, default=None)
+
+    def real_contact_score(row):
+        # Actual hitter bat-to-ball/contact indicators; pitcher damage belongs in MATCH.
+        specs = [
+            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA"], 0.245, 0.045, 0.24, True),
+            (["Savant Whiff%", "Batter Whiff%"], 24.0, 7.0, 0.22, False),
+            (["Savant K%"], 22.0, 8.0, 0.20, False),
+            (["Batter Pitch Contact%"], 76.0, 7.0, 0.13, True),
+            (["Batter Pitch Whiff%"], 24.0, 8.0, 0.08, False),
+            (["Split AVG"], 0.245, 0.050, 0.08, True),
+            (["Savant xwOBA", "Batter xwOBA"], 0.320, 0.065, 0.05, True),
+        ]
+        return weighted_real_score(row, specs, default=None)
 
     def parse_ratio_or_pct(val):
         if val in (None, "", "—"):
@@ -11426,57 +11477,80 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         return clamp_score(x, default)
 
     def bar_html(label, value, color, value_text=None):
-        pct = clamp_score(value, 50)
-        show_txt = esc(value_text if value_text not in (None, "") else f"{pct:.0f}")
+        if value is None:
+            pct = 0.0
+            show_txt = esc(value_text if value_text not in (None, "") else "—")
+            fill_style = "background:#394356"
+        else:
+            pct = clamp_score(value, 50)
+            show_txt = esc(value_text if value_text not in (None, "") else f"{pct:.0f}")
+            fill_style = f"background:{color}"
         return (
             f"<div class='ow-stat-row'>"
             f"<div class='ow-stat-head'><span>{esc(label)}</span><b>{show_txt}</b></div>"
-            f"<div class='ow-stat-track'><div class='ow-stat-fill' style='width:{pct:.0f}%;background:{color}'></div></div>"
+            f"<div class='ow-stat-track'><div class='ow-stat-fill' style='width:{pct:.0f}%;{fill_style}'></div></div>"
             f"</div>"
         )
 
     st.markdown(
         """
         <style>
-        .ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:12px}
-        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:18px;padding:12px 14px 12px;box-shadow:0 0 22px rgba(196,33,255,.16)}
-        .ow-card-head{border:1px solid #d827ff;border-radius:12px;padding:8px 10px;display:flex;justify-content:space-between;gap:10px;align-items:center}
+        .ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:8px}
+        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:16px;padding:9px 11px 8px;box-shadow:0 0 18px rgba(196,33,255,.14)}
+        .ow-card-head{border:1px solid #d827ff;border-radius:10px;padding:6px 8px;display:flex;justify-content:space-between;gap:8px;align-items:center}
         .ow-player-top{display:flex;align-items:center;gap:8px;min-width:0}
         .ow-player-logo{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;background:rgba(13,21,34,.72);border:1px solid rgba(255,255,255,.10);font-size:11px;font-weight:800;flex:0 0 28px;overflow:visible}.ow-player-logo img{width:24px!important;height:24px!important;max-width:24px!important;max-height:24px!important;object-fit:contain!important;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
-        .ow-player-name{font-size:17px;font-weight:800;color:#f8f8ff;line-height:1.1;white-space:normal;overflow-wrap:anywhere}
+        .ow-player-name{font-size:15px;font-weight:800;color:#f8f8ff;line-height:1.05;white-space:normal;overflow-wrap:anywhere}
         .ow-card-proj{font-size:12px;color:#f6c43c;font-weight:800;white-space:nowrap}
-        .ow-card-sub{font-size:11px;color:#c3cada;margin:9px 2px 10px;line-height:1.3}
-        .ow-chip-row{display:grid;grid-template-columns:1.1fr .7fr .85fr;gap:8px;margin-bottom:10px}
-        .ow-chip{border-radius:12px;padding:8px 9px;font-size:11px;font-weight:800;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(8,12,20,.55)}
-        .ow-section-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:6px 0 10px}
+        .ow-card-sub{font-size:9px;color:#c3cada;margin:5px 1px 6px;line-height:1.2}
+        .ow-chip-row{display:grid;grid-template-columns:1.1fr .7fr .85fr;gap:5px;margin-bottom:6px}
+        .ow-chip{border-radius:10px;padding:6px 6px;font-size:9px;font-weight:800;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(8,12,20,.55)}
+        .ow-section-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:3px 0 6px}
         .ow-section{min-width:0}
-        .ow-section-title{font-size:10px;color:#9ca6bb;font-weight:800;margin:0 0 6px 1px;text-transform:uppercase;letter-spacing:.4px}
-        .ow-stat-stack{display:flex;flex-direction:column;gap:8px}
-        .ow-stat-row{display:flex;flex-direction:column;gap:4px}
-        .ow-stat-head{display:flex;justify-content:space-between;gap:8px;font-size:10px;color:#c9d1e2;font-weight:800}
+        .ow-section-title{font-size:8px;color:#9ca6bb;font-weight:800;margin:0 0 3px 1px;text-transform:uppercase;letter-spacing:.3px}
+        .ow-stat-stack{display:flex;flex-direction:column;gap:5px}
+        .ow-stat-row{display:flex;flex-direction:column;gap:2px}
+        .ow-stat-head{display:flex;justify-content:space-between;gap:6px;font-size:8px;color:#c9d1e2;font-weight:800}
         .ow-stat-head span{color:#9ca6bb}
-        .ow-stat-track{height:10px;border-radius:999px;background:#202839;overflow:hidden;position:relative}
+        .ow-stat-track{height:7px;border-radius:999px;background:#202839;overflow:hidden;position:relative}
         .ow-stat-fill{height:100%;border-radius:999px;display:block;min-width:0}
-        .ow-primary-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:6px 0 10px}
-        .ow-env-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
-        .ow-tile{background:#111827;border:1px solid #263247;border-radius:10px;padding:8px;min-height:56px}
-        .ow-tile-label{font-size:9px;color:#8f98ad;font-weight:700;margin-bottom:4px}
-        .ow-tile-val{font-size:14px;color:#f8f8ff;font-weight:800;line-height:1.1}
-        .ow-tile-sub{font-size:10px;color:#aeb7c8;margin-top:3px;line-height:1.15}
-        .ow-tile-bar{height:7px;border-radius:999px;background:#202839;overflow:hidden;margin-top:7px}
+        .ow-primary-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin:4px 0 6px}
+        .ow-env-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+        .ow-tile{background:#111827;border:1px solid #263247;border-radius:9px;padding:6px;min-height:43px}
+        .ow-tile-label{font-size:7px;color:#8f98ad;font-weight:700;margin-bottom:2px}
+        .ow-tile-val{font-size:12px;color:#f8f8ff;font-weight:800;line-height:1.05}
+        .ow-tile-sub{font-size:8px;color:#aeb7c8;margin-top:2px;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ow-tile-bar{height:5px;border-radius:999px;background:#202839;overflow:hidden;margin-top:4px}
         .ow-tile-bar > i{display:block;height:100%;border-radius:999px}
-        .ow-card-mini{font-size:10px;color:#8f98ad;margin:10px 2px 0;line-height:1.25}
-        .ow-pill-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-        .ow-pill{font-size:9px;padding:4px 7px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.03)}
+        .ow-card-mini{font-size:8px;color:#8f98ad;margin:5px 1px 0;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ow-pill-row{display:flex;gap:4px;flex-wrap:nowrap;margin-top:5px;overflow:hidden}
+        .ow-pill{font-size:7px;padding:3px 5px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.03);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         @media (max-width: 950px){.ow-card-list{grid-template-columns:1fr}}
         @media (max-width: 700px){
-          .ow-player-card{padding:12px}
-          .ow-player-logo{width:26px;height:26px;flex-basis:26px}.ow-player-logo img{width:23px!important;height:23px!important;max-width:23px!important;max-height:23px!important}
-          .ow-chip-row{grid-template-columns:1fr 1fr 1fr}
-          .ow-section-grid{grid-template-columns:1fr}
-          .ow-primary-tiles,.ow-env-tiles{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
-          .ow-tile{padding:7px;min-height:58px}
-          .ow-tile-val{font-size:13px}
+          .ow-card-list{gap:6px;margin-top:5px}
+          .ow-player-card{padding:5px 7px 5px;border-radius:13px}
+          .ow-card-head{padding:4px 6px;border-radius:8px}
+          .ow-player-logo{width:22px;height:22px;flex-basis:22px;border-radius:6px}.ow-player-logo img{width:20px!important;height:20px!important;max-width:20px!important;max-height:20px!important}
+          .ow-player-name{font-size:12px;line-height:1}
+          .ow-card-proj{font-size:9px}
+          .ow-card-sub{font-size:7px;margin:3px 1px 4px;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .ow-chip-row{grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px}
+          .ow-chip{padding:4px 4px;font-size:7px;border-radius:8px}
+          .ow-section-grid{grid-template-columns:1fr 1fr;gap:6px;margin:2px 0 4px}
+          .ow-section-title{display:none}
+          .ow-stat-stack{gap:3px}
+          .ow-stat-row{gap:1px}
+          .ow-stat-head{font-size:7px}
+          .ow-stat-track{height:5px}
+          .ow-primary-tiles,.ow-env-tiles{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+          .ow-primary-tiles{margin:2px 0 4px}
+          .ow-tile{padding:4px;min-height:32px;border-radius:7px}
+          .ow-tile-label{font-size:6px;margin-bottom:1px}
+          .ow-tile-val{font-size:9px}
+          .ow-tile-sub{font-size:6.5px;margin-top:1px}
+          .ow-tile-bar{height:3px;margin-top:2px}
+          .ow-card-mini{font-size:6.5px;margin:3px 1px 0;line-height:1;white-space:nowrap}
+          .ow-pill-row{display:none}
         }
         </style>
         """,
@@ -11520,29 +11594,40 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             row_logo = poster_value(row, "Team Logo", "Batter Team Logo", "Logo", default="")
             logo_html = f"<img src='{esc(row_logo)}' alt='{esc(team_abbr)} logo'/>" if str(row_logo).startswith("http") else esc(team_abbr)
 
-        skill_score = score_from_keys(row, ["Skill", "Overall Rating", "Likely Score", "Upside Score"], default=score_from_keys(row, ["Likely Score"], 50))
-        match_score = score_from_keys(row, ["Match", "Pitcher Run/Contact Score", "Pitcher Allows Hits Score", "Pitcher Power Damage Score", "Pitcher Split K%"], default=50)
-        contact_score = score_from_keys(row, ["Contact", "Pitcher Contact/Leash Score", "Pitcher Contact Allowed Score", "Pitcher Contact Factor"], default=50)
+        skill_score, skill_inputs = real_skill_score(row)
+        match_score = score_from_keys(row, ["Match", "Pitcher Run/Contact Score", "Pitcher Allows Hits Score", "Pitcher Power Damage Score", "Pitcher Contact/Leash Score"], default=None)
+        contact_score, contact_inputs = real_contact_score(row)
 
         l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("L3") or row.get("Recent 3") or row.get("L3 Hit Rate") or row.get("Last 3 %"))
         l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("L5") or row.get("Recent 5") or row.get("L5 Hit Rate") or row.get("Last 5 %"))
         if l3_val is None and l5_val is None:
-            form_score = score_from_keys(row, ["Form", "Best Win/Hit %", "Win Probability %"], default=50)
-            form_label = f"{form_score:.0f}"
+            form_score = None
+            form_label = "—/—"
         else:
             vals = [v for v in [l3_val, l5_val] if v is not None]
-            form_score = sum(vals) / len(vals) if vals else 50
+            form_score = sum(vals) / len(vals) if vals else None
             l3_txt = "—" if l3_val is None else f"{l3_val:.0f}"
             l5_txt = "—" if l5_val is None else f"{l5_val:.0f}"
             form_label = f"{l3_txt}/{l5_txt}"
 
-        game_score = score_from_keys(row, ["Game Score", "Blowout Run Score", "Likely Score"], default=50)
-        team_score = score_from_keys(row, ["Team Score", "Team Context Score"], default=env_score(row.get("Team Run Environment"), 50))
+        team_runs_val = num(poster_value(row, "Team Implied Runs", "Projected Team Runs", "Team Run Env", "ImpR", default=None), None)
+        team_score = score_from_keys(row, ["Team Score", "Team Context Score", "Offense Env Score"], default=env_score(team_runs_val, 50) if team_runs_val is not None else 50)
+        # Keep high-scoring/game environment independent from blowout probability.
+        # If no dedicated game-total score is present, team run environment is the
+        # conservative display fallback rather than reusing the blowout score.
+        game_score = score_from_keys(row, ["High Scoring Game Score", "Game Environment Score", "Game Score"], default=team_score)
         blowout_score = score_from_keys(row, ["Blowout Run Score", "Blowout Score"], default=50)
-        cross_note = poster_value(row, "Cross Check", "Cross-Fit", "Cross Fits", default="AGREE")
-        game_signal = poster_value(row, "Blowout Stack Signal", "Game Environment Label", default="GAME")
+        cross_note = poster_value(row, "Cross Check", "FS Cross Check", "Cross-Fit", "Cross Fits", default="FS NOT BUILT")
+        game_signal = poster_value(row, "High Scoring Game Label", "Game Environment Label", default=("ELEVATED" if game_score >= 62 else "LOW" if game_score <= 38 else "NEUTRAL"))
         blowout_label = poster_value(row, "Blowout Risk Label", default="LOW")
-        team_note = poster_value(row, "Team Run Environment", default="AVG")
+        team_source = str(poster_value(row, "Team Implied Runs Source", default="")).replace("ODDS_API_CONSENSUS_TOTAL_SPREAD", "ODDS").replace("MLB_2026_OFFENSE_PROXY", "MLB PROXY").replace("ODDS_API_TOTAL_H2H_PROXY", "ODDS")
+        if team_runs_val is not None:
+            team_level = "HIGH" if team_runs_val >= 5.2 else "ABOVE AVG" if team_runs_val >= 4.7 else "AVG" if team_runs_val >= 4.1 else "BELOW AVG" if team_runs_val >= 3.6 else "LOW"
+            team_tile_value = f"{team_runs_val:.2f} R"
+            team_note = f"{team_level}" + (f" • {team_source}" if team_source and team_source not in {"—", "MISSING"} else "")
+        else:
+            team_tile_value = f"{team_score:.0f}"
+            team_note = "NO TOTAL • NEUTRAL"
 
         cards.append(textwrap.dedent(f"""
             <div class="ow-player-card">
@@ -11589,7 +11674,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
                 </div>
                 <div class="ow-tile">
                   <div class="ow-tile-label">TEAM</div>
-                  <div class="ow-tile-val">{esc(_ow_fmt_slate_num(team_score, 0))}</div>
+                  <div class="ow-tile-val">{esc(team_tile_value)}</div>
                   <div class="ow-tile-sub">{esc(team_note)}</div>
                   <div class="ow-tile-bar"><i style="width:{team_score:.0f}%;background:#52e3a4"></i></div>
                 </div>
@@ -11600,7 +11685,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
                   <div class="ow-tile-bar"><i style="width:{blowout_score:.0f}%;background:#f6c43c"></i></div>
                 </div>
               </div>
-              <div class="ow-card-mini">Cross: {esc(cross_note)} · <span style="color:{risk_color}">Risk {esc(risk)}</span></div>
+              <div class="ow-card-mini">DATA {esc(_ow_fmt_slate_num(row.get('Data Coverage %'),0))}% · S{skill_inputs}/C{contact_inputs} · Cross {esc(cross_note)} · Missing {esc(str(row.get('Missing Data') or 'NONE').split(' | ')[0])}</div>
               <div class="ow-pill-row">
                 <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('PA Sim Volatility Label') or row.get('Volatility') or 'normal').lower())}</span>
                 <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('Pitcher Confirmed') or row.get('Pitcher Confirmation Note') or 'probable pitcher not confirmed'))}</span>
@@ -33958,6 +34043,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
         if sim_hrr_over is not None:
             over_prob = clamp((0.76 * (over_prob * 100) + 0.24 * sim_hrr_over) / 100.0, 0.01, 0.99)
         pick = "OVER" if edge >= 0 else "UNDER"
+        l3, l3_pct = _ow_hit_rate_text(vals[-3:], float(line), pick)
         l5, l5_pct = _ow_hit_rate_text(vals[-5:], float(line), pick)
         l10, l10_pct = _ow_hit_rate_text(vals[-10:], float(line), pick)
         l15, l15_pct = _ow_hit_rate_text(vals[-15:], float(line), pick)
@@ -34026,6 +34112,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Prior H+R+RBI Projection": round(hrr_prior_proj, 2) if hrr_prior_proj is not None else "—",
             "Prior H+R+RBI Probability %": round(hrr_prior_prob, 1) if hrr_prior_prob is not None else "—",
             "Confidence": conf,
+            "Last 3": l3,
             "Last 5": l5,
             "Last 10": l10,
             "Last 15": l15,
@@ -34041,6 +34128,7 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "H2H Avg": round(float(np.mean(h2h_vals)), 2) if h2h_vals else "—",
             "H2H Median": round(float(np.median(h2h_vals)), 2) if h2h_vals else "—",
             "Same-Line": same,
+            "Last 3 Avg": round(float(np.mean(vals[-3:])), 2) if vals else "—",
             "Average": round(float(np.mean(vals)), 2) if vals else proj,
             "Median": round(float(np.median(vals)), 2) if vals else proj,
             "Projected PA": projected_pa,
@@ -34196,6 +34284,8 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "Starter Leash Label": bullpen_leash_ctx.get("Starter Leash Label"),
             "Starter Leash Note": bullpen_leash_ctx.get("Starter Leash Note"),
             "Bullpen Rest Note": bullpen_leash_ctx.get("Bullpen Rest Note"),
+            "Team Implied Runs": round(float(team_runs), 2) if team_runs is not None else "—",
+            "Team Implied Runs Source": team_ctx.get("Team Implied Runs Source", "MISSING"),
             "Team Run Environment": team_run_note,
             "Run Factor": round(run_factor, 3),
             "Blowout Environment Factor": blowout_factor,
@@ -34830,6 +34920,8 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Starter Leash Label": bullpen_leash_ctx.get("Starter Leash Label"),
             "Starter Leash Note": bullpen_leash_ctx.get("Starter Leash Note"),
             "Bullpen Rest Note": bullpen_leash_ctx.get("Bullpen Rest Note"),
+            "Team Implied Runs": round(float(team_runs), 2) if team_runs is not None else "—",
+            "Team Implied Runs Source": team_ctx.get("Team Implied Runs Source", "MISSING"),
             "Team Run Environment": team_run_note,
             "Blowout Environment Factor": blowout_factor,
             "Blowout Run Score": blowout_ctx.get("Blowout Run Score"),
@@ -35190,6 +35282,25 @@ def build_v3_batter_upside_board_final():
                     "Pitch Mix Matchup Factor": rd.get("Pitch Mix Matchup Factor", d.get("Pitch Mix Matchup Factor")),
                     "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
                 })
+                # Preserve the actual hitter/current-data fields for the shared non-FS
+                # card renderer. Display-only: no projection or ranking math changes.
+                for _k in [
+                    "Player ID", "Last 3", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30",
+                    "Last 3 Avg", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg",
+                    "Season PA", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%",
+                    "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG",
+                    "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split OPS", "Split wRC+ Proxy",
+                    "Savant Hitter Found", "Savant PA", "Savant xwOBA", "Savant xBA", "Savant xSLG",
+                    "Savant xOBP", "Savant wOBA", "Savant K%", "Savant BB%", "Savant Whiff%",
+                    "Savant Chase%", "Savant HardHit%", "Savant Barrel%", "Savant Avg EV",
+                    "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%",
+                    "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%",
+                    "Recent 15d xwOBA", "Recent 30d xwOBA", "Batter Pitch Contact%",
+                    "Batter Pitch Whiff%", "Batter Pitch wOBA", "Batter Pitch SLG",
+                    "Team Implied Runs", "Team Implied Runs Source", "Team Run Environment",
+                ]:
+                    if rd.get(_k) not in (None, "", "—"):
+                        d[_k] = rd.get(_k)
     except Exception:
         pass
 
@@ -35296,6 +35407,64 @@ def build_v3_batter_upside_board_final():
                     "Pitch Mix Matchup Factor": rd.get("Pitch Mix Matchup Factor", d.get("Pitch Mix Matchup Factor")),
                     "Official Play Filter": rd.get("Official Play Filter", d.get("Official Play Filter")),
                 })
+                # Preserve the actual hitter/current-data fields for the shared non-FS
+                # card renderer. Display-only: no projection or ranking math changes.
+                for _k in [
+                    "Player ID", "Last 3", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30",
+                    "Last 3 Avg", "Last 5 Avg", "Last 10 Avg", "Last 15 Avg", "Last 20 Avg", "Last 30 Avg",
+                    "Season PA", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%",
+                    "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG",
+                    "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split OPS", "Split wRC+ Proxy",
+                    "Savant Hitter Found", "Savant PA", "Savant xwOBA", "Savant xBA", "Savant xSLG",
+                    "Savant xOBP", "Savant wOBA", "Savant K%", "Savant BB%", "Savant Whiff%",
+                    "Savant Chase%", "Savant HardHit%", "Savant Barrel%", "Savant Avg EV",
+                    "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%",
+                    "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%",
+                    "Recent 15d xwOBA", "Recent 30d xwOBA", "Batter Pitch Contact%",
+                    "Batter Pitch Whiff%", "Batter Pitch wOBA", "Batter Pitch SLG",
+                    "Team Implied Runs", "Team Implied Runs Source", "Team Run Environment",
+                ]:
+                    if rd.get(_k) not in (None, "", "—"):
+                        d[_k] = rd.get(_k)
+    except Exception:
+        pass
+
+    # Shadow FS ↔ HRR consistency audit. Batter Fantasy remains its own formula/market.
+    # We only compare its simulated H/G + R/G + RBI/G to HRR; no projection is overwritten.
+    _fs_cross_state = "FS NOT BUILT"
+    try:
+        fs_df = st.session_state.get("ow_bfs_df")
+        _fs_built_at = st.session_state.get("ow_bfs_built_at")
+        _fs_current = False
+        if isinstance(fs_df, pd.DataFrame) and not fs_df.empty:
+            try:
+                _fs_date = pd.to_datetime(_fs_built_at, errors="coerce") if _fs_built_at else pd.NaT
+                _today = california_now().date()
+                _fs_current = (not pd.isna(_fs_date)) and (_fs_date.date() == _today)
+            except Exception:
+                _fs_current = False
+            _fs_cross_state = "FS CURRENT" if _fs_current else "FS STALE"
+        if isinstance(fs_df, pd.DataFrame) and not fs_df.empty and _fs_current:
+            for _, _fr in fs_df.iterrows():
+                _fd = _fr.to_dict()
+                _p = _fd.get("Player")
+                _d = getrow(_p)
+                if _d is None:
+                    continue
+                _h = _v3_final_num(_fd.get("H/G"), None)
+                _r = _v3_final_num(_fd.get("R/G"), None)
+                _rbi = _v3_final_num(_fd.get("RBI/G"), None)
+                _fs_hrr = (_h + _r + _rbi) if all(v is not None for v in [_h, _r, _rbi]) else None
+                _d["FS Projection"] = _v3_final_num(_fd.get("Projection") or _fd.get("FS Projection"), None)
+                _d["FS Line"] = _fd.get("Line")
+                _d["FS Direction"] = _fd.get("Model Direction") or _fd.get("Model Side") or _fd.get("Pick")
+                _d["FS Win Probability %"] = _v3_final_num(_fd.get("Model Win Probability %") or _fd.get("Win Probability %"), None)
+                _d["FS HRR Event Projection"] = round(float(_fs_hrr), 2) if _fs_hrr is not None else None
+                _d["FS H/G"] = _h
+                _d["FS R/G"] = _r
+                _d["FS RBI/G"] = _rbi
+                _d["FS Data Score"] = _v3_final_num(_fd.get("Data Score"), None)
+                _d["FS Contact Score"] = _v3_final_num(_fd.get("Contact"), None)
     except Exception:
         pass
 
@@ -35422,13 +35591,70 @@ def build_v3_batter_upside_board_final():
         daily_clean = not bool(d.get("Daily Data Hard Stop")) and (_v3_final_num(d.get("Daily Data Score"), 0) or 0) >= 74
         d["Clean Risk"] = "YES" if not clean_flags and matchup_ok and pitcher_confirmed and lineup_confirmed and guard_clean and daily_clean else "NO"
         d["Upside Score"] = int(round(clamp(score, 0, 100)))
+
+        # Cross-market sanity check: compare the Fantasy event model's H+R+RBI expectation
+        # to HRR. This is audit/ranking context only; neither core projection is changed.
+        _fs_hrr = _v3_final_num(d.get("FS HRR Event Projection"), None)
+        _hrr_line = _v3_final_num(d.get("HRR Line"), None)
+        _hrr_pick = str(d.get("HRR Pick") or "").upper()
+        if _fs_hrr is not None and hrr > 0:
+            _gap = abs(float(_fs_hrr) - float(hrr))
+            _fs_side = None
+            if _hrr_line is not None:
+                if _fs_hrr > _hrr_line: _fs_side = "OVER"
+                elif _fs_hrr < _hrr_line: _fs_side = "UNDER"
+                else: _fs_side = "PUSH"
+            _same_side = (_fs_side in {None, "PUSH"}) or (_hrr_pick not in {"OVER", "UNDER"}) or (_fs_side == _hrr_pick)
+            if _gap <= 0.70 and _same_side:
+                _cross = "AGREE"
+            elif _gap <= 1.15 and _same_side:
+                _cross = "WATCH"
+            else:
+                _cross = "DISAGREE"
+            d["FS-HRR Gap"] = round(_gap, 2)
+            d["FS HRR Side"] = _fs_side or "—"
+            d["FS Cross Check"] = _cross
+            d["Cross Check"] = _cross
+        else:
+            d["FS-HRR Gap"] = None
+            d["FS HRR Side"] = "—"
+            d["FS Cross Check"] = _fs_cross_state
+            d["Cross Check"] = _fs_cross_state
+
+        # Row-level coverage audit for the exact information used by these display scores.
+        _coverage_groups = {
+            "identity": any(d.get(k) not in (None, "", "—") for k in ["Player ID", "Player"]),
+            "skill": any(_v3_final_num(d.get(k), None) is not None for k in ["Savant xwOBA", "Savant xBA", "Savant xSLG", "Split wRC+ Proxy", "Season wRC+ Proxy"]),
+            "contact": any(_v3_final_num(d.get(k), None) is not None for k in ["Savant Whiff%", "Savant K%", "Batter Pitch Contact%", "Batter Pitch Whiff%", "Split AVG"]),
+            "pitcher": any(_v3_final_num(d.get(k), None) is not None for k in ["Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Run/Contact Score"]),
+            "split": any(d.get(k) not in (None, "", "—") for k in ["Split vs Hand", "Pitcher Split vs Batter Hand"]),
+            "pa": _v3_final_num(d.get("Projected PA"), None) is not None,
+            "recent": any(d.get(k) not in (None, "", "—") for k in ["Last 3", "Last 5"]),
+            "team_runs": _v3_final_num(d.get("Team Implied Runs"), None) is not None,
+            "pitch_mix": _v3_final_num(d.get("Pitch Mix Matchup Factor"), None) is not None,
+            "lineup": d.get("Lineup Status") not in (None, "", "—"),
+        }
+        _loaded = sum(bool(v) for v in _coverage_groups.values())
+        d["Data Coverage %"] = int(round((_loaded / max(1, len(_coverage_groups))) * 100))
+        d["Missing Data"] = " | ".join(k for k, v in _coverage_groups.items() if not v) or "NONE"
         out.append(d)
     if not out:
         return pd.DataFrame()
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
     df = df.sort_values(["Likely Score", "Upside Score", "Best Hit Rate %"], ascending=[False, False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
-    cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Line Opportunity Class", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Recent Contact Damage Score", "Pitcher Recent H/9", "Pitcher Recent ER/9", "Pitcher Recent HR/9", "Pitcher Recent WHIP", "Pitcher Recent K%", "Pitcher Recent Leash Label", "Pitcher K App Reliability Label", "Pitcher K App Avg Actual K", "Pitcher K App Win Rate %", "Pitcher Run/Contact Note", "Pitcher Contact/Leash Note", "Pitcher Recent Note", "Pitcher K App Note", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Batter Hand", "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split OPS", "Pitcher Split K%", "Pitcher Split HR%", "Bullpen Handedness Label", "Bullpen Handedness Score", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher H/9", "Pitcher Contact Factor", "Team Run Environment", "Blowout Environment Factor", "Pitcher Contact/Leash Factor", "Pitcher Run/Contact Factor", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix MatchupFactor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score"]
+    cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Line Opportunity Class", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Recent Contact Damage Score", "Pitcher Recent H/9", "Pitcher Recent ER/9", "Pitcher Recent HR/9", "Pitcher Recent WHIP", "Pitcher Recent K%", "Pitcher Recent Leash Label", "Pitcher K App Reliability Label", "Pitcher K App Avg Actual K", "Pitcher K App Win Rate %", "Pitcher Run/Contact Note", "Pitcher Contact/Leash Note", "Pitcher Recent Note", "Pitcher K App Note", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Batter Hand", "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split OPS", "Pitcher Split K%", "Pitcher Split HR%", "Bullpen Handedness Label", "Bullpen Handedness Score", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher H/9", "Pitcher Contact Factor", "Team Run Environment", "Blowout Environment Factor", "Pitcher Contact/Leash Factor", "Pitcher Run/Contact Factor", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix MatchupFactor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score",
+            "Player ID", "Last 3", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30",
+            "Season PA", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season OPS", "Season wRC+ Proxy",
+            "Split vs Hand", "Split PA", "Split AVG", "Split OBP", "Split SLG", "Split BB%", "Split HR%", "Split OPS", "Split wRC+ Proxy",
+            "Savant Hitter Found", "Savant PA", "Savant xwOBA", "Savant xBA", "Savant xSLG", "Savant xOBP", "Savant wOBA",
+            "Savant K%", "Savant BB%", "Savant Whiff%", "Savant Chase%", "Savant HardHit%", "Savant Barrel%", "Savant Avg EV",
+            "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Whiff%", "Batter xwOBA", "Batter xSLG",
+            "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA",
+            "Batter Pitch Contact%", "Batter Pitch Whiff%", "Batter Pitch wOBA", "Batter Pitch SLG",
+            "Team Implied Runs", "Team Implied Runs Source", "FS Projection", "FS Line", "FS Direction", "FS Win Probability %",
+            "FS HRR Event Projection", "FS H/G", "FS R/G", "FS RBI/G", "FS-HRR Gap", "FS HRR Side", "FS Cross Check", "Cross Check",
+            "Data Coverage %", "Missing Data"]
     return df[[c for c in cols if c in df.columns]]
 
 
@@ -40237,6 +40463,141 @@ def render_v3_batter_fantasy_tab():
             st.dataframe(df[cols],use_container_width=True,hide_index=True)
             st.caption("Pitch-type rows are sample-shrunk toward the batter baseline; missing installer fields are ignored and remaining weights renormalize automatically.")
 
+
+
+
+# =========================
+# LIVE TEAM IMPLIED RUNS / PROJECTED RUNS SOURCE — UI + EXISTING RUN ENV SUPPORT
+# 2026-08-26
+# Priority: existing true team total -> Odds API consensus total/spread -> local total file
+# -> MLB 2026 offense + split proxy. No manual upload required for normal operation.
+# =========================
+_ow_team_market_total_context_before_live_source = _ow_team_market_total_context
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _ow_live_odds_team_total_context(team):
+    out = {"Team Implied Runs": None, "Team Implied Runs Source": "MISSING", "Game Total": None, "Team Spread": None, "Team Moneyline": None}
+    try:
+        key = get_secret("ODDS_API_KEY", "")
+        if not key:
+            return out
+        team_abbr = _ow_team_abbr(team) if "_ow_team_abbr" in globals() else str(team or "").upper()
+        data = safe_get_json(
+            f"{ODDS_BASE}/sports/baseball_mlb/odds",
+            params={"apiKey": key, "regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "american"},
+            timeout=16,
+        ) or []
+        import statistics as _ow_stats
+        for ev in data if isinstance(data, list) else []:
+            home = ml_abbr(ev.get("home_team")) if "ml_abbr" in globals() else str(ev.get("home_team") or "").upper()
+            away = ml_abbr(ev.get("away_team")) if "ml_abbr" in globals() else str(ev.get("away_team") or "").upper()
+            if team_abbr not in {home, away}:
+                continue
+            totals, spreads, team_prices, opp_prices = [], [], [], []
+            opp_abbr = away if team_abbr == home else home
+            for book in ev.get("bookmakers", []) or []:
+                for market in book.get("markets", []) or []:
+                    mkey = str(market.get("key") or "")
+                    outcomes = market.get("outcomes", []) or []
+                    if mkey == "totals":
+                        pts = [_v3_safe_num(o.get("point"), None) for o in outcomes]
+                        pts = [x for x in pts if x is not None]
+                        if pts: totals.append(float(pts[0]))
+                    elif mkey == "spreads":
+                        for o in outcomes:
+                            if ml_abbr(o.get("name")) == team_abbr:
+                                v = _v3_safe_num(o.get("point"), None)
+                                if v is not None: spreads.append(float(v))
+                    elif mkey == "h2h":
+                        for o in outcomes:
+                            ab = ml_abbr(o.get("name"))
+                            pr = _v3_safe_num(o.get("price"), None)
+                            if pr is None: continue
+                            if ab == team_abbr: team_prices.append(float(pr))
+                            elif ab == opp_abbr: opp_prices.append(float(pr))
+            total = float(_ow_stats.median(totals)) if totals else None
+            spread = float(_ow_stats.median(spreads)) if spreads else None
+            team_ml = float(_ow_stats.median(team_prices)) if team_prices else None
+            runs = None
+            source = "MISSING"
+            if total is not None and spread is not None:
+                # Team spread is negative for the favorite; subtracting half the spread
+                # converts the consensus game total into an approximate team total.
+                runs = total / 2.0 - spread / 2.0
+                source = "ODDS_API_CONSENSUS_TOTAL_SPREAD"
+            elif total is not None and team_prices and opp_prices:
+                tp = float(_ow_stats.median(team_prices)); op = float(_ow_stats.median(opp_prices))
+                p1 = ml_implied(tp) if "ml_implied" in globals() else None
+                p2 = ml_implied(op) if "ml_implied" in globals() else None
+                if p1 is not None and p2 is not None and (p1 + p2) > 0:
+                    nv = p1 / (p1 + p2)
+                    runs = total / 2.0 + (nv - 0.5) * 1.8
+                    source = "ODDS_API_TOTAL_H2H_PROXY"
+            if runs is not None:
+                runs = round(float(clamp(runs, 2.4, 7.5)), 2)
+                out.update({
+                    "Team Implied Runs": runs,
+                    "Team Implied Runs Source": source,
+                    "Game Total": round(total, 2) if total is not None else None,
+                    "Team Spread": round(spread, 2) if spread is not None else None,
+                    "Team Moneyline": team_ml,
+                    "Team Total Note": f"Projected team runs {runs:.2f} from sportsbook consensus",
+                })
+                return out
+        return out
+    except Exception:
+        return out
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_live_mlb_team_id_map():
+    out = {}
+    try:
+        data = safe_get_json(f"{MLB_BASE}/teams", params={"sportId": 1}, timeout=12) or {}
+        for t in data.get("teams", []) or []:
+            ab = _ow_team_abbr(t.get("abbreviation") or t.get("teamCode") or t.get("name"))
+            tid = _v3_safe_num(t.get("id"), None)
+            if ab and tid is not None:
+                out[ab] = int(tid)
+    except Exception:
+        pass
+    return out
+
+def _ow_team_market_total_context(team, raw_ctx=None):
+    # First preserve any true/direct total already provided by the schedule/local context.
+    try:
+        base = dict(_ow_team_market_total_context_before_live_source(team, raw_ctx) or {})
+    except Exception:
+        base = {}
+    if _v3_safe_num(base.get("Team Implied Runs"), None) is not None:
+        return base
+    live = _ow_live_odds_team_total_context(team)
+    if _v3_safe_num(live.get("Team Implied Runs"), None) is not None:
+        return live
+    # No sportsbook total available: use current MLB 2026 offense + vs-hand profile.
+    try:
+        ab = _ow_team_abbr(team)
+        tid = _ow_live_mlb_team_id_map().get(ab)
+        if tid:
+            team_prof = ml_team_hitting_profile(tid) if "ml_team_hitting_profile" in globals() else {}
+            pctx = _v3_pitcher_matchup_context_for_team(ab) if "_v3_pitcher_matchup_context_for_team" in globals() else {}
+            hand = str((pctx or {}).get("Pitcher Hand") or "").upper()[:1]
+            wrc_prof = ml_team_wrc_split_profile(tid, hand) if "ml_team_wrc_split_profile" in globals() else {}
+            if "_team_implied_runs_proxy_from_env" in globals():
+                runs = _team_implied_runs_proxy_from_env(team_prof, wrc_prof, 1.0)
+            else:
+                runs = _v3_safe_num((team_prof or {}).get("runs_pg"), 4.45) or 4.45
+            runs = round(float(clamp(runs, 2.6, 6.8)), 2)
+            wrc = _v3_safe_num((wrc_prof or {}).get("wrc_plus_split"), 100) or 100
+            return {
+                "Team Implied Runs": runs,
+                "Team Implied Runs Source": "MLB_2026_OFFENSE_PROXY",
+                "Game Total": None,
+                "Team Moneyline": None,
+                "Team Total Note": f"Projected team runs {runs:.2f} from 2026 offense + vs-hand wRC proxy ({wrc:.0f})",
+            }
+    except Exception:
+        pass
+    return base or {"Team Implied Runs": None, "Team Implied Runs Source": "MISSING", "Team Total Note": "Team run projection unavailable"}
 
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
