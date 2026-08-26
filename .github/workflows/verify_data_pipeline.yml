@@ -9,6 +9,7 @@ on:
       - "patch_railway_persistence.py"
       - "patch_verified_current_savant.py"
       - "patch_verified_identity_matching.py"
+      - "patch_schedule_team_ids.py"
       - "patch_verified_split_cache.py"
       - "patch_verified_matchup_cache.py"
       - "bootstrap_verified_data.py"
@@ -41,6 +42,7 @@ jobs:
             patch_railway_persistence.py \
             patch_verified_current_savant.py \
             patch_verified_identity_matching.py \
+            patch_schedule_team_ids.py \
             patch_verified_split_cache.py \
             patch_verified_matchup_cache.py \
             bootstrap_verified_data.py \
@@ -53,6 +55,7 @@ jobs:
           python patch_railway_persistence.py
           python patch_verified_current_savant.py
           python patch_verified_identity_matching.py
+          python patch_schedule_team_ids.py
           python patch_verified_split_cache.py
           python patch_verified_matchup_cache.py
           python bootstrap_verified_data.py
