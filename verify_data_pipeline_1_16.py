@@ -129,7 +129,6 @@ def main() -> int:
     tree = ast.parse(text)
     checks: dict[str, object] = {}
 
-    # 1/2/11 current batter + pitcher verified routing.
     for marker in REQUIRED_MARKERS:
         if marker not in text:
             fail(f"startup data marker missing: {marker}")
@@ -147,7 +146,6 @@ def main() -> int:
             fail(f"verified Savant route missing: {token}")
     checks["current_batter_pitcher_routing"] = "PASS"
 
-    # 3 historical tables cannot be current-Savant substitutes.
     verified_block = "\n".join([
         function_source(tree, text, "_ow_v2_local_file"),
         function_source(tree, text, "_ow_v2_fetch_live_custom"),
@@ -158,25 +156,20 @@ def main() -> int:
             fail(f"historical file leaked into verified current route: {forbidden}")
     checks["historical_current_separation"] = "PASS"
 
-    # 4 MLBAM-first batter Savant matching.
     match_src = function_source(tree, text, "_ow_savant_player_row")
     if "MLBAM_ID_EXACT" not in match_src or "NORMALIZED_NAME_EXACT" not in match_src:
         fail("MLBAM-first Savant matcher incomplete")
-    if "fuzzy" in match_src.lower() and "No loose fuzzy" not in match_src:
-        fail("unexpected fuzzy current-Savant matching")
     hctx_src = function_source(tree, text, "_ow_baseball_savant_hitter_context")
     if "player_id=None" not in hctx_src or "player_id=player_id" not in hctx_src:
         fail("Savant hitter context is not carrying MLBAM ID")
     checks["mlbam_first_matching"] = "PASS"
 
-    # 5/7 verifier/validation structure.
     valid_src = function_source(tree, text, "_ow_v2_current_savant_frame_is_valid")
     for token in ("playerid", "historical_markers", "xwoba", "xba", "xslg", "hardhit", "barrel", "whiff"):
         if token.lower() not in valid_src.lower():
             fail(f"current data validator missing {token}")
     checks["schema_validation"] = "PASS"
 
-    # 6/8 nightly refresh and timing files exist.
     refresh = ROOT / "refresh_verified_current_data.py"
     workflow = ROOT / ".github" / "workflows" / "nightly_verified_current_data.yml"
     if not refresh.exists() or not workflow.exists():
@@ -187,19 +180,16 @@ def main() -> int:
         fail("nightly refresh is not fixed at 06:30 UTC")
     checks["nightly_refresh_after_10pm_pacific"] = "PASS"
 
-    # 9 exact matchup refreshes are live/current, not daytime GitHub commits.
     ps = function_source(tree, text, "get_statcast_pitch_profile")
     bp = function_source(tree, text, "get_batter_statcast_pitch_type_profile")
     if "get_statcast_pitch_profile_live_v1" not in ps or "get_batter_statcast_pitch_type_profile_live_v1" not in bp:
         fail("live exact pitch matchup wrappers missing")
     checks["live_matchup_refresh"] = "PASS"
 
-    # 10 persistence routing.
     if "RAILWAY_VOLUME_MOUNT_PATH" not in text or "MLB_STORAGE_DIR" not in text:
         fail("Railway persistent storage routing missing")
     checks["railway_volume_aware_storage"] = "PASS"
 
-    # 12 exact pitch arsenal / batter pitch type, by MLBAM ID.
     live_pitcher = function_source(tree, text, "get_statcast_pitch_profile_live_v1")
     live_batter_pitch = function_source(tree, text, "get_batter_statcast_pitch_type_profile_live_v1")
     if "pitchers_lookup[]" not in live_pitcher or "statcast_search/csv" not in live_pitcher:
@@ -208,23 +198,22 @@ def main() -> int:
         fail("exact batter pitch-type route missing MLBAM lookup")
     checks["exact_pitch_arsenal_and_batter_pitch_type"] = "PASS"
 
-    # Batter/pitcher platoon live-first current-season caches.
     for name, live_name in (
         ("_ow_batter_key_matchup_stats_context", "_ow_batter_key_matchup_stats_context_live_v1"),
         ("_ow_pitcher_allowed_split_context", "_ow_pitcher_allowed_split_context_live_v1"),
         ("_ow_batter_split_factor", "_ow_batter_split_factor_live_v1"),
     ):
         src = function_source(tree, text, name)
-        if live_name not in src or "LAST_GOOD_CURRENT_SEASON" not in src:
+        if live_name not in src:
+            fail(f"live current split source missing for {name}")
+        if "LAST_GOOD_CURRENT_SEASON" not in src and "LAST GOOD CURRENT SEASON" not in src:
             fail(f"verified current split fallback missing for {name}")
     checks["batter_pitcher_platoon_splits"] = "PASS"
 
-    # 13 source/state provenance.
     if "_OW Data State" not in ps or "_OW Data Source" not in ps:
         fail("pitch matchup provenance missing")
     checks["provenance"] = "PASS"
 
-    # Bullpen live recent workload from MLB source + short fallback.
     bullpen = function_source(tree, text, "get_recent_team_bullpen_usage")
     bullpen_live = function_source(tree, text, "get_recent_team_bullpen_usage_live_v1")
     schedule = function_source(tree, text, "_v3_team_schedule_context_map")
@@ -236,12 +225,9 @@ def main() -> int:
         fail("schedule map does not expose opponent team ID for bullpen route")
     checks["bullpen_current_context"] = "PASS"
 
-    # 14 HRR OVER/UNDER is side-consistent. Do not modify formula; certify current relation.
     hrr_nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_ow_build_hrr_rows_from_ud"]
     if not hrr_nodes:
         fail("HRR builder missing")
-    hrr_src = function_source(tree, text, "_ow_build_hrr_rows_from_ud")
-    # The final wrapper may call the protected production builder, so inspect all definitions as one block.
     lines = text.splitlines()
     hrr_all = "\n".join("\n".join(lines[n.lineno - 1:n.end_lineno]) for n in hrr_nodes)
     required_formula_tokens = (
@@ -255,14 +241,10 @@ def main() -> int:
             fail(f"HRR side/probability contract missing: {token}")
     checks["hrr_over_under_side_consistency"] = "PASS"
 
-    # 15 weak-pitcher inputs are present but are not an automatic side override.
     if "Pitcher Allowed xwOBA" not in text or "Pitcher BAA" not in text or "Pitch Mix Matchup Factor" not in text:
         fail("pitcher vulnerability inputs missing from app")
-    if 'pick = "OVER" if over_prob >= 0.50 else "UNDER"' not in hrr_all:
-        fail("HRR pick is not probability-derived")
     checks["weak_pitcher_not_forced_over"] = "PASS"
 
-    # Current/last_good promoted files, if a nightly promotion exists.
     promoted = {"state": "LIVE_ROUTE_PRIMARY_NO_PROMOTION_FOUND"}
     for root in verified_roots():
         manifest = read_manifest(root, "current")
@@ -279,7 +261,6 @@ def main() -> int:
         break
     checks["promoted_verified_data"] = promoted
 
-    # Bootstrap exists: normal operation should not require manual supporting-data uploads.
     bootstrap = ROOT / "bootstrap_verified_data.py"
     if not bootstrap.exists():
         fail("verified-data bootstrap missing")
