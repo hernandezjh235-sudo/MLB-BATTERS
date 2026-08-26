@@ -26674,6 +26674,278 @@ def build_v3_home_run_table():
     return df, meta
 
 
+
+# ============================================================
+# BATTER COMPACT CARD UI V8 — OLD UPSIDE STYLE + TEAM LOGOS
+# UI ONLY. FS card UI is intentionally untouched.
+# ============================================================
+OW_BATTER_CARD_UI_V8 = "COMPACT_UPSIDE_STYLE_ALL_NON_FS_V8_2026_08_26"
+
+
+def _ow_batter_card_logo_v8(team):
+    """Reuse the app's existing MLB logo normalization/mapping."""
+    try:
+        ab = _mlui_abbr(team) if "_mlui_abbr" in globals() else str(team or "").upper()
+        url = (_ML_UI_LOGOS.get(ab, "") if "_ML_UI_LOGOS" in globals() else "")
+        if url:
+            return url
+    except Exception:
+        pass
+    return ""
+
+
+def _ow_batter_card_team_label_v8(score):
+    x = _v3_safe_num(score, None)
+    if x is None: return "—"
+    if x < 35: return "LOW"
+    if x < 47: return "BELOW"
+    if x < 57: return "AVG"
+    if x < 68: return "GOOD"
+    if x < 80: return "STRONG"
+    return "ELITE"
+
+
+def _ow_batter_card_market_v8(r, title_label="BATTER PLAYS"):
+    raw = str(r.get("Best Market") or r.get("Market") or title_label or "BATTER PLAYS")
+    up = raw.upper()
+    title = str(title_label or "").upper()
+    if "H+R+RBI" in up or "HRR" == up or "HITS + RUNS + RBI" in up or "H+R+RBI" in title:
+        return "H+R+RBI"
+    if "HOME RUN" in up or up == "HR" or "HOME RUN" in title:
+        return "HOME RUNS"
+    if "OFFICIAL" in title:
+        m = str(r.get("Market") or "").upper()
+        if "HOME RUN" in m: return "HOME RUNS"
+        if "H+R" in m or "HRR" in m: return "H+R+RBI"
+        return "OFFICIAL"
+    return up or "BATTER"
+
+
+def _ow_batter_card_side_prob_v8(r, market, pick):
+    """Return probability of the DISPLAYED/PICKED side, never raw-over probability for an UNDER."""
+    side = str(pick or "").upper()
+    # Known side-aware fields first.
+    for key in ["Best Win/Hit %", "HRR Side Win Probability %", "Win Probability %", "Model Win Probability %"]:
+        v = _v3_safe_num(r.get(key), None)
+        if v is not None:
+            return float(clamp(v, 0, 100))
+    if market == "H+R+RBI":
+        ov = _v3_safe_num(r.get("Over Probability %"), None)
+        if ov is None: ov = _v3_safe_num(r.get("HRR Over Probability %"), None)
+        if ov is not None:
+            return float(clamp(100.0-ov if side in {"UNDER","LOWER"} else ov, 0, 100))
+    if market == "HOME RUNS":
+        ov = _v3_safe_num(r.get("HR Probability %"), None)
+        if ov is None: ov = _v3_safe_num(r.get("HR Probability"), None)
+        if ov is not None:
+            return float(clamp(100.0-ov if side in {"UNDER","LOWER"} else ov, 0, 100))
+    ov = _v3_safe_num(r.get("Over Probability %"), None)
+    if ov is not None:
+        return float(clamp(100.0-ov if side in {"UNDER","LOWER"} else ov, 0, 100))
+    return None
+
+
+def _ow_batter_card_enrich_v8(row, bfs_map=None, hrr_map=None):
+    """Display-only enrichment from current live boards; never fabricates factor values."""
+    r = dict(row or {})
+    try:
+        key = _ow_cross_norm_player(r.get("Player"))
+    except Exception:
+        key = _v3_norm_name(r.get("Player")) if "_v3_norm_name" in globals() else str(r.get("Player") or "").lower()
+    bfs = (bfs_map or {}).get(key, {}) if key else {}
+    hrr = (hrr_map or {}).get(key, {}) if key else {}
+
+    # Real current-session factor scores when available. Missing stays missing/—.
+    for fld in ["Skill","Match","Form","Contact","FS Recent Form Score V2","FS Factor Support Score"]:
+        if r.get(fld) in (None,"","—") and bfs.get(fld) not in (None,"","—"):
+            r[fld] = bfs.get(fld)
+
+    # Environment/pitcher context is sourced from the current HRR board because that board
+    # owns the Game Environment V2 calculations used across the batter app.
+    for fld in [
+        "High Scoring Game Score","High Scoring Game Label","Team Offensive Score","Opponent Offensive Score",
+        "Expected Team Runs V2","Expected Opp Runs V2","Expected Game Runs V2","Market Game Total V2",
+        "Blowout Score","Blowout Score Label","Blowout Lean","Team Blowout Advantage Score",
+        "Opponent Bullpen Fatigue","Opponent Bullpen Fatigue Label","PA Risk Score","PA Risk Label",
+        "Team Run Suppression Risk","Side Environment Fit","Cross-Market Agreement",
+        "Opp Pitcher","Pitcher Hand","Pitcher ERA","Pitcher WHIP","Pitcher BAA","Projected PA",
+    ]:
+        if r.get(fld) in (None,"","—") and hrr.get(fld) not in (None,"","—"):
+            r[fld] = hrr.get(fld)
+
+    if r.get("Side Environment Fit") in (None,"","—") and hrr:
+        try:
+            side = str(r.get("Best Pick") or r.get("Pick") or hrr.get("Pick") or "").upper()
+            r["Side Environment Fit"] = _ow_side_environment_fit(hrr, side=side)
+        except Exception:
+            pass
+    return r
+
+
+def _ow_compact_batter_cards_v8(df, title_label="BATTER UPSIDE", max_rows=None, sort_best=False):
+    """The original compact Batter Upside card proportions, generalized to all non-FS batter boards."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No batter cards to show.")
+        return
+    d = df.copy()
+    if sort_best and "Best Play Score" in d.columns:
+        d = d.sort_values(["Best Play Score"], ascending=False, kind="mergesort", na_position="last")
+    if max_rows:
+        d = d.head(int(max_rows))
+
+    bfs_map = _ow_current_bfs_map() if "_ow_current_bfs_map" in globals() else {}
+    hrr_map = _ow_current_hrr_map() if "_ow_current_hrr_map" in globals() else {}
+
+    def esc(v):
+        return html.escape(str(v if v not in (None,"","None","nan") else "—"))
+    def num(v):
+        x = _v3_safe_num(v, None)
+        return None if x is None else float(x)
+    def fmt(v, digits=1, suffix=""):
+        x = num(v)
+        if x is None: return "—"
+        return f"{x:.{digits}f}{suffix}"
+    def factor(r,key):
+        x = num(r.get(key)); return None if x is None else float(clamp(x,0,100))
+    def bar(label,value,fill):
+        if value is None:
+            return ("<div class='ow-up-factor'><div class='ow-up-factor-head'>"
+                    f"<span>{esc(label)}</span><b>—</b></div><div class='ow-up-track'><i style='width:0%;background:{fill}'></i></div></div>")
+        vv=float(clamp(value,0,100))
+        return ("<div class='ow-up-factor'>"
+                f"<div class='ow-up-factor-head'><span>{esc(label)}</span><b>{vv:.0f}</b></div>"
+                f"<div class='ow-up-track'><i style='width:{vv:.0f}%;background:{fill}'></i></div></div>")
+
+    # Keep the exact old card footprint. GAME/TEAM/BLOWOUT get more meaning by using
+    # their existing two lines rather than adding a taller diagnostic row.
+    css = r"""
+<style>
+.ow-up-grid{display:grid;grid-template-columns:1fr;gap:10px;margin:10px 0 14px;width:100%}
+.ow-up-card{min-width:0;width:100%;background:linear-gradient(145deg,rgba(95,16,151,.18),#080b12 34%,#0b111c 76%,rgba(177,126,15,.11));border:1px solid rgba(244,194,56,.86);border-radius:14px;padding:11px 12px 10px;box-shadow:inset 0 1px 0 rgba(219,39,255,.30),0 7px 22px rgba(0,0,0,.32);box-sizing:border-box;overflow:hidden}
+.ow-up-head{display:flex;justify-content:space-between;align-items:center;gap:9px;border:1px solid rgba(218,39,255,.72);border-radius:9px;padding:7px 9px;min-width:0}
+.ow-up-player{display:flex;align-items:center;gap:7px;min-width:0;overflow:hidden}.ow-up-logo{width:22px;height:22px;object-fit:contain;flex:0 0 22px}.ow-up-name{font-size:15px;font-weight:900;color:#f7f7fb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.ow-up-best{font-size:10px;font-weight:900;color:#ffd24a;white-space:nowrap;flex:0 0 auto}.ow-up-meta{font-size:9px;color:#969caf;margin:7px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ow-up-chips{display:grid;grid-template-columns:1.05fr .9fr 1fr;gap:6px;margin-bottom:8px;min-width:0}.ow-up-chip{min-width:0;border:1px solid rgba(242,196,58,.60);border-radius:9px;padding:6px 5px;text-align:center;font-size:9px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#f4c63b}.ow-up-chip.market{border-color:#d929ff;color:#e760ff}.ow-up-chip.good{border-color:#39e99b;color:#39e99b}
+.ow-up-factors{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 9px;margin:5px 0 8px;min-width:0}.ow-up-factor{min-width:0}.ow-up-factor-head{display:flex;justify-content:space-between;align-items:center;font-size:8px;color:#a6adbd;font-weight:800;margin-bottom:3px;gap:5px}.ow-up-factor-head b{color:#d8dde7}.ow-up-track{height:6px;background:#202839;border-radius:999px;overflow:hidden}.ow-up-track i{display:block;height:100%;border-radius:999px}
+.ow-up-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:7px 0;min-width:0}.ow-up-tile{background:#101827;border:1px solid #263248;border-radius:9px;padding:7px 8px;min-width:0}.ow-up-tile span{display:block;font-size:8px;color:#8f98ab;font-weight:800}.ow-up-tile b{display:block;font-size:12px;color:#f5f6fa;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ow-up-tile b.green{color:#42e8a0}.ow-up-tile b.cyan{color:#47d8ff}
+.ow-up-env{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:6px;min-width:0}.ow-up-env div{min-width:0;background:rgba(17,24,39,.75);border:1px solid rgba(89,101,128,.35);border-radius:7px;padding:4px 3px;text-align:center}.ow-up-env span{display:block;font-size:6.5px;color:#7e8799;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ow-up-env b{display:block;font-size:8.5px;color:#dfe5ef;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ow-up-flags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px;min-height:19px}.ow-up-flag{font-size:7px;border:1px solid rgba(255,93,127,.33);color:#ff8098;border-radius:999px;padding:3px 5px;white-space:nowrap;max-width:48%;overflow:hidden;text-overflow:ellipsis}.ow-up-flag.ok{border-color:rgba(66,232,160,.30);color:#42e8a0}
+@media(min-width:900px){.ow-up-grid{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}.ow-up-card{height:100%}}
+@media(max-width:520px){.ow-up-grid{gap:9px}.ow-up-card{border-radius:12px;padding:9px 10px 8px}.ow-up-head{padding:6px 8px}.ow-up-logo{width:20px;height:20px;flex-basis:20px}.ow-up-name{font-size:14px}.ow-up-meta{font-size:8px;margin:6px 1px}.ow-up-chips{gap:4px;margin-bottom:7px}.ow-up-chip{font-size:8px;padding:5px 3px}.ow-up-factors{gap:5px 7px}.ow-up-tiles{gap:4px}.ow-up-tile{padding:6px}.ow-up-env{gap:4px}.ow-up-env b{font-size:8px}.ow-up-env span{font-size:6px}}
+</style>
+""".strip()
+
+    cards=[]
+    for idx,(_,rr) in enumerate(d.iterrows(),start=1):
+        r=_ow_batter_card_enrich_v8(rr.to_dict(),bfs_map=bfs_map,hrr_map=hrr_map)
+        market=_ow_batter_card_market_v8(r,title_label)
+        pick=str(r.get("Best Pick") or r.get("Pick") or r.get("HRR Pick") or r.get("HR Pick") or "—").upper()
+
+        if market == "HOME RUNS":
+            line = r.get("Best Line") if r.get("Best Line") not in (None,"","—") else r.get("Line") if r.get("Line") not in (None,"","—") else r.get("HR Line")
+            proj = r.get("Best Projection") if r.get("Best Projection") not in (None,"","—") else r.get("HR Projection") if r.get("HR Projection") not in (None,"","—") else r.get("Projection")
+        else:
+            line = r.get("Best Line") if r.get("Best Line") not in (None,"","—") else r.get("Line") if r.get("Line") not in (None,"","—") else r.get("HRR Line")
+            proj = r.get("Best Projection") if r.get("Best Projection") not in (None,"","—") else r.get("Projection") if r.get("Projection") not in (None,"","—") else r.get("HRR Projection")
+
+        prob=_ow_batter_card_side_prob_v8(r,market,pick)
+        likely=num(r.get("Likely Score"))
+        if likely is None: likely=prob
+        best=num(r.get("Best Play Score"))
+        if best is None: best=num(r.get("HR Score"))
+        if best is None: best=likely
+
+        rank=num(r.get("Rank")); rank=int(rank) if rank is not None and rank>0 else idx
+        player=r.get("Player") or r.get("UD Player") or "—"
+        team,opp=r.get("Team","—"),r.get("Opponent","—")
+        logo=_ow_batter_card_logo_v8(team)
+        logo_html=(f"<img class='ow-up-logo' src='{esc(logo)}' alt='{esc(team)} logo' onerror=\"this.style.display='none'\">" if logo else "")
+        pitcher=r.get("Opp Pitcher","—"); phand=str(r.get("Pitcher Hand") or "").upper(); hand_txt=f"{phand}HP" if phand and phand!="—" else ""
+        meta=f"{team} vs {opp} · vs {pitcher} {hand_txt} · ERA {fmt(r.get('Pitcher ERA'),2)} WHIP {fmt(r.get('Pitcher WHIP'),2)} BAA {fmt(r.get('Pitcher BAA'),3)}"
+
+        skill=factor(r,"Skill"); match=factor(r,"Match"); contact=factor(r,"Contact")
+        if market == "H+R+RBI" and "_ow_hrr_l3_l5_upside_support" in globals():
+            source=dict((hrr_map or {}).get(_ow_cross_norm_player(player),{}) or {})
+            # Direct current row wins where it has current line/side/recent values.
+            source.update({k:v for k,v in r.items() if v not in (None,"","—")})
+            rec=_ow_hrr_l3_l5_upside_support(source)
+            form=num(rec.get("HRR Recent Form Score")); form_label="L3/L5"
+        else:
+            form=factor(r,"Upside Form Score")
+            if form is None: form=factor(r,"Form")
+            if form is None: form=num(r.get("FS Recent Form Score V2"))
+            form_label="FORM"
+
+        hs=r.get("High Scoring Game Score"); off=r.get("Team Offensive Score"); blow=r.get("Blowout Score")
+        hs_label=str(r.get("High Scoring Game Label") or "—").upper()
+        team_label=_ow_batter_card_team_label_v8(off)
+        blow_label=str(r.get("Blowout Score Label") or "—").upper()
+        exp_game=num(r.get("Expected Game Runs V2")); exp_team=num(r.get("Expected Team Runs V2"))
+        blow_lean=str(r.get("Blowout Lean") or "NONE").upper()
+        cross=str(r.get("Cross-Market Agreement") or "—").upper()
+        envfit=num(r.get("Side Environment Fit"))
+
+        # Two lines per box only = same compact footprint as the old screenshot.
+        game_top = "GAME" + (f" · {exp_game:.1f}R" if exp_game is not None else "")
+        game_val = (fmt(hs,0) + (f" {hs_label}" if hs_label!="—" else "")).strip()
+        team_top = "TEAM" + (f" · {exp_team:.1f}R" if exp_team is not None else "")
+        team_val = (fmt(off,0) + (f" {team_label}" if team_label!="—" else "")).strip()
+        blow_top = "BLOWOUT" + (f" · {blow_lean}" if blow_lean not in {"","NONE","—"} else "")
+        blow_val = (fmt(blow,0) + (f" {blow_label}" if blow_label!="—" else "")).strip()
+        cross_top = "CROSS" + (f" · FIT{envfit:.0f}" if envfit is not None else "")
+
+        pa=r.get("Projected PA","—")
+        risk_txt=str(r.get("No-Bet Risk Flags") or r.get("Data Flags") or "").strip()
+        raw_flags=[x.strip() for x in risk_txt.replace(";","|").split("|") if x.strip() and x.strip().lower() not in {"clean","none","—","no major flags"}]
+        if not raw_flags: raw_flags=["clean context"]
+        flag_html="".join(f"<span class='ow-up-flag{' ok' if f.lower()=='clean context' else ''}'>{esc(f)}</span>" for f in raw_flags[:2])
+
+        card=(
+            "<div class='ow-up-card'>"
+            f"<div class='ow-up-head'><div class='ow-up-player'>{logo_html}<div class='ow-up-name'>#{rank} {esc(player)}</div></div><div class='ow-up-best'>BEST {fmt(best,1)}</div></div>"
+            f"<div class='ow-up-meta'>{esc(meta)}</div>"
+            "<div class='ow-up-chips'>"
+            f"<div class='ow-up-chip market'>{esc(market)}</div>"
+            f"<div class='ow-up-chip'>{esc(pick)} {fmt(line,1)}</div>"
+            f"<div class='ow-up-chip good'>LIKELY {fmt(likely,0)}</div>"
+            "</div>"
+            "<div class='ow-up-factors'>"
+            f"{bar('SKILL',skill,'#c82cff')}{bar('MATCH',match,'#f2c84b')}{bar(form_label,form,'#42d7a1')}{bar('CONTACT',contact,'#56c8f2')}"
+            "</div>"
+            "<div class='ow-up-tiles'>"
+            f"<div class='ow-up-tile'><span>PROJECTION</span><b>{fmt(proj,2)}</b></div>"
+            f"<div class='ow-up-tile'><span>WIN / HIT</span><b class='green'>{fmt(prob,1)}%</b></div>"
+            f"<div class='ow-up-tile'><span>PA</span><b class='cyan'>{fmt(pa,1)}</b></div>"
+            "</div>"
+            "<div class='ow-up-env'>"
+            f"<div><span>{esc(game_top)}</span><b>{esc(game_val)}</b></div>"
+            f"<div><span>{esc(team_top)}</span><b>{esc(team_val)}</b></div>"
+            f"<div><span>{esc(blow_top)}</span><b>{esc(blow_val)}</b></div>"
+            f"<div><span>{esc(cross_top)}</span><b>{esc(cross)}</b></div>"
+            "</div>"
+            f"<div class='ow-up-flags'>{flag_html}</div>"
+            "</div>"
+        )
+        cards.append(card)
+
+    full_html=css+"<div class='ow-up-grid'>"+"".join(cards)+"</div>"
+    if hasattr(st,"html"):
+        st.html(full_html)
+    else:
+        st.markdown("".join(line.strip() for line in full_html.splitlines()),unsafe_allow_html=True)
+
+
+# Batter Upside uses the restored old compact style.
+def _ow_upside_clean_cards_v2(df,max_rows=None):
+    return _ow_compact_batter_cards_v8(df,title_label="BATTER UPSIDE",max_rows=max_rows,sort_best=True)
+
+
+# H+R+RBI, Home Runs and Official Plays use the SAME compact card style.
+# Batter Fantasy does not use this renderer and is intentionally unaffected.
+def _ow_render_player_card_rows(df,title_label="BATTER PLAYS",max_rows=30,key="cards"):
+    return _ow_compact_batter_cards_v8(df,title_label=title_label,max_rows=max_rows,sort_best=False)
+
+
 def render_v3_top_batter_plays_board():
     st.markdown('<div class="section-title-pro">🏆 Top Batter Plays Board</div>', unsafe_allow_html=True)
     st.caption("Pre-line style board: Batter FS, H+R+RBI, and HR spots ranked by projection edge/sync, projected PA, lineup status, pitcher matchup, and official filter. Pitcher K is not shown here.")
@@ -35383,7 +35655,18 @@ def build_v3_batter_upside_board_final():
         pa = _v3_final_num(d.get("Projected PA"), 4.1) or 4.1
         hrr = _v3_final_num(d.get("HRR Projection"), 0) or 0
         hrr_edge = abs(_v3_final_num(d.get("HRR Edge"), 0) or 0)
-        hrr_prob = _v3_final_num(d.get("HRR Over Probability %"), 0) or 0
+        hrr_over_prob = _v3_final_num(d.get("HRR Over Probability %"), 0) or 0
+        hrr_pick_side = str(d.get("HRR Pick") or "").strip().upper()
+        hrr_saved_win_prob = _v3_final_num(d.get("HRR Win Probability %"), None)
+        if hrr_saved_win_prob is not None:
+            hrr_prob = float(clamp(hrr_saved_win_prob, 0.0, 100.0))
+        elif hrr_pick_side == "UNDER":
+            hrr_prob = float(clamp(100.0 - float(hrr_over_prob), 0.0, 100.0))
+        elif hrr_pick_side == "OVER":
+            hrr_prob = float(clamp(float(hrr_over_prob), 0.0, 100.0))
+        else:
+            hrr_prob = float(clamp(max(float(hrr_over_prob), 100.0 - float(hrr_over_prob)), 0.0, 100.0)) if hrr_over_prob else 0.0
+        d["HRR Side Win Probability %"] = round(hrr_prob, 1)
         hrp = _v3_final_num(d.get("HR Probability"), 0) or 0
         hr_score = _v3_final_num(d.get("HR Score"), 0) or 0
         hr_rank = _v3_final_num(d.get("HR Likelihood Rank"), 0) or 0
@@ -43775,6 +44058,28 @@ def build_v3_batter_upside_board_final():
             if r.get(field) in (None, "", "—") and hrr.get(field) not in (None, "", "—"):
                 r[field] = hrr.get(field)
 
+        # Carry the existing pregame Game Environment V2 snapshot into Batter Upside.
+        # This is ranking/display context only; it does NOT rewrite the HRR production projection.
+        for field in [
+            "High Scoring Game Score", "High Scoring Game Label",
+            "Team Offensive Score", "Opponent Offensive Score",
+            "Expected Team Runs V2", "Expected Opp Runs V2", "Expected Game Runs V2",
+            "Market Game Total V2", "Expected Team Runs Source",
+            "Blowout Score", "Blowout Score Label", "Team Blowout Advantage Score", "Blowout Lean",
+            "Opponent Bullpen Fatigue", "Opponent Bullpen Fatigue Label",
+            "PA Risk Score", "PA Risk Label", "Team Run Suppression Risk",
+            "Pregame Team Win Probability %", "Environment Risk Flags", "Environment V2 Note",
+        ]:
+            if hrr.get(field) not in (None, "", "—"):
+                r[field] = hrr.get(field)
+
+        if hrr:
+            hrr_side_for_env = str(hrr.get("Pick") or r.get("Best Pick") or "").upper()
+            try:
+                r["Side Environment Fit"] = _ow_side_environment_fit(hrr, side=hrr_side_for_env)
+            except Exception:
+                pass
+
         # HRR-specific recent form is copied with explicit names so it cannot collide with
         # Batter Fantasy Form or production HRR fields.
         hrr_recent_ctx = _ow_hrr_l3_l5_upside_support(hrr)
@@ -44018,6 +44323,13 @@ def render_v3_batter_fantasy_tab():
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
 _ow_bfs_restore_saved_board_to_session()
+
+# V8 FINAL RENDERER BINDINGS — placed immediately before the active tabs so later legacy definitions cannot override them.
+def _ow_upside_clean_cards_v2(df,max_rows=None):
+    return _ow_compact_batter_cards_v8(df,title_label="BATTER UPSIDE",max_rows=max_rows,sort_best=True)
+
+def _ow_render_player_card_rows(df,title_label="BATTER PLAYS",max_rows=30,key="cards"):
+    return _ow_compact_batter_cards_v8(df,title_label=title_label,max_rows=max_rows,sort_best=False)
 
 tab_top, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_poster, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
