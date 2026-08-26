@@ -19,7 +19,6 @@ if not nodes:
     raise RuntimeError("_ow_savant_player_row not found")
 node = nodes[-1]
 lines = text.splitlines(keepends=True)
-old_fn = "".join(lines[node.lineno - 1:node.end_lineno])
 new_fn = r'''# VERIFIED_MLBAM_MATCHING_V1_2026_08_26
 def _ow_savant_player_row(df, player, player_id=None):
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -48,9 +47,23 @@ def _ow_savant_player_row(df, player, player_id=None):
     pcol = _ow_savant_col(df, candidates)
     if not pcol:
         return None
-    target = _ow_norm_name(player)
+
+    def _ow_match_norm_name(value):
+        s = str(value or "").strip().lower()
+        try:
+            s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        except Exception:
+            pass
+        if "," in s:
+            parts = [p.strip() for p in s.split(",", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                s = parts[1] + " " + parts[0]
+        s = re.sub(r"\b(jr|sr|ii|iii|iv)\.?\b", " ", s)
+        return re.sub(r"[^a-z0-9]+", "", s)
+
+    target = _ow_match_norm_name(player)
     try:
-        norm_series = df[pcol].fillna("").astype(str).map(_ow_norm_name)
+        norm_series = df[pcol].fillna("").astype(str).map(_ow_match_norm_name)
         exact = df[norm_series == target]
         if not exact.empty:
             rr = exact.iloc[0].to_dict()
