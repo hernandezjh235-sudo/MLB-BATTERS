@@ -68,3 +68,6 @@ jobs:
 
       - name: Verify all 1-16 data contracts
         run: python verify_data_pipeline_1_16.py
+
+      - name: Smoke-test live 2026 batter + pitcher refresh without committing data
+        run: python refresh_verified_current_data.py --season 2026 --root /tmp/mlb_verified_current_smoke
