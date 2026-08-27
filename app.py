@@ -11616,10 +11616,13 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         # If no dedicated game-total score is present, team run environment is the
         # conservative display fallback rather than reusing the blowout score.
         game_score = score_from_keys(row, ["High Scoring Game Score", "Game Environment Score", "Game Score"], default=team_score)
-        blowout_score = score_from_keys(row, ["Blowout Run Score", "Blowout Score"], default=50)
+        blowout_score = score_from_keys(row, ["Blowout Risk Score", "Blowout Run Score", "Blowout Score"], default=50)
         cross_note = poster_value(row, "Cross Check", "FS Cross Check", "Cross-Fit", "Cross Fits", default="FS NOT BUILT")
         game_signal = poster_value(row, "High Scoring Game Label", "Game Environment Label", default=("ELEVATED" if game_score >= 62 else "LOW" if game_score <= 38 else "NEUTRAL"))
-        blowout_label = poster_value(row, "Blowout Risk Label", default="LOW")
+        blowout_label = poster_value(row, "Blowout Risk Display Label", "Blowout Risk Label", default="LOW")
+        game_total_val = num(poster_value(row, "Projected Game Total", "Game Total", default=None), None)
+        if game_total_val is not None:
+            game_signal = f"{game_signal} • {game_total_val:.1f} TOTAL"
         team_source = str(poster_value(row, "Team Implied Runs Source", default="")).replace("ODDS_API_CONSENSUS_TOTAL_SPREAD", "ODDS").replace("MLB_2026_OFFENSE_PROXY", "MLB PROXY").replace("ODDS_API_TOTAL_H2H_PROXY", "ODDS")
         if team_runs_val is not None:
             team_level = "HIGH" if team_runs_val >= 5.2 else "ABOVE AVG" if team_runs_val >= 4.7 else "AVG" if team_runs_val >= 4.1 else "BELOW AVG" if team_runs_val >= 3.6 else "LOW"
@@ -11685,7 +11688,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
                   <div class="ow-tile-bar"><i style="width:{blowout_score:.0f}%;background:#f6c43c"></i></div>
                 </div>
               </div>
-              <div class="ow-card-mini">DATA {esc(_ow_fmt_slate_num(row.get('Data Coverage %'),0))}% · S{skill_inputs}/C{contact_inputs} · Cross {esc(cross_note)} · Missing {esc(str(row.get('Missing Data') or 'NONE').split(' | ')[0])}</div>
+              <div class="ow-card-mini">DATA {esc(_ow_fmt_slate_num(row.get('Data Coverage %'),0))}% · READY {esc(_ow_fmt_slate_num(row.get('Verification Readiness %'),0))}% · S{skill_inputs}/C{contact_inputs} · Cross {esc(cross_note)} · Missing {esc(str(row.get('Missing Data') or 'NONE').split(' | ')[0])}</div>
               <div class="ow-pill-row">
                 <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('PA Sim Volatility Label') or row.get('Volatility') or 'normal').lower())}</span>
                 <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('Pitcher Confirmed') or row.get('Pitcher Confirmation Note') or 'probable pitcher not confirmed'))}</span>
@@ -35203,6 +35206,12 @@ def build_v3_batter_upside_board_final():
                     "HRR Edge": rd.get("Edge"),
                     "HRR Over Probability %": rd.get("Over Probability %"),
                     "HRR Win Probability %": rd.get("Win Probability %"),
+                    "HRR Last 3": rd.get("Last 3"),
+                    "HRR Last 5": rd.get("Last 5"),
+                    "HRR Last 10": rd.get("Last 10"),
+                    "HRR Last 15": rd.get("Last 15"),
+                    "HRR Last 20": rd.get("Last 20"),
+                    "HRR Last 30": rd.get("Last 30"),
                     "HRR Official Filter": rd.get("Official Play Filter"),
                     "HRR Overall Rating": rd.get("Overall Rating"),
                     "HRR No-Bet Risk Flags": rd.get("No-Bet Risk Flags"),
@@ -35328,6 +35337,11 @@ def build_v3_batter_upside_board_final():
                     "HR Line": rd.get("Line"),
                     "HR Pick": rd.get("Pick"),
                     "HR Win Probability %": rd.get("Win Probability %"),
+                    "HR Last 5": rd.get("Last 5"),
+                    "HR Last 10": rd.get("Last 10"),
+                    "HR Last 15": rd.get("Last 15"),
+                    "HR Last 20": rd.get("Last 20"),
+                    "HR Last 30": rd.get("Last 30"),
                     "HR Grade": rd.get("HR Grade"),
                     "HR Official Filter": rd.get("Official Play Filter"),
                     "HR Overall Rating": rd.get("Overall Rating"),
@@ -35475,7 +35489,54 @@ def build_v3_batter_upside_board_final():
         pa = _v3_final_num(d.get("Projected PA"), 4.1) or 4.1
         hrr = _v3_final_num(d.get("HRR Projection"), 0) or 0
         hrr_edge = abs(_v3_final_num(d.get("HRR Edge"), 0) or 0)
-        hrr_prob = _v3_final_num(d.get("HRR Over Probability %"), 0) or 0
+        # Ranking must use probability of the selected HRR side, not OVER probability unconditionally.
+        hrr_prob = _v3_final_num(d.get("HRR Win Probability %"), None)
+        if hrr_prob is None:
+            _op = _v3_final_num(d.get("HRR Over Probability %"), 50) or 50
+            hrr_prob = _op if str(d.get("HRR Pick") or "").upper() == "OVER" else (100.0 - _op)
+        hrr_prob = float(clamp(hrr_prob, 1, 99))
+
+        # GAME = both teams' projected scoring environment. BLOWOUT = projected margin risk.
+        # These are ranking/display audit fields only; the core HRR/FS formulas remain unchanged.
+        _team_runs = _v3_final_num(d.get("Team Implied Runs"), None)
+        _opp_runs = None
+        _game_total = None
+        _game_total_source = "MISSING"
+        try:
+            _tc = _ow_team_context(d.get("Team")) or {}
+            _oc = _ow_team_context(d.get("Opponent")) or {}
+            _direct_total = _v3_final_num(_tc.get("Game Total"), None)
+            _opp_runs = _v3_final_num(_oc.get("Team Implied Runs"), None)
+            if _direct_total is not None:
+                _game_total = _direct_total
+                _game_total_source = str(_tc.get("Team Implied Runs Source") or "ODDS")
+            elif _team_runs is not None and _opp_runs is not None:
+                _game_total = _team_runs + _opp_runs
+                _game_total_source = "TEAM_RUN_SUM"
+        except Exception:
+            pass
+        if _game_total is not None:
+            # MLB game environment centered near ~8.7 runs; intentionally compressed.
+            _game_score = int(round(clamp(50 + (_game_total - 8.7) * 13.0, 15, 95)))
+            _game_label = "VERY HIGH" if _game_score >= 78 else "ELEVATED" if _game_score >= 62 else "LOW" if _game_score <= 38 else "NEUTRAL"
+        else:
+            _game_score = 50
+            _game_label = "VERIFY"
+        _margin = abs((_team_runs or 0) - (_opp_runs or 0)) if _team_runs is not None and _opp_runs is not None else None
+        if _margin is not None:
+            _blowout_risk_score = int(round(clamp(28 + _margin * 34.0, 18, 92)))
+            _blowout_risk_label = "HIGH MARGIN RISK" if _blowout_risk_score >= 72 else "ELEVATED" if _blowout_risk_score >= 58 else "LOW" if _blowout_risk_score <= 40 else "NEUTRAL"
+        else:
+            _blowout_risk_score = 50
+            _blowout_risk_label = "VERIFY"
+        d["Opponent Implied Runs"] = round(_opp_runs, 2) if _opp_runs is not None else None
+        d["Projected Game Total"] = round(_game_total, 2) if _game_total is not None else None
+        d["Projected Game Total Source"] = _game_total_source
+        d["High Scoring Game Score"] = _game_score
+        d["High Scoring Game Label"] = _game_label
+        d["Blowout Risk Score"] = _blowout_risk_score
+        d["Blowout Risk Display Label"] = _blowout_risk_label
+
         hrp = _v3_final_num(d.get("HR Probability"), 0) or 0
         hr_score = _v3_final_num(d.get("HR Score"), 0) or 0
         hr_rank = _v3_final_num(d.get("HR Likelihood Rank"), 0) or 0
@@ -35483,7 +35544,10 @@ def build_v3_batter_upside_board_final():
         data_conf = _v3_final_num(d.get("Data Confidence"), 50) or 50
         daily_score = _v3_final_num(d.get("Daily Data Score"), data_conf) or data_conf
         blowout_score = _v3_final_num(d.get("Blowout Run Score"), 50) or 50
-        blowout_boost = min(6, max(0, blowout_score - 60) * 0.22)
+        # Small ranking-only boost for genuinely high projected game totals. Do not double-count
+        # the legacy run-friendly/blowout factor already inside the HRR projection.
+        game_env_score = _v3_final_num(d.get("High Scoring Game Score"), 50) or 50
+        game_env_boost = min(4.0, max(0, game_env_score - 58) * 0.14)
         blowout_risk_label = str(d.get("Blowout Risk Label") or "").upper()
         contact_score = _v3_final_num(d.get("Pitcher Contact/Leash Score"), 50) or 50
         contact_boost = min(5, max(0, contact_score - 60) * 0.18)
@@ -35502,9 +35566,9 @@ def build_v3_batter_upside_board_final():
         if not matchup_ok:
             risk_penalty += 10
         if not pitcher_confirmed:
-            risk_penalty += 5
+            risk_penalty += 8
         if not lineup_confirmed:
-            risk_penalty += 4
+            risk_penalty += 6
         if "REST RISK" in blowout_risk_label:
             risk_penalty += 3
         if "STRIKEOUT RISK" in contact_label:
@@ -35519,19 +35583,43 @@ def build_v3_batter_upside_board_final():
             risk_penalty += 10
         elif daily_score < 82:
             risk_penalty += 4
+        # Robust HRR recent-rate consensus. Never let one tiny 3/3 or 5/5 window
+        # dominate the ranking.
+        def _ow_recent_rate_txt(v):
+            try:
+                m = re.search(r"(\d+)\s*/\s*(\d+)", str(v or ""))
+                if not m: return None
+                a, b = int(m.group(1)), int(m.group(2))
+                return (100.0 * a / b) if b > 0 else None
+            except Exception:
+                return None
+        _r5 = _ow_recent_rate_txt(d.get("HRR Last 5") or d.get("Last 5"))
+        _r10 = _ow_recent_rate_txt(d.get("HRR Last 10") or d.get("Last 10"))
+        _r15 = _ow_recent_rate_txt(d.get("HRR Last 15") or d.get("Last 15"))
+        _rr = [(x,w) for x,w in [(_r5,.25),(_r10,.45),(_r15,.30)] if x is not None]
+        recent_consensus = (sum(x*w for x,w in _rr) / sum(w for _,w in _rr)) if _rr else 50.0
+
         hrr_likely = 0
         if _v3_is_live_ud_line(d.get("HRR Line")):
             hrr_likely = (
-                max(0, hrr_prob - 45) * 1.15
-                + max(0, hit - 45) * 0.35
-                + min(20, hrr_edge * 12.0)
-                + max(0, min(data_conf, daily_score) - 45) * 0.35
-                + min(10, max(0, pa - 3.5) * 6)
-                + blowout_boost
-                + contact_boost
-                + run_contact_boost
+                38
+                + max(0, hrr_prob - 50) * 0.68
+                + min(16, hrr_edge * 7.5)
+                + max(0, min(data_conf, daily_score) - 60) * 0.18
+                + min(5, max(0, pa - 3.7) * 4.0)
+                + min(5, max(0, recent_consensus - 55) * 0.12)
+                + game_env_boost
+                + min(3.0, contact_boost * 0.65)
+                + min(4.0, run_contact_boost * 0.55)
+                - risk_penalty
             )
-            hrr_likely = clamp(42 + hrr_likely - risk_penalty, 0, 100)
+            # 99/100 should require actual confirmation/clean data.
+            _ceil = 98.0
+            if not pitcher_confirmed: _ceil = min(_ceil, 94.0)
+            if not lineup_confirmed: _ceil = min(_ceil, 93.0)
+            if not matchup_ok: _ceil = min(_ceil, 90.0)
+            if clean_flags: _ceil = min(_ceil, 92.0)
+            hrr_likely = clamp(hrr_likely, 0, _ceil)
         hr_likely = 0
         if _v3_is_live_ud_line(d.get("HR Line")):
             # HR is naturally lower probability, so normalize strong HR spots onto the same board scale.
@@ -35541,7 +35629,7 @@ def build_v3_batter_upside_board_final():
                 + max(0, hr_rank - 50) * 0.28
                 + max(0, min(data_conf, daily_score) - 45) * 0.25
                 + min(10, max(0, pa - 3.5) * 4)
-                + min(3.5, blowout_boost * 0.55)
+                + min(3.0, game_env_boost * 0.65)
                 + min(2.5, contact_boost * 0.45)
                 + min(4.0, run_contact_boost * 0.60)
             )
@@ -35560,7 +35648,10 @@ def build_v3_batter_upside_board_final():
             d["Best Pick"] = d.get("HRR Pick")
             d["Best Line"] = d.get("HRR Line")
             d["Best Projection"] = round(hrr, 2) if hrr else "—"
-            d["Best Win/Hit %"] = round(max(hrr_prob, hit), 1) if max(hrr_prob, hit) else "—"
+            d["Best Win/Hit %"] = round(hrr_prob, 1) if hrr_prob else "—"
+            d["Last 3"] = d.get("HRR Last 3") or d.get("Last 3")
+            d["Last 5"] = d.get("HRR Last 5") or d.get("Last 5")
+            d["Last 10"] = d.get("HRR Last 10") or d.get("Last 10")
             d["Official Play Filter"] = d.get("HRR Official Filter") or d.get("Official Play Filter")
         elif hr_likely > 0:
             d["Best Market"] = "Home Runs"
@@ -35568,6 +35659,9 @@ def build_v3_batter_upside_board_final():
             d["Best Line"] = d.get("HR Line")
             d["Best Projection"] = d.get("HR Projection")
             d["Best Win/Hit %"] = round(hrp, 1) if hrp else "—"
+            d["Last 3"] = "—"
+            d["Last 5"] = d.get("HR Last 5") or "—"
+            d["Last 10"] = d.get("HR Last 10") or "—"
             d["Official Play Filter"] = d.get("HR Official Filter") or d.get("Official Play Filter")
         else:
             d["Best Market"] = "—"
@@ -35636,13 +35730,19 @@ def build_v3_batter_upside_board_final():
         }
         _loaded = sum(bool(v) for v in _coverage_groups.values())
         d["Data Coverage %"] = int(round((_loaded / max(1, len(_coverage_groups))) * 100))
+        _ready = float(d["Data Coverage %"])
+        if not bool(d.get("Pitcher Confirmed")): _ready -= 10
+        if "CONFIRMED" not in str(d.get("Lineup Status") or "").upper(): _ready -= 10
+        if not bool(d.get("Pitcher Matchup Verified")): _ready -= 10
+        d["Verification Readiness %"] = int(round(clamp(_ready, 0, 100)))
         d["Missing Data"] = " | ".join(k for k, v in _coverage_groups.items() if not v) or "NONE"
         out.append(d)
     if not out:
         return pd.DataFrame()
     df = pd.DataFrame(out)
     df["_norm"] = df["Player"].map(_v3_final_norm_player)
-    df = df.sort_values(["Likely Score", "Upside Score", "Best Hit Rate %"], ascending=[False, False, False], na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
+    _sort = [c for c in ["Likely Score", "High Scoring Game Score", "Upside Score", "Best Win/Hit %"] if c in df.columns]
+    df = df.sort_values(_sort, ascending=[False] * len(_sort), na_position="last").drop_duplicates("_norm", keep="first").drop(columns=["_norm"])
     cols = ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Best Market", "Best Pick", "Best Line", "Best Projection", "Best Win/Hit %", "Likely Score", "Clean Risk", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Run/Contact Score", "Pitcher Run/Contact Label", "Pitcher Line Opportunity Class", "Pitcher Allows Hits Score", "Pitcher Run/RBI Traffic Score", "Pitcher Contact Allowed Score", "Pitcher Power Damage Score", "Pitcher Under Suppression Score", "Pitcher Recent Contact Damage Score", "Pitcher Recent H/9", "Pitcher Recent ER/9", "Pitcher Recent HR/9", "Pitcher Recent WHIP", "Pitcher Recent K%", "Pitcher Recent Leash Label", "Pitcher K App Reliability Label", "Pitcher K App Avg Actual K", "Pitcher K App Win Rate %", "Pitcher Run/Contact Note", "Pitcher Contact/Leash Note", "Pitcher Recent Note", "Pitcher K App Note", "Matchup Data Status", "Pitcher Matchup Verified", "Projected PA", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HRR Over Probability %", "HR Projection", "HR Probability", "HR Score", "HR Likelihood Rank", "HR Line", "HR Pick", "Best Hit Rate %", "Fantasy Involvement Score", "PA Sim Volatility Label", "Batter Outcome Tags", "Lineup Status", "Lineup Source", "Lineup Protection Factor", "Lineup Slot Trend Factor", "Opp Pitcher", "Pitcher Hand", "Batter Hand", "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split OPS", "Pitcher Split K%", "Pitcher Split HR%", "Bullpen Handedness Label", "Bullpen Handedness Score", "Pitcher Confirmed", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher H/9", "Pitcher Contact Factor", "Team Run Environment", "Blowout Environment Factor", "Pitcher Contact/Leash Factor", "Pitcher Run/Contact Factor", "Park", "Weather Factor", "Wind Carry Label", "Umpire Name", "Defense/Framing Factor", "Pitch Mix MatchupFactor", "Pitch Mix Matchup Factor", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Result Gate Label", "Result Gate Win Rate %", "Sportsbook Market Status", "Sportsbook Line Edge", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Official Play Filter", "Upside Score",
             "Player ID", "Last 3", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30",
             "Season PA", "Season AVG", "Season OBP", "Season SLG", "Season BB%", "Season HR%", "Season OPS", "Season wRC+ Proxy",
@@ -35654,6 +35754,8 @@ def build_v3_batter_upside_board_final():
             "Batter Pitch Contact%", "Batter Pitch Whiff%", "Batter Pitch wOBA", "Batter Pitch SLG",
             "Team Implied Runs", "Team Implied Runs Source", "FS Projection", "FS Line", "FS Direction", "FS Win Probability %",
             "FS HRR Event Projection", "FS H/G", "FS R/G", "FS RBI/G", "FS-HRR Gap", "FS HRR Side", "FS Cross Check", "Cross Check",
+            "Opponent Implied Runs", "Projected Game Total", "Projected Game Total Source", "High Scoring Game Score", "High Scoring Game Label",
+            "Blowout Risk Score", "Blowout Risk Display Label", "Verification Readiness %",
             "Data Coverage %", "Missing Data"]
     return df[[c for c in cols if c in df.columns]]
 
@@ -38953,6 +39055,46 @@ def render_v3_batter_official_plays_tab():
 
 
 def render_v3_top_batter_plays_board():
+    # Keep the independent Fantasy cross-check alive automatically once per day.
+    # Heavy build runs only if no current-day persisted/session board exists.
+    try:
+        _today_key = str(california_now().date())
+        _cur = st.session_state.get("ow_bfs_df")
+        _built = st.session_state.get("ow_bfs_built_at")
+        _current = False
+        if isinstance(_cur, pd.DataFrame) and not _cur.empty and _built:
+            _dt = pd.to_datetime(_built, errors="coerce")
+            _current = (not pd.isna(_dt)) and str(_dt.date()) == _today_key
+        if not _current and st.session_state.get("ow_bfs_auto_cross_attempt") != _today_key:
+            st.session_state["ow_bfs_auto_cross_attempt"] = _today_key
+            try:
+                _saved = _ow_bfs_load_current_board()
+                if isinstance(_saved, tuple) and len(_saved) >= 3:
+                    _sf, _sm, _sb = _saved[0], _saved[1], _saved[2]
+                    _sdt = pd.to_datetime(_sb, errors="coerce") if _sb else pd.NaT
+                    if isinstance(_sf, pd.DataFrame) and not _sf.empty and (not pd.isna(_sdt)) and str(_sdt.date()) == _today_key:
+                        st.session_state["ow_bfs_df"] = _sf
+                        st.session_state["ow_bfs_meta"] = _sm or {}
+                        st.session_state["ow_bfs_source_meta"] = _sm or {}
+                        st.session_state["ow_bfs_built_at"] = _sb
+                        _current = True
+            except Exception:
+                pass
+            if not _current:
+                try:
+                    _fdf, _fmeta = build_v3_batter_fantasy_table()
+                    if isinstance(_fdf, pd.DataFrame) and not _fdf.empty:
+                        _fat = now_iso()
+                        st.session_state["ow_bfs_df"] = _fdf
+                        st.session_state["ow_bfs_meta"] = _fmeta or {}
+                        st.session_state["ow_bfs_source_meta"] = _fmeta or {}
+                        st.session_state["ow_bfs_built_at"] = _fat
+                        try: _ow_bfs_save_current_board(_fdf, _fmeta or {}, _fat)
+                        except Exception: pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
     _original_render_v3_top_batter_plays_board_bfsv2()
     df=st.session_state.get("ow_bfs_df")
     if not isinstance(df,pd.DataFrame) or df.empty: return
