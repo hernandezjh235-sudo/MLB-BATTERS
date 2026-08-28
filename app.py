@@ -11342,13 +11342,24 @@ def _ow_render_copy_paste_slate(df, market_label, key, max_rows=12):
 
 
 def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key="cards"):
+    """Unified OneWayPickz V4 batter-card renderer.
+
+    UI-only. Uses fields already produced by HRR / HR / Batter Fantasy / Games.
+    No projection, probability, grading, or ranking formulas are changed here.
+    """
     if not isinstance(df, pd.DataFrame) or df.empty:
         st.info("No player cards to show.")
         return
+
     d = df.copy()
-    sort_cols = [c for c in ["Likely Score", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
+    sort_cols = [c for c in ["Likely Score", "Overall Rating", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
     if sort_cols:
-        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+        for c in sort_cols:
+            try:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+            except Exception:
+                pass
+        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last", kind="mergesort")
 
     def esc(v):
         return html.escape(str(v if v not in (None, "", "nan", "None") else "—"))
@@ -11356,6 +11367,14 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
     def num(v, default=None):
         n = _v3_safe_num(v, None)
         return default if n is None else float(n)
+
+    def pct_num(v, default=None):
+        x = num(v, None)
+        if x is None:
+            return default
+        if abs(x) <= 1.0:
+            x *= 100.0
+        return float(x)
 
     def clamp_score(v, default=50):
         try:
@@ -11368,37 +11387,28 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         except Exception:
             return float(default)
 
-    def pick_color(txt):
-        t = str(txt or "").upper()
-        if "PASS" in t:
-            return "#ff3f68"
-        if "OFFICIAL" in t or "STRONG" in t or "CLEAN" in t or "LIKELY" in t:
-            return "#31f08a"
-        if "OPPORTUNITY" in t or "SPRINKLE" in t or "WATCH" in t or "LEAN" in t:
-            return "#f6c43c"
-        return "#d827ff"
-
     def poster_value(row, *keys, default="—"):
         return _ow_poster_value(row, *keys, default=default)
 
-    def score_from_keys(row, keys, default=50):
+    def first_num(row, keys, default=None, pct=False):
         for k in keys:
-            if k in row and row.get(k) not in (None, "", "—"):
-                x = num(row.get(k), None)
-                if x is not None:
-                    return clamp_score(x, 50 if default is None else default)
-        return None if default is None else float(default)
+            if k not in row:
+                continue
+            x = pct_num(row.get(k), None) if pct else num(row.get(k), None)
+            if x is not None:
+                return x
+        return default
+
+    def score_from_keys(row, keys, default=None):
+        x = first_num(row, keys, None)
+        if x is None:
+            return default
+        return clamp_score(x, 50 if default is None else default)
 
     def weighted_real_score(row, specs, default=None):
-        """UI-only 0-100 score from real row metrics; missing inputs are reweighted."""
         parts = []
         for keys, center, scale, weight, higher in specs:
-            val = None
-            for k in keys:
-                if k in row:
-                    val = num(row.get(k), None)
-                    if val is not None:
-                        break
+            val = first_num(row, keys, None)
             if val is None or not scale:
                 continue
             z = max(-2.25, min(2.25, (float(val) - float(center)) / float(scale)))
@@ -11409,16 +11419,14 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             return default, 0
         wsum = sum(w for _, w in parts) or 1.0
         z = sum(zv * w for zv, w in parts) / wsum
-        score = float(clamp(50.0 + z * 18.0, 8.0, 97.0))
-        return score, len(parts)
+        return float(clamp(50.0 + z * 18.0, 8.0, 97.0)), len(parts)
 
     def real_skill_score(row):
-        # Current player ability only: 2026 season/split production + Statcast quality.
         specs = [
             (["Split wRC+ Proxy"], 100, 30, 0.20, True),
             (["Season wRC+ Proxy", "Profile wRC+ Proxy"], 100, 30, 0.14, True),
-            (["Savant xwOBA", "Batter xwOBA", "Recent 30d xwOBA"], 0.320, 0.065, 0.17, True),
-            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA"], 0.245, 0.045, 0.12, True),
+            (["Savant xwOBA", "Batter xwOBA", "Recent 30d xwOBA", "wOBA/xwOBA"], 0.320, 0.065, 0.17, True),
+            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA", "AVG"], 0.245, 0.045, 0.12, True),
             (["Savant xSLG", "Batter xSLG", "Split SLG", "Season SLG"], 0.410, 0.090, 0.12, True),
             (["Savant HardHit%", "Batter HardHit%", "Recent 15d HardHit%"], 40.0, 9.0, 0.08, True),
             (["Savant Barrel%", "Batter Barrel%", "Recent 15d Barrel%"], 7.5, 6.0, 0.06, True),
@@ -11428,28 +11436,30 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         return weighted_real_score(row, specs, default=None)
 
     def real_contact_score(row):
-        # Actual hitter bat-to-ball/contact indicators; pitcher damage belongs in MATCH.
         specs = [
-            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA"], 0.245, 0.045, 0.24, True),
+            (["Savant xBA", "Split AVG", "Season AVG", "Profile BA", "AVG"], 0.245, 0.045, 0.24, True),
             (["Savant Whiff%", "Batter Whiff%"], 24.0, 7.0, 0.22, False),
             (["Savant K%"], 22.0, 8.0, 0.20, False),
             (["Batter Pitch Contact%"], 76.0, 7.0, 0.13, True),
             (["Batter Pitch Whiff%"], 24.0, 8.0, 0.08, False),
             (["Split AVG"], 0.245, 0.050, 0.08, True),
-            (["Savant xwOBA", "Batter xwOBA"], 0.320, 0.065, 0.05, True),
+            (["Savant xwOBA", "Batter xwOBA", "wOBA/xwOBA"], 0.320, 0.065, 0.05, True),
         ]
         return weighted_real_score(row, specs, default=None)
 
     def parse_ratio_or_pct(val):
         if val in (None, "", "—"):
             return None
-        if isinstance(val, (int, float)):
-            x = float(val)
-            if np.isnan(x):
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            try:
+                x = float(val)
+                if np.isnan(x):
+                    return None
+                if abs(x) <= 1:
+                    x *= 100
+                return clamp_score(x, 50)
+            except Exception:
                 return None
-            if abs(x) <= 1:
-                x *= 100
-            return clamp_score(x, 50)
         s = str(val).strip()
         if not s:
             return None
@@ -11476,81 +11486,67 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             return clamp_score((x / 8.0) * 100, default)
         return clamp_score(x, default)
 
-    def bar_html(label, value, color, value_text=None):
+    def score_tile(label, value, color, text=None):
         if value is None:
             pct = 0.0
-            show_txt = esc(value_text if value_text not in (None, "") else "—")
-            fill_style = "background:#394356"
+            valtxt = "—" if text in (None, "") else str(text)
         else:
             pct = clamp_score(value, 50)
-            show_txt = esc(value_text if value_text not in (None, "") else f"{pct:.0f}")
-            fill_style = f"background:{color}"
+            valtxt = f"{pct:.0f}" if text in (None, "") else str(text)
         return (
-            f"<div class='ow-stat-row'>"
-            f"<div class='ow-stat-head'><span>{esc(label)}</span><b>{show_txt}</b></div>"
-            f"<div class='ow-stat-track'><div class='ow-stat-fill' style='width:{pct:.0f}%;{fill_style}'></div></div>"
+            f"<div class='owv4-score' style='--accent:{color}'>"
+            f"<div class='owv4-score-head'><span>{esc(label)}</span><b>{esc(valtxt)}</b></div>"
+            f"<div class='owv4-track'><i style='width:{pct:.0f}%'></i></div>"
             f"</div>"
         )
+
+    def metric_tile(label, value, accent="#f8f8ff", sub=""):
+        return (
+            f"<div class='owv4-metric'>"
+            f"<span>{esc(label)}</span><b style='color:{accent}'>{esc(value)}</b>"
+            f"<small>{esc(sub)}</small>"
+            f"</div>"
+        )
+
+    def team_logo(team):
+        try:
+            ab = _mlui_abbr(team)
+            url = _ML_UI_LOGOS.get(ab, "")
+        except Exception:
+            ab = str(team or "").upper().strip()[:3]
+            url = ""
+        if url:
+            return ab, f"<img src='{esc(url)}' alt='{esc(ab)} logo'/>"
+        return ab, esc(ab or "MLB")
+
+    def prettier(txt):
+        return str(txt or "—").replace("_", " ").replace("HR-", "HR ").strip()
 
     st.markdown(
         """
         <style>
-        .ow-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:8px}
-        .ow-player-card{background:linear-gradient(145deg,#090d16,#111826);border:2px solid #f6c43c;border-radius:16px;padding:9px 11px 8px;box-shadow:0 0 18px rgba(196,33,255,.14)}
-        .ow-card-head{border:1px solid #d827ff;border-radius:10px;padding:6px 8px;display:flex;justify-content:space-between;gap:8px;align-items:center}
-        .ow-player-top{display:flex;align-items:center;gap:8px;min-width:0}
-        .ow-player-logo{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;background:rgba(13,21,34,.72);border:1px solid rgba(255,255,255,.10);font-size:11px;font-weight:800;flex:0 0 28px;overflow:visible}.ow-player-logo img{width:24px!important;height:24px!important;max-width:24px!important;max-height:24px!important;object-fit:contain!important;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
-        .ow-player-name{font-size:15px;font-weight:800;color:#f8f8ff;line-height:1.05;white-space:normal;overflow-wrap:anywhere}
-        .ow-card-proj{font-size:12px;color:#f6c43c;font-weight:800;white-space:nowrap}
-        .ow-card-sub{font-size:9px;color:#c3cada;margin:5px 1px 6px;line-height:1.2}
-        .ow-chip-row{display:grid;grid-template-columns:1.1fr .7fr .85fr;gap:5px;margin-bottom:6px}
-        .ow-chip{border-radius:10px;padding:6px 6px;font-size:9px;font-weight:800;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(8,12,20,.55)}
-        .ow-section-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:3px 0 6px}
-        .ow-section{min-width:0}
-        .ow-section-title{font-size:8px;color:#9ca6bb;font-weight:800;margin:0 0 3px 1px;text-transform:uppercase;letter-spacing:.3px}
-        .ow-stat-stack{display:flex;flex-direction:column;gap:5px}
-        .ow-stat-row{display:flex;flex-direction:column;gap:2px}
-        .ow-stat-head{display:flex;justify-content:space-between;gap:6px;font-size:8px;color:#c9d1e2;font-weight:800}
-        .ow-stat-head span{color:#9ca6bb}
-        .ow-stat-track{height:7px;border-radius:999px;background:#202839;overflow:hidden;position:relative}
-        .ow-stat-fill{height:100%;border-radius:999px;display:block;min-width:0}
-        .ow-primary-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin:4px 0 6px}
-        .ow-env-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
-        .ow-tile{background:#111827;border:1px solid #263247;border-radius:9px;padding:6px;min-height:43px}
-        .ow-tile-label{font-size:7px;color:#8f98ad;font-weight:700;margin-bottom:2px}
-        .ow-tile-val{font-size:12px;color:#f8f8ff;font-weight:800;line-height:1.05}
-        .ow-tile-sub{font-size:8px;color:#aeb7c8;margin-top:2px;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .ow-tile-bar{height:5px;border-radius:999px;background:#202839;overflow:hidden;margin-top:4px}
-        .ow-tile-bar > i{display:block;height:100%;border-radius:999px}
-        .ow-card-mini{font-size:8px;color:#8f98ad;margin:5px 1px 0;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .ow-pill-row{display:flex;gap:4px;flex-wrap:nowrap;margin-top:5px;overflow:hidden}
-        .ow-pill{font-size:7px;padding:3px 5px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.03);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        @media (max-width: 950px){.ow-card-list{grid-template-columns:1fr}}
-        @media (max-width: 700px){
-          .ow-card-list{gap:6px;margin-top:5px}
-          .ow-player-card{padding:5px 7px 5px;border-radius:13px}
-          .ow-card-head{padding:4px 6px;border-radius:8px}
-          .ow-player-logo{width:22px;height:22px;flex-basis:22px;border-radius:6px}.ow-player-logo img{width:20px!important;height:20px!important;max-width:20px!important;max-height:20px!important}
-          .ow-player-name{font-size:12px;line-height:1}
-          .ow-card-proj{font-size:9px}
-          .ow-card-sub{font-size:7px;margin:3px 1px 4px;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-          .ow-chip-row{grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px}
-          .ow-chip{padding:4px 4px;font-size:7px;border-radius:8px}
-          .ow-section-grid{grid-template-columns:1fr 1fr;gap:6px;margin:2px 0 4px}
-          .ow-section-title{display:none}
-          .ow-stat-stack{gap:3px}
-          .ow-stat-row{gap:1px}
-          .ow-stat-head{font-size:7px}
-          .ow-stat-track{height:5px}
-          .ow-primary-tiles,.ow-env-tiles{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
-          .ow-primary-tiles{margin:2px 0 4px}
-          .ow-tile{padding:4px;min-height:32px;border-radius:7px}
-          .ow-tile-label{font-size:6px;margin-bottom:1px}
-          .ow-tile-val{font-size:9px}
-          .ow-tile-sub{font-size:6.5px;margin-top:1px}
-          .ow-tile-bar{height:3px;margin-top:2px}
-          .ow-card-mini{font-size:6.5px;margin:3px 1px 0;line-height:1;white-space:nowrap}
-          .ow-pill-row{display:none}
+        .owv4-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:8px}
+        .owv4-card{position:relative;min-width:0;background:radial-gradient(circle at 85% 0%,rgba(67,36,111,.14),transparent 34%),linear-gradient(145deg,#07101a,#0b1420 55%,#0c1520);border:1px solid rgba(246,196,60,.86);border-radius:17px;padding:10px;box-shadow:inset 0 1px 0 rgba(216,39,255,.34),0 9px 26px rgba(0,0,0,.32),0 0 18px rgba(71,44,125,.12);color:#f8f8ff;overflow:hidden}
+        .owv4-card:before{content:"";position:absolute;left:12px;right:12px;top:0;height:2px;background:linear-gradient(90deg,#d827ff,#f6c43c,#33dfff);opacity:.9}
+        .owv4-top{display:grid;grid-template-columns:minmax(0,1.45fr) repeat(3,minmax(68px,.55fr));gap:6px;align-items:stretch}
+        .owv4-player{display:flex;align-items:center;gap:8px;min-width:0;background:rgba(6,12,20,.58);border:1px solid rgba(80,105,138,.30);border-radius:11px;padding:6px 7px}
+        .owv4-rank{display:flex;align-items:center;justify-content:center;width:27px;height:27px;flex:0 0 27px;border-radius:8px;background:linear-gradient(145deg,#4b3210,#a77214);border:1px solid rgba(255,209,72,.75);font-size:10px;font-weight:900;color:#fff3ba}
+        .owv4-logo{width:30px;height:30px;flex:0 0 30px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:#0e1724;border:1px solid rgba(126,166,222,.28);font-size:9px;font-weight:900}.owv4-logo img{width:26px!important;height:26px!important;object-fit:contain!important;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))}
+        .owv4-name-wrap{min-width:0;flex:1}.owv4-name{font-size:14px;font-weight:900;line-height:1.02;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-meta{font-size:7.5px;color:#b7c0cf;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .owv4-topbox{background:rgba(7,13,22,.66);border:1px solid rgba(70,91,119,.32);border-radius:11px;padding:6px 5px;text-align:center;display:flex;flex-direction:column;justify-content:center;min-width:0}.owv4-topbox span{font-size:6.5px;letter-spacing:.4px;color:#8f9aac;font-weight:800}.owv4-topbox b{font-size:12px;line-height:1.1;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-market b{color:#f25bd9}.owv4-line b{color:#fff4ce}.owv4-likely b{color:#68efa7}.owv4-best{font-size:7px;color:#f6c43c!important;margin-top:2px!important}
+        .owv4-scores{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:7px}.owv4-score{background:rgba(9,16,26,.68);border:1px solid rgba(63,81,108,.35);border-radius:9px;padding:5px 6px;min-width:0}.owv4-score-head{display:flex;justify-content:space-between;gap:5px;align-items:center;font-size:7px;font-weight:900}.owv4-score-head span{color:var(--accent)}.owv4-score-head b{font-size:10px;color:#edf1f7}.owv4-track{height:5px;background:#1c2939;border-radius:99px;overflow:hidden;margin-top:4px}.owv4-track i{display:block;height:100%;background:var(--accent);border-radius:99px;box-shadow:0 0 8px color-mix(in srgb,var(--accent) 35%,transparent)}
+        .owv4-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:5px;margin-top:6px}.owv4-metric{background:rgba(10,18,29,.80);border:1px solid #253349;border-radius:9px;padding:5px;min-height:42px}.owv4-metric span{display:block;font-size:6px;color:#8fa0b4;font-weight:850;letter-spacing:.25px}.owv4-metric b{display:block;font-size:11px;font-weight:900;margin-top:2px;line-height:1}.owv4-metric small{display:block;font-size:6.2px;color:#9eabba;margin-top:3px;line-height:1.03;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .owv4-intel{display:grid;grid-template-columns:1.08fr .92fr;gap:6px;margin-top:6px}.owv4-panel{background:linear-gradient(145deg,rgba(8,17,28,.90),rgba(10,20,31,.76));border:1px solid rgba(48,83,122,.48);border-radius:10px;padding:6px;min-width:0}.owv4-panel-title{font-size:6.5px;font-weight:900;color:#aa73ff;letter-spacing:.35px;margin-bottom:4px}.owv4-pitch-main{display:flex;align-items:center;gap:6px}.owv4-opp-logo{width:24px;height:24px;flex:0 0 24px;display:flex;align-items:center;justify-content:center}.owv4-opp-logo img{width:22px!important;height:22px!important;object-fit:contain!important}.owv4-pitch-name{font-size:9px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-hand{font-size:6px;color:#c493ff;background:rgba(92,49,136,.28);padding:2px 4px;border-radius:5px;margin-left:3px}.owv4-pitch-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:3px;margin-top:5px}.owv4-pstat{text-align:center}.owv4-pstat span,.owv4-wx span{display:block;font-size:5.5px;color:#8090a4;font-weight:800}.owv4-pstat b,.owv4-wx b{display:block;font-size:8px;color:#f1f4fa;margin-top:1px}.owv4-profile{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:5px;padding-top:4px;border-top:1px solid rgba(64,82,106,.28)}.owv4-profile strong{font-size:7px;color:#ff778b}.owv4-prof-track{height:4px;flex:1;max-width:70px;background:#2a1b28;border-radius:99px;overflow:hidden}.owv4-prof-track i{display:block;height:100%;background:linear-gradient(90deg,#ff4466,#ff9b48);border-radius:99px}
+        .owv4-park-top{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.owv4-wx{text-align:center}.owv4-wx b.good{color:#66eea7}.owv4-wx b.warn{color:#f7c851}.owv4-weather{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:5px;padding-top:4px;border-top:1px solid rgba(64,82,106,.28)}
+        .owv4-foot{font-size:6.3px;color:#7f8ea1;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-foot em{font-style:normal;color:#ff748d}.owv4-foot .ok{color:#59e2a1}
+        @media(max-width:950px){.owv4-list{grid-template-columns:1fr}}
+        @media(max-width:700px){
+          .owv4-list{gap:6px;margin-top:5px}.owv4-card{padding:6px;border-radius:13px}
+          .owv4-top{grid-template-columns:minmax(0,1.38fr) repeat(3,minmax(54px,.55fr));gap:4px}.owv4-player{padding:4px 5px;gap:5px;border-radius:8px}.owv4-rank{width:22px;height:22px;flex-basis:22px;font-size:7px;border-radius:6px}.owv4-logo{width:23px;height:23px;flex-basis:23px;border-radius:7px}.owv4-logo img{width:20px!important;height:20px!important}.owv4-name{font-size:10px}.owv4-meta{font-size:5.7px;margin-top:2px}.owv4-topbox{padding:3px 2px;border-radius:8px}.owv4-topbox span{font-size:5px}.owv4-topbox b{font-size:8px}.owv4-best{font-size:5.2px!important}
+          .owv4-scores{gap:4px;margin-top:4px}.owv4-score{padding:3px 4px;border-radius:7px}.owv4-score-head{font-size:5.5px}.owv4-score-head b{font-size:7px}.owv4-track{height:3px;margin-top:2px}
+          .owv4-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:4px}.owv4-metric{padding:3px 4px;min-height:29px;border-radius:7px}.owv4-metric span{font-size:4.8px}.owv4-metric b{font-size:8px;margin-top:1px}.owv4-metric small{font-size:4.9px;margin-top:1px}
+          .owv4-intel{grid-template-columns:1.04fr .96fr;gap:4px;margin-top:4px}.owv4-panel{padding:4px;border-radius:8px}.owv4-panel-title{font-size:5.2px;margin-bottom:2px}.owv4-pitch-main{gap:4px}.owv4-opp-logo{width:18px;height:18px;flex-basis:18px}.owv4-opp-logo img{width:17px!important;height:17px!important}.owv4-pitch-name{font-size:6.5px}.owv4-hand{font-size:4.8px;padding:1px 3px}.owv4-pitch-stats{gap:1px;margin-top:3px}.owv4-pstat span,.owv4-wx span{font-size:4.2px}.owv4-pstat b,.owv4-wx b{font-size:5.8px}.owv4-profile{margin-top:3px;padding-top:2px}.owv4-profile strong{font-size:5.1px}.owv4-prof-track{height:3px;max-width:44px}
+          .owv4-park-top{gap:1px}.owv4-weather{gap:1px;margin-top:3px;padding-top:2px}.owv4-foot{font-size:4.8px;margin-top:3px}
         }
         </style>
         """,
@@ -11560,142 +11556,230 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
     cards = []
     for i, (_, r) in enumerate(d.head(int(max_rows or 30)).iterrows(), start=1):
         row = r.to_dict()
-        market = poster_value(row, "Best Market", "Market", default=title_label)
-        pick = poster_value(row, "Best Pick", "Pick", default="—")
+        market = str(poster_value(row, "Best Market", "Market", default=title_label) or title_label)
+        market_upper = market.upper()
+        is_fs = "FANTASY" in market_upper
+        pick = poster_value(row, "Best Pick", "Model Direction Alt", "Model Direction", "Pick", default="—")
         line = poster_value(row, "Best Line", "Line", default="—")
         proj = poster_value(row, "Best Projection", "Projection", "HR Projection", default="—")
-        prob = poster_value(row, "Best Win/Hit %", "Win Probability %", "Over Probability %", "HR Probability %", default="—")
-        likely = poster_value(row, "Likely Score", "Sync Score", "HR Score", default="—")
+        prob = poster_value(row, "Best Win/Hit %", "Model Win Probability %", "Win Probability %", "Over Probability %", "HR Probability %", default="—")
+        likely = poster_value(row, "Likely Score", "Model Win Probability %", "Sync Score", "HR Score", default="—")
+        if "HOME RUN" in market_upper or market_upper in {"HR", "HOME RUNS"}:
+            best_score = poster_value(row, "HR Composite Score V3", "HR Power Score V2", "Overall Rating", "Likely Score", default=likely)
+        elif is_fs:
+            best_score = poster_value(row, "Rank Score", "Confidence", "Model Win Probability %", default=likely)
+        else:
+            best_score = poster_value(row, "Overall Rating", "Likely Score", "Sync Score", default=likely)
+
         player = poster_value(row, "Player", "UD Player", default="—")
         team = poster_value(row, "Team", "Raw Log Team", default="—")
         opp = poster_value(row, "Opponent", default="—")
-        pitcher = poster_value(row, "Opp Pitcher", default="—")
-        p_hand = poster_value(row, "Pitcher Hand", default="—")
-        p_era = poster_value(row, "Pitcher ERA", default="—")
-        p_whip = poster_value(row, "Pitcher WHIP", default="—")
-        p_baa = poster_value(row, "Pitcher BAA", default="—")
-        pa = poster_value(row, "Projected PA", default="—")
-        risk = _ow_slate_risk_text(row)
-        tier = poster_value(row, "Opportunity Tier", "Official Play Filter", "Overall Rating", default="RESEARCH")
-        risk_color = "#31f08a" if str(risk).lower() == "clean" else "#ff738d"
-        tier_color = pick_color(tier)
-        # Reuse the app's proven MLB team normalization/logo map. This keeps
-        # batter cards independent from whether a row happened to carry a Logo column.
-        try:
-            team_abbr = _mlui_abbr(team)
-            team_logo_url = _ML_UI_LOGOS.get(team_abbr, "")
-        except Exception:
-            team_abbr = str(team or "").upper().strip()[:3]
-            team_logo_url = ""
-        if team_logo_url:
-            logo_html = f"<img src='{esc(team_logo_url)}' alt='{esc(team_abbr)} logo'/>"
-        else:
-            # Row-provided URL is a secondary fallback only.
-            row_logo = poster_value(row, "Team Logo", "Batter Team Logo", "Logo", default="")
-            logo_html = f"<img src='{esc(row_logo)}' alt='{esc(team_abbr)} logo'/>" if str(row_logo).startswith("http") else esc(team_abbr)
+        pitcher = poster_value(row, "Opp Pitcher", "Opposing Pitcher", default="—")
+        p_hand = str(poster_value(row, "Pitcher Hand", default="—") or "—").upper()[:1]
+        p_hand_label = f"{p_hand}HP" if p_hand in {"R", "L"} else "—"
+        p_era = first_num(row, ["Pitcher ERA"], None)
+        p_whip = first_num(row, ["Pitcher WHIP", "Pitcher Recent WHIP"], None)
+        p_baa = first_num(row, ["Pitcher BAA"], None)
+        p_k = first_num(row, ["Pitcher K%", "Pitcher Recent K%", "Pitcher Split K%"], None, pct=True)
+        p_hr9 = first_num(row, ["Pitcher Recent HR/9", "Pitcher HR9", "Pitcher HR/9"], None)
+        pa = poster_value(row, "Projected PA", "PA", "Expected PA", default="—")
 
-        skill_score, skill_inputs = real_skill_score(row)
-        match_score = score_from_keys(row, ["Match", "Pitcher Run/Contact Score", "Pitcher Allows Hits Score", "Pitcher Power Damage Score", "Pitcher Contact/Leash Score"], default=None)
-        contact_score, contact_inputs = real_contact_score(row)
+        team_abbr, logo_html = team_logo(team)
+        opp_abbr, opp_logo_html = team_logo(opp)
 
-        l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("L3") or row.get("Recent 3") or row.get("L3 Hit Rate") or row.get("Last 3 %"))
-        l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("L5") or row.get("Recent 5") or row.get("L5 Hit Rate") or row.get("Last 5 %"))
-        if l3_val is None and l5_val is None:
-            form_score = None
-            form_label = "—/—"
+        if is_fs:
+            skill_score = score_from_keys(row, ["Skill"], default=None)
+            match_score = score_from_keys(row, ["Match"], default=None)
+            contact_score = score_from_keys(row, ["Contact"], default=None)
+            form_score = score_from_keys(row, ["Form"], default=None)
+            form_label = "—" if form_score is None else f"{form_score:.0f}"
+            form_name = "FORM"
+            skill_inputs = 1 if skill_score is not None else 0
+            contact_inputs = 1 if contact_score is not None else 0
         else:
+            skill_score, skill_inputs = real_skill_score(row)
+            match_score = score_from_keys(row, ["Match", "Pitcher Run/Contact Score", "Pitcher Allows Hits Score", "Pitcher Power Damage Score", "Pitcher Contact/Leash Score"], default=None)
+            contact_score, contact_inputs = real_contact_score(row)
+            l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("L3") or row.get("Recent 3") or row.get("L3 Hit Rate") or row.get("Last 3 %"))
+            l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("L5") or row.get("Recent 5") or row.get("L5 Hit Rate") or row.get("Last 5 %"))
             vals = [v for v in [l3_val, l5_val] if v is not None]
             form_score = sum(vals) / len(vals) if vals else None
             l3_txt = "—" if l3_val is None else f"{l3_val:.0f}"
             l5_txt = "—" if l5_val is None else f"{l5_val:.0f}"
             form_label = f"{l3_txt}/{l5_txt}"
+            form_name = "L3/L5"
 
-        team_runs_val = num(poster_value(row, "Team Implied Runs", "Projected Team Runs", "Team Run Env", "ImpR", default=None), None)
+        # Display-only environment enrichment. Existing row values always win.
+        team_runs_val = first_num(row, ["Team Runs V3", "Team Implied Runs", "Projected Team Runs", "Team Run Env", "ImpR"], None)
+        if team_runs_val is None and "_ow_team_market_total_context" in globals():
+            try:
+                tr = _ow_team_market_total_context(team, row) or {}
+                team_runs_val = num(tr.get("Team Implied Runs"), None)
+                if tr.get("Team Implied Runs Source") and not row.get("Team Implied Runs Source"):
+                    row["Team Implied Runs Source"] = tr.get("Team Implied Runs Source")
+            except Exception:
+                pass
         team_score = score_from_keys(row, ["Team Score", "Team Context Score", "Offense Env Score"], default=env_score(team_runs_val, 50) if team_runs_val is not None else 50)
-        # Keep high-scoring/game environment independent from blowout probability.
-        # If no dedicated game-total score is present, team run environment is the
-        # conservative display fallback rather than reusing the blowout score.
-        game_score = score_from_keys(row, ["High Scoring Game Score", "Game Environment Score", "Game Score"], default=team_score)
-        blowout_score = score_from_keys(row, ["Blowout Risk Score", "Blowout Run Score", "Blowout Score"], default=50)
-        cross_note = poster_value(row, "Cross Check", "FS Cross Check", "Cross-Fit", "Cross Fits", default="FS NOT BUILT")
-        game_signal = poster_value(row, "High Scoring Game Label", "Game Environment Label", default=("ELEVATED" if game_score >= 62 else "LOW" if game_score <= 38 else "NEUTRAL"))
-        blowout_label = poster_value(row, "Blowout Risk Display Label", "Blowout Risk Label", default="LOW")
-        game_total_val = num(poster_value(row, "Projected Game Total", "Game Total", default=None), None)
-        if game_total_val is not None:
-            game_signal = f"{game_signal} • {game_total_val:.1f} TOTAL"
+        game_score = score_from_keys(row, ["Game V3 Score", "High Scoring Game Score", "Game Environment Score", "Game Score"], default=team_score)
+        blowout_score = score_from_keys(row, ["Blowout V3 Score", "Blowout Risk Score", "Blowout Run Score", "Blowout Score"], default=50)
+        game_total_val = first_num(row, ["Game Total V3", "Projected Game Total", "Game Total"], None)
+        game_label = poster_value(row, "Game V3 Label", "High Scoring Game Label", "Game Environment Label", default=("ELEVATED" if game_score >= 62 else "LOW" if game_score <= 38 else "NEUTRAL"))
+        blowout_label = poster_value(row, "Blowout Risk Display Label", "Blowout Risk Label", default=("HIGH" if blowout_score >= 70 else "LOW" if blowout_score <= 34 else "MODERATE"))
         team_source = str(poster_value(row, "Team Implied Runs Source", default="")).replace("ODDS_API_CONSENSUS_TOTAL_SPREAD", "ODDS").replace("MLB_2026_OFFENSE_PROXY", "MLB PROXY").replace("ODDS_API_TOTAL_H2H_PROXY", "ODDS")
         if team_runs_val is not None:
             team_level = "HIGH" if team_runs_val >= 5.2 else "ABOVE AVG" if team_runs_val >= 4.7 else "AVG" if team_runs_val >= 4.1 else "BELOW AVG" if team_runs_val >= 3.6 else "LOW"
             team_tile_value = f"{team_runs_val:.2f} R"
             team_note = f"{team_level}" + (f" • {team_source}" if team_source and team_source not in {"—", "MISSING"} else "")
         else:
-            team_tile_value = f"{team_score:.0f}"
-            team_note = "NO TOTAL • NEUTRAL"
+            team_tile_value = "—"
+            team_note = "NO TEAM TOTAL"
+        game_note = str(game_label)
+        if game_total_val is not None:
+            game_note += f" • {game_total_val:.1f} TOTAL"
+
+        # Probable-pitcher profile is display only; prefer the HR V3 classification when present.
+        pprofile = str(poster_value(row, "Pitcher HR Profile V3", default="") or "").upper().strip()
+        p_vuln = first_num(row, ["Pitcher HR Vulnerability Score V3"], None)
+        if not pprofile or pprofile in {"—", "NEUTRAL"}:
+            if p_era is not None and p_era >= 5.0:
+                pprofile = "RUN-PRONE"
+            elif p_baa is not None and p_baa >= .275:
+                pprofile = "CONTACTABLE"
+            elif p_k is not None and p_k >= 27 and (p_baa is None or p_baa <= .235):
+                pprofile = "K-HEAVY"
+            elif p_era is not None and p_era <= 3.25 and (p_baa is None or p_baa <= .235):
+                pprofile = "TOUGH"
+            else:
+                pprofile = "NEUTRAL"
+        if p_vuln is None:
+            p_vuln = 50.0
+            if p_hr9 is not None:
+                p_vuln += clamp((p_hr9 - 1.15) * 18.0, -18, 22)
+            if p_baa is not None:
+                p_vuln += clamp((p_baa - .245) * 120.0, -10, 12)
+            p_vuln = float(clamp(p_vuln, 5, 95))
+
+        # Stadium/weather can be displayed on every batter tab even if HR V3 fields were not merged onto that row.
+        stadium = {}
+        if "_ow_hr_stadium_weather_v3_context" in globals():
+            try:
+                stadium = _ow_hr_stadium_weather_v3_context(row) or {}
+            except Exception:
+                stadium = {}
+        park_score = first_num(row, ["HR Stadium Score V3"], num(stadium.get("HR Stadium Score V3"), None))
+        park_pf = first_num(row, ["HR Park Current 2026 V3", "HR Park Index V3"], num(stadium.get("HR Park Current 2026 V3"), num(stadium.get("HR Park Index V3"), None)))
+        batter_side = str(poster_value(row, "HR Batter Side V3", "Bats", "Batter Hand", default=stadium.get("HR Batter Side V3") or "—")).upper()[:1]
+        wind_label = str(poster_value(row, "HR Wind Pull Label V3", "Wind Carry Label", default=stadium.get("HR Wind Pull Label V3") or "—"))
+        wind_mph = first_num(row, ["Weather Wind MPH"], None)
+        temp = first_num(row, ["Weather Temp F"], None)
+        humidity = first_num(row, ["Weather Humidity %"], None)
+        roof = str(poster_value(row, "HR Roof Status V3", default=stadium.get("HR Roof Status V3") or "—"))
+        park_name = str(poster_value(row, "Park", default=""))
+        if not park_name or park_name in {"—", "None"}:
+            try:
+                _ui_ctx = _ow_team_context(team) if "_ow_team_context" in globals() else {}
+                park_name = str((_ui_ctx or {}).get("Venue") or "")
+            except Exception:
+                park_name = ""
+
+        split_txt = f"vs {batter_side}HB (2026)" if batter_side in {"L", "R"} else "2026 matchup"
+        confirmed_raw = str(poster_value(row, "Pitcher Confirmed", "Pitcher Confirmation Note", default="probable pitcher not confirmed"))
+        confirmed_good = any(x in confirmed_raw.lower() for x in ["true", "confirmed", "official"]) and "not confirmed" not in confirmed_raw.lower()
+        ready = first_num(row, ["Verification Readiness %"], None)
+        data_cov = first_num(row, ["Data Coverage %", "Final Data Quality Score", "Data Confidence"], None)
+        cross_note = poster_value(row, "Cross Check", "FS Cross Check", "Cross-Fit", "Cross Fits", default=("FS" if is_fs else "FS NOT BUILT"))
+        lineup_status = str(poster_value(row, "Lineup Status", "Confirmed Lineup Status", default=""))
+        footer_bits = []
+        if data_cov is not None: footer_bits.append(f"DATA {data_cov:.0f}%")
+        if ready is not None: footer_bits.append(f"READY {ready:.0f}%")
+        if not is_fs: footer_bits.append(f"S{skill_inputs}/C{contact_inputs}")
+        footer_bits.append(f"Cross {cross_note}")
+        if lineup_status and lineup_status not in {"—", "None"}: footer_bits.append(lineup_status)
+        footer_bits.append("pitcher confirmed" if confirmed_good else "probable pitcher not confirmed")
+        if is_fs:
+            p20 = first_num(row, ["P20", "Floor"], None)
+            p80 = first_num(row, ["P80", "Ceiling"], None)
+            conf = first_num(row, ["Confidence"], None)
+            if p20 is not None and p80 is not None: footer_bits.append(f"P20–P80 {p20:.1f}–{p80:.1f}")
+            if conf is not None: footer_bits.append(f"CONF {conf:.0f}")
+
+        market_short = "FS" if is_fs else "HR" if "HOME RUN" in market_upper else "HRR" if "H+R+RBI" in market_upper or "HRR" in market_upper else market_upper[:10]
+        line_txt = _ow_fmt_slate_num(line, 1)
+        pick_txt = str(pick).replace("HIGHER", "OVER").replace("LOWER", "UNDER")
+        proj_txt = _ow_fmt_slate_num(proj, 2 if not is_fs else 1)
+        prob_txt = "—" if num(prob, None) is None else f"{num(prob):.1f}%"
+        pa_txt = _ow_fmt_slate_num(pa, 1)
+        best_txt = _ow_fmt_slate_num(best_score, 1)
+        likely_txt = _ow_fmt_slate_num(likely, 0)
 
         cards.append(textwrap.dedent(f"""
-            <div class="ow-player-card">
-              <div class="ow-card-head">
-                <div class="ow-player-top">
-                  <div class="ow-player-logo">{logo_html}</div>
-                  <div class="ow-player-name">#{i} {esc(player)}</div>
-                </div>
-                <div class="ow-card-proj">BEST {esc(_ow_fmt_slate_num(likely, 1))}</div>
-              </div>
-              <div class="ow-card-sub">{esc(team)} vs {esc(opp)} · vs {esc(pitcher)} {esc(p_hand)}HP · ERA {esc(_ow_fmt_slate_num(p_era, 2))} WHIP {esc(_ow_fmt_slate_num(p_whip, 2))} BAA {esc(_ow_fmt_slate_num(p_baa, 3))}</div>
-              <div class="ow-chip-row">
-                <div class="ow-chip" style="border:1px solid #d827ff;color:#f08cff">{esc(str(market).upper())}</div>
-                <div class="ow-chip" style="border:1px solid #f6c43c;color:#f6c43c">{esc(pick)} {esc(_ow_fmt_slate_num(line, 1))}</div>
-                <div class="ow-chip" style="border:1px solid {tier_color};color:{tier_color}">LIKELY {esc(_ow_fmt_slate_num(likely,0))}</div>
-              </div>
-              <div class="ow-section-grid">
-                <div class="ow-section">
-                  <div class="ow-section-title">Core Scores</div>
-                  <div class="ow-stat-stack">
-                    {bar_html('SKILL', skill_score, '#d827ff')}
-                    {bar_html('L3/L5', form_score, '#52e3a4', form_label)}
-                  </div>
-                </div>
-                <div class="ow-section">
-                  <div class="ow-section-title">Matchup Scores</div>
-                  <div class="ow-stat-stack">
-                    {bar_html('MATCH', match_score, '#f6c43c')}
-                    {bar_html('CONTACT', contact_score, '#55d8ff')}
-                  </div>
+          <div class="owv4-card">
+            <div class="owv4-top">
+              <div class="owv4-player">
+                <div class="owv4-rank">#{i}</div>
+                <div class="owv4-logo">{logo_html}</div>
+                <div class="owv4-name-wrap">
+                  <div class="owv4-name">{esc(player)}</div>
+                  <div class="owv4-meta">{esc(team_abbr)} vs {esc(opp_abbr)} · vs {esc(pitcher)} {esc(p_hand_label)}</div>
                 </div>
               </div>
-              <div class="ow-primary-tiles">
-                <div class="ow-tile"><div class="ow-tile-label">PROJECTION</div><div class="ow-tile-val">{esc(_ow_fmt_slate_num(proj, 2))}</div></div>
-                <div class="ow-tile"><div class="ow-tile-label">WIN / HIT</div><div class="ow-tile-val" style="color:#52e3a4">{esc(_ow_fmt_slate_num(prob, 1))}%</div></div>
-                <div class="ow-tile"><div class="ow-tile-label">PA</div><div class="ow-tile-val" style="color:#55d8ff">{esc(_ow_fmt_slate_num(pa, 1))}</div></div>
+              <div class="owv4-topbox owv4-market"><span>MARKET</span><b>{esc(market_short)}</b></div>
+              <div class="owv4-topbox owv4-line"><span>LINE</span><b>{esc(pick_txt)} {esc(line_txt)}</b></div>
+              <div class="owv4-topbox owv4-likely"><span>LIKELY</span><b>{esc(likely_txt)}</b><span class="owv4-best">BEST {esc(best_txt)}</span></div>
+            </div>
+
+            <div class="owv4-scores">
+              {score_tile('SKILL', skill_score, '#f1438f')}
+              {score_tile(form_name, form_score, '#3b9cff', form_label)}
+              {score_tile('MATCHUP', match_score, '#ff8a2f')}
+              {score_tile('CONTACT', contact_score, '#26d7c6')}
+            </div>
+
+            <div class="owv4-metrics">
+              {metric_tile('PROJECTION', proj_txt, '#42b6ff', (f"P20–P80 {first_num(row,['P20'],0):.1f}–{first_num(row,['P80'],0):.1f}" if is_fs and first_num(row,['P20'],None) is not None and first_num(row,['P80'],None) is not None else ''))}
+              {metric_tile('WIN / HIT', prob_txt, '#62eaa6', '')}
+              {metric_tile('PA', pa_txt, '#51d8ef', '')}
+              {metric_tile('GAME', f"{game_score:.0f}", '#ef58e6', game_note)}
+              {metric_tile('TEAM RUNS', team_tile_value, '#62eaa6', team_note)}
+              {metric_tile('BLOWOUT', f"{blowout_score:.0f}", '#f7c948', str(blowout_label))}
+            </div>
+
+            <div class="owv4-intel">
+              <div class="owv4-panel">
+                <div class="owv4-panel-title">VS PROBABLE PITCHER</div>
+                <div class="owv4-pitch-main">
+                  <div class="owv4-opp-logo">{opp_logo_html}</div>
+                  <div style="min-width:0;flex:1"><div class="owv4-pitch-name">{esc(pitcher)} <span class="owv4-hand">{esc(p_hand_label)}</span></div><div style="font-size:5.5px;color:#9d77ca;margin-top:1px">{esc(split_txt)}</div></div>
+                </div>
+                <div class="owv4-pitch-stats">
+                  <div class="owv4-pstat"><span>K%</span><b>{'—' if p_k is None else f'{p_k:.1f}%'}</b></div>
+                  <div class="owv4-pstat"><span>ERA</span><b>{'—' if p_era is None else f'{p_era:.2f}'}</b></div>
+                  <div class="owv4-pstat"><span>WHIP</span><b>{'—' if p_whip is None else f'{p_whip:.2f}'}</b></div>
+                  <div class="owv4-pstat"><span>BAA</span><b>{'—' if p_baa is None else f'{p_baa:.3f}'}</b></div>
+                  <div class="owv4-pstat"><span>HR/9</span><b>{'—' if p_hr9 is None else f'{p_hr9:.2f}'}</b></div>
+                </div>
+                <div class="owv4-profile"><strong>{esc(prettier(pprofile))}</strong><div class="owv4-prof-track"><i style="width:{clamp_score(p_vuln):.0f}%"></i></div></div>
               </div>
-              <div class="ow-env-tiles">
-                <div class="ow-tile">
-                  <div class="ow-tile-label">GAME</div>
-                  <div class="ow-tile-val">{esc(_ow_fmt_slate_num(game_score, 0))}</div>
-                  <div class="ow-tile-sub">{esc(game_signal)}</div>
-                  <div class="ow-tile-bar"><i style="width:{game_score:.0f}%;background:#d827ff"></i></div>
+
+              <div class="owv4-panel">
+                <div class="owv4-panel-title">PARK & WEATHER{(' · ' + esc(park_name)) if park_name else ''}</div>
+                <div class="owv4-park-top">
+                  <div class="owv4-wx"><span>HR STADIUM</span><b>{'—' if park_score is None else f'{park_score:.0f}'}</b></div>
+                  <div class="owv4-wx"><span>HR PF 2026</span><b class="warn">{'—' if park_pf is None else f'{park_pf:.0f}'} {esc(batter_side + 'HB' if batter_side in {'L','R'} else '')}</b></div>
+                  <div class="owv4-wx"><span>WIND</span><b class="good">{'—' if wind_mph is None else f'{wind_mph:.0f} MPH'}</b><span>{esc(prettier(wind_label))}</span></div>
                 </div>
-                <div class="ow-tile">
-                  <div class="ow-tile-label">TEAM</div>
-                  <div class="ow-tile-val">{esc(team_tile_value)}</div>
-                  <div class="ow-tile-sub">{esc(team_note)}</div>
-                  <div class="ow-tile-bar"><i style="width:{team_score:.0f}%;background:#52e3a4"></i></div>
+                <div class="owv4-weather">
+                  <div class="owv4-wx"><span>TEMP</span><b>{'—' if temp is None else f'{temp:.0f}°F'}</b></div>
+                  <div class="owv4-wx"><span>HUMIDITY</span><b>{'—' if humidity is None else f'{humidity:.0f}%'}</b></div>
+                  <div class="owv4-wx"><span>ROOF</span><b>{esc(prettier(roof))}</b></div>
                 </div>
-                <div class="ow-tile">
-                  <div class="ow-tile-label">BLOWOUT</div>
-                  <div class="ow-tile-val">{esc(_ow_fmt_slate_num(blowout_score, 0))}</div>
-                  <div class="ow-tile-sub">{esc(blowout_label)}</div>
-                  <div class="ow-tile-bar"><i style="width:{blowout_score:.0f}%;background:#f6c43c"></i></div>
-                </div>
-              </div>
-              <div class="ow-card-mini">DATA {esc(_ow_fmt_slate_num(row.get('Data Coverage %'),0))}% · READY {esc(_ow_fmt_slate_num(row.get('Verification Readiness %'),0))}% · S{skill_inputs}/C{contact_inputs} · Cross {esc(cross_note)} · Missing {esc(str(row.get('Missing Data') or 'NONE').split(' | ')[0])}</div>
-              <div class="ow-pill-row">
-                <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('PA Sim Volatility Label') or row.get('Volatility') or 'normal').lower())}</span>
-                <span class="ow-pill" style="color:#ff8fa4;border-color:rgba(255,99,132,.35)">{esc(str(row.get('Pitcher Confirmed') or row.get('Pitcher Confirmation Note') or 'probable pitcher not confirmed'))}</span>
               </div>
             </div>
+            <div class="owv4-foot">{' · '.join(esc(x) for x in footer_bits)}</div>
+          </div>
         """).strip())
-    st.markdown('<div class="ow-card-list">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="owv4-list">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
 
 
 def render_kproj_tab(board):
@@ -26959,7 +27043,7 @@ def render_v3_settings_tab():
     c1.metric("App", "Batter V3")
     c2.metric("Brand", "OneWayPickz")
     c3.metric("Mode", "Batter Only")
-    st.info("Visible tabs: Batter Upside, Batter FS, H+R+RBI, Home Runs, Baseball IQ, Official Plays, Calibration Audit.")
+    st.info("Visible tabs: Batter Upside, Games, Batter FS, H+R+RBI, Home Runs, Baseball IQ, Official Plays, Calibration Audit.")
     st.write({
         "K engine visible in V3": "No",
         "Pitcher FS visible in V3": "No",
@@ -27982,7 +28066,7 @@ def render_v3_settings_tab():
     c1.metric("App", "Batter V3")
     c2.metric("Brand", "ONE WAY PICKZ")
     c3.metric("Mode", "UD Lines Only")
-    st.info("Visible tabs: Batter Upside, H+R+RBI, Home Runs, Batter Fantasy, Batter Learning Lab, Official Plays, Poster, Calibration Audit.")
+    st.info("Visible tabs: Batter Upside, H+R+RBI, Home Runs, Batter Fantasy, Batter Learning Lab, Official Plays, Games, Calibration Audit.")
     st.write({
         "K engine visible in V3": "No",
         "Pitcher FS visible in V3": "No",
@@ -35833,7 +35917,7 @@ def render_v3_home_run_tab():
     if s2.button("Grade HR snapshots", key=_v3_unique_widget_key("ow_grade_hr_snapshot"), use_container_width=True):
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
-    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "HR Projection Base", "Edge", "HR Probability %", "HR Probability Base %", "HR Power Score V2", "HR Power Label V2", "HR Power Coverage V2", "HR Feature xHR V2", "Game V3 Score", "Game V3 Label", "Team Runs V3", "Game Total V3", "P Game 11+ Runs V3", "Blowout V3 Score", "P Margin 5+ V3", "Starter IP P50 V3", "Starter Early Exit Risk % V3", "Bullpen V3 Score", "Bullpen V3 Label", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Team Run Environment", "Blowout Environment Factor", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "HR Projection Base", "Edge", "HR Probability %", "HR Probability Base %", "HR Power Score V2", "HR Power Label V2", "HR Power Coverage V2", "HR Feature xHR V2", "HR Composite Score V3", "HR Stadium Score V3", "HR Stadium Label V3", "HR Park Index V3", "HR Park Current 2026 V3", "HR Park Stable V3", "HR Park Source V3", "HR Stadium Factor V3", "HR Wind Pull Label V3", "HR Wind Pull Factor V3", "HR Roof Status V3", "HR Shape Score V3", "HR Shape Coverage V3", "HR xISO V3", "HR SweetSpot% V3", "HR Pull% V3", "HR FlyBall% V3", "Pitcher HR Profile V3", "Pitcher HR Vulnerability Score V3", "Game V3 Score", "Game V3 Label", "Team Runs V3", "Game Total V3", "P Game 11+ Runs V3", "Blowout V3 Score", "P Margin 5+ V3", "Starter IP P50 V3", "Starter Early Exit Risk % V3", "Bullpen V3 Score", "Bullpen V3 Label", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Team Run Environment", "Blowout Environment Factor", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
     for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note"]:
         if c in df.columns and c not in cols:
             anchor = cols.index("Pitch Mix Matchup Factor") if "Pitch Mix Matchup Factor" in cols else len(cols)
@@ -35854,7 +35938,7 @@ def render_v3_home_run_tab():
             d.metric("Over Prob", f"{rr.get('HR Probability %', '—')}%")
             e.metric("Grade", rr.get("HR Grade", "—"))
             st.info(rr.get("Matchup Summary", "—"))
-            st.write({"HR Power V2": rr.get("HR Power Score V2"), "Power Label": rr.get("HR Power Label V2"), "Feature xHR": rr.get("HR Feature xHR V2"), "Base HR Projection": rr.get("HR Projection Base"), "Base HR Probability %": rr.get("HR Probability Base %"), "Game V3": rr.get("Game V3 Score"), "Game Total V3": rr.get("Game Total V3"), "P Game 11+": rr.get("P Game 11+ Runs V3"), "Bullpen V3": rr.get("Bullpen V3 Label"), "Starter P50 IP": rr.get("Starter IP P50 V3"), "Starter Exit Risk %": rr.get("Starter Early Exit Risk % V3"), "HR V2 Note": rr.get("HR V2 Note")})
+            st.write({"HR Composite V3": rr.get("HR Composite Score V3"), "HR Power V2": rr.get("HR Power Score V2"), "Power Label": rr.get("HR Power Label V2"), "Feature xHR": rr.get("HR Feature xHR V2"), "Stadium HR": rr.get("HR Stadium Label V3"), "2026 HR Park Index": rr.get("HR Park Current 2026 V3"), "Stable HR Park Index": rr.get("HR Park Stable V3"), "Wind vs Pull": rr.get("HR Wind Pull Label V3"), "Stadium/Weather Factor": rr.get("HR Stadium Factor V3"), "xISO": rr.get("HR xISO V3"), "Sweet Spot%": rr.get("HR SweetSpot% V3"), "Pull%": rr.get("HR Pull% V3"), "FlyBall%": rr.get("HR FlyBall% V3"), "Pitcher HR Profile": rr.get("Pitcher HR Profile V3"), "Base HR Projection": rr.get("HR Projection Base"), "Base HR Probability %": rr.get("HR Probability Base %"), "Game V3": rr.get("Game V3 Score"), "Game Total V3": rr.get("Game Total V3"), "P Game 11+": rr.get("P Game 11+ Runs V3"), "Bullpen V3": rr.get("Bullpen V3 Label"), "Starter P50 IP": rr.get("Starter IP P50 V3"), "Starter Exit Risk %": rr.get("Starter Early Exit Risk % V3"), "HR V2 Note": rr.get("HR V2 Note"), "Stadium V3 Note": rr.get("HR Stadium/Weather V3 Note")})
             st.write({"Last 5": rr.get("Last 5"), "Last 10": rr.get("Last 10"), "Last 15": rr.get("Last 15"), "Last 30": rr.get("Last 30"), "Last 5 HR": rr.get("Last 5 HR"), "Last 10 HR": rr.get("Last 10 HR"), "Last 15 HR": rr.get("Last 15 HR"), "Last 30 HR": rr.get("Last 30 HR"), "Last 5 HR Rate %": rr.get("Last 5 HR Rate %"), "Last 10 HR Rate %": rr.get("Last 10 HR Rate %"), "Last 15 HR Rate %": rr.get("Last 15 HR Rate %"), "Last 30 HR Rate %": rr.get("Last 30 HR Rate %")})
 
 
@@ -41441,25 +41525,826 @@ def build_v3_batter_upside_board_final():
     df = _ow_build_v3_batter_upside_before_route_fix()
     return _ow_apply_authoritative_matchup_to_df(df)
 
+
+# ============================================================
+# GAMES BROWSER — MATCHUP-FIRST BATTER NAVIGATION
+# Added 2026-08-28.
+# UI/navigation only. Does NOT alter HRR, HR, or Batter Fantasy formulas.
+# - Lists every active MLB matchup from the authoritative MLB schedule router.
+# - Shows a slate-level best-play preview on each matchup.
+# - Tap a game to view Best Overall / H+R+RBI / Home Runs / Fantasy.
+# - Keeps the existing OneWayPickz player-card renderer inside each game.
+# ============================================================
+OW_GAMES_BROWSER_VERSION = "OW_GAMES_BROWSER_V1_2026_08_28"
+
+
+def _ow_games_num(x, default=None):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _ow_games_first_num(row, keys, default=None):
+    for key in keys:
+        try:
+            if key in row:
+                v = _ow_games_num(row.get(key), None)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+    return default
+
+
+def _ow_games_time_label(value, date_value=None):
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if not pd.isna(ts):
+            ts = ts.tz_convert("America/Los_Angeles")
+            return ts.strftime("%-I:%M %p")
+    except Exception:
+        pass
+    try:
+        dd = pd.to_datetime(date_value, errors="coerce")
+        if not pd.isna(dd):
+            return dd.strftime("%b %-d")
+    except Exception:
+        pass
+    return "—"
+
+
+def _ow_games_player_rows_for_matchup(df, away, home):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    try:
+        if "Team" in d.columns:
+            d["_ow_game_team"] = d["Team"].map(_ow_team_abbr)
+        elif "Raw Log Team" in d.columns:
+            d["_ow_game_team"] = d["Raw Log Team"].map(_ow_team_abbr)
+        else:
+            return pd.DataFrame()
+        mask = d["_ow_game_team"].isin([away, home])
+        if "Opponent" in d.columns:
+            d["_ow_game_opp"] = d["Opponent"].map(_ow_team_abbr)
+            # Use opponent check when available, but do not throw away rows whose
+            # opponent is missing. The authoritative Team route is still sufficient.
+            opp_ok = d["_ow_game_opp"].isin([away, home]) | d["_ow_game_opp"].isin(["", "—", None])
+            mask = mask & opp_ok
+        d = d[mask].copy()
+        return d.drop(columns=[c for c in ["_ow_game_team", "_ow_game_opp"] if c in d.columns])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _ow_games_best_preview(rows):
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        return {"player": "No active batter line", "market": "—", "pick": "—", "line": "—", "prob": None, "likely": None}
+    d = rows.copy()
+    sort_cols = [c for c in ["Likely Score", "Best Win/Hit %", "Win Probability %", "Upside Score"] if c in d.columns]
+    if sort_cols:
+        for c in sort_cols:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    r = d.iloc[0].to_dict()
+    return {
+        "player": str(r.get("Player") or "—"),
+        "market": str(r.get("Best Market") or r.get("Market") or "—"),
+        "pick": str(r.get("Best Pick") or r.get("Pick") or r.get("Model Direction") or "—"),
+        "line": r.get("Best Line") if r.get("Best Line") not in (None, "", "—") else r.get("Line"),
+        "prob": _ow_games_first_num(r, ["Best Win/Hit %", "Win Probability %", "Model Win Probability %", "HR Probability %"], None),
+        "likely": _ow_games_first_num(r, ["Likely Score", "Upside Score", "Confidence"], None),
+    }
+
+
+def _ow_games_schedule_rows(upside_df=None):
+    sched = _v3_team_schedule_context_map() or {}
+    grouped = {}
+    for team, ctx0 in sched.items():
+        ctx = dict(ctx0 or {})
+        matchup = str(ctx.get("Matchup") or "")
+        if "@" not in matchup:
+            continue
+        away_raw, home_raw = [x.strip() for x in matchup.split("@", 1)]
+        away, home = _ow_team_abbr(away_raw), _ow_team_abbr(home_raw)
+        if not away or not home or away == "—" or home == "—":
+            continue
+        key = str(ctx.get("GamePk") or f"{ctx.get('Date')}:{away}:{home}")
+        g = grouped.setdefault(key, {
+            "key": key, "game_pk": ctx.get("GamePk"), "away": away, "home": home,
+            "date": ctx.get("Date"), "game_time": ctx.get("Game Time"), "venue": ctx.get("Venue"),
+            "status": ctx.get("Game Status") or ctx.get("Detailed State") or ctx.get("Status") or "",
+            "away_pitcher": "—", "away_pitcher_hand": "—", "home_pitcher": "—", "home_pitcher_hand": "—",
+        })
+        if _ow_team_abbr(ctx.get("Team")) == away:
+            g["away_pitcher"] = ctx.get("Own Probable Pitcher") or g["away_pitcher"]
+            g["away_pitcher_hand"] = ctx.get("Own Probable Pitcher Hand") or g["away_pitcher_hand"]
+            g["home_pitcher"] = ctx.get("Opp Probable Pitcher") or g["home_pitcher"]
+            g["home_pitcher_hand"] = ctx.get("Opp Probable Pitcher Hand") or g["home_pitcher_hand"]
+        elif _ow_team_abbr(ctx.get("Team")) == home:
+            g["home_pitcher"] = ctx.get("Own Probable Pitcher") or g["home_pitcher"]
+            g["home_pitcher_hand"] = ctx.get("Own Probable Pitcher Hand") or g["home_pitcher_hand"]
+            g["away_pitcher"] = ctx.get("Opp Probable Pitcher") or g["away_pitcher"]
+            g["away_pitcher_hand"] = ctx.get("Opp Probable Pitcher Hand") or g["away_pitcher_hand"]
+
+    games = []
+    for g in grouped.values():
+        rows = _ow_games_player_rows_for_matchup(upside_df, g["away"], g["home"])
+        g["rows"] = rows
+        g["best"] = _ow_games_best_preview(rows)
+        g["time_label"] = _ow_games_time_label(g.get("game_time"), g.get("date"))
+        if isinstance(rows, pd.DataFrame) and not rows.empty:
+            first = rows.iloc[0].to_dict()
+            g["game_score"] = _ow_games_first_num(first, ["Game V3 Score", "High Scoring Game Score", "Game Environment Score", "Game Score"], None)
+            g["game_total"] = _ow_games_first_num(first, ["Game Total V3", "Projected Game Total"], None)
+            g["blowout_score"] = _ow_games_first_num(first, ["Blowout V3 Score", "Blowout Risk Score", "Blowout Run Score"], None)
+            team_runs = {}
+            for tm in [g["away"], g["home"]]:
+                sub = rows[rows["Team"].map(_ow_team_abbr).eq(tm)] if "Team" in rows.columns else pd.DataFrame()
+                if not sub.empty:
+                    rr = sub.iloc[0].to_dict()
+                    team_runs[tm] = _ow_games_first_num(rr, ["Team Runs V3", "Team Implied Runs"], None)
+            g["away_runs"] = team_runs.get(g["away"])
+            g["home_runs"] = team_runs.get(g["home"])
+        else:
+            g.update({"game_score": None, "game_total": None, "blowout_score": None, "away_runs": None, "home_runs": None})
+        games.append(g)
+    return games
+
+
+def _ow_games_fs_cards_df(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    d = _ow_apply_authoritative_matchup_to_df(df.copy())
+    if "Best Market" not in d.columns: d["Best Market"] = "BATTER FANTASY"
+    if "Best Pick" not in d.columns: d["Best Pick"] = d.get("Model Direction", d.get("Pick", "—"))
+    if "Best Line" not in d.columns: d["Best Line"] = d.get("Line")
+    if "Best Projection" not in d.columns: d["Best Projection"] = d.get("Projection")
+    if "Best Win/Hit %" not in d.columns: d["Best Win/Hit %"] = d.get("Model Win Probability %", d.get("Win Probability %"))
+    if "Likely Score" not in d.columns:
+        p = pd.to_numeric(d.get("Model Win Probability %"), errors="coerce") if "Model Win Probability %" in d.columns else pd.Series(np.nan, index=d.index)
+        c = pd.to_numeric(d.get("Confidence"), errors="coerce") if "Confidence" in d.columns else pd.Series(np.nan, index=d.index)
+        d["Likely Score"] = (p.fillna(50) * 0.75 + c.fillna(50) * 0.25).round(0)
+    if "Win Probability %" not in d.columns and "Model Win Probability %" in d.columns:
+        d["Win Probability %"] = d["Model Win Probability %"]
+    return d
+
+
+def _ow_games_team_top_html(rows, team, limit=3):
+    if not isinstance(rows, pd.DataFrame) or rows.empty or "Team" not in rows.columns:
+        return "<div class='ow-game-team-empty'>No active batter lines</div>"
+    d = rows[rows["Team"].map(_ow_team_abbr).eq(team)].copy()
+    if d.empty:
+        return "<div class='ow-game-team-empty'>No active batter lines</div>"
+    sort_cols = [c for c in ["Likely Score", "Best Win/Hit %", "Win Probability %"] if c in d.columns]
+    if sort_cols:
+        for c in sort_cols: d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    pieces = []
+    for j, (_, r0) in enumerate(d.head(limit).iterrows(), start=1):
+        r = r0.to_dict()
+        player = html.escape(str(r.get("Player") or "—"))
+        pick = html.escape(str(r.get("Best Pick") or r.get("Pick") or "—"))
+        line = r.get("Best Line") if r.get("Best Line") not in (None, "", "—") else r.get("Line")
+        likely = _ow_games_first_num(r, ["Likely Score", "Upside Score"], None)
+        likely_txt = "—" if likely is None else f"{likely:.0f}"
+        pieces.append(f"<div class='ow-game-team-row'><b>#{j} {player}</b><span>{pick} {_ow_fmt_slate_num(line,1)} · {likely_txt}</span></div>")
+    return "".join(pieces)
+
+
+def render_v3_games_tab():
+    st.markdown('<div class="section-title-pro">⚾ GAMES — Matchup Browser</div>', unsafe_allow_html=True)
+    st.caption("Scan the full MLB slate, tap a matchup, then see the best Batter Upside / HRR / Home Run / Fantasy plays inside that game. Projection formulas are unchanged.")
+
+    try:
+        upside = build_v3_batter_upside_board_final()
+    except Exception as exc:
+        upside = pd.DataFrame()
+        st.warning(f"Batter Upside board unavailable for game previews: {exc}")
+
+    games = _ow_games_schedule_rows(upside)
+    if not games:
+        st.info("No MLB schedule matchups loaded for the selected date mode yet.")
+        return
+
+    st.markdown("""
+    <style>
+    .ow-game-browser-card{background:linear-gradient(145deg,#090d16,#101725);border:1.5px solid rgba(246,196,60,.72);border-radius:15px;padding:10px 12px;margin:5px 0 4px;box-shadow:0 5px 18px rgba(0,0,0,.25)}
+    .ow-game-browser-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .ow-game-browser-match{font-size:15px;font-weight:900;color:#fff}
+    .ow-game-browser-meta{font-size:10px;color:#9da7b9;margin-top:4px;line-height:1.35}
+    .ow-game-browser-best{font-size:10px;color:#55e3aa;margin-top:7px;font-weight:800}
+    .ow-game-browser-metrics{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}
+    .ow-game-browser-chip{font-size:9px;border:1px solid #27364d;border-radius:999px;padding:3px 7px;color:#c8d1df;background:#111827}
+    .ow-game-header{background:linear-gradient(145deg,rgba(216,39,255,.10),#0c121d 45%,rgba(246,196,60,.08));border:2px solid #f6c43c;border-radius:18px;padding:12px 14px;margin:12px 0}
+    .ow-game-header-main{display:flex;justify-content:center;align-items:center;gap:18px}
+    .ow-game-team-block{text-align:center;min-width:120px}
+    .ow-game-team-name{font-size:18px;font-weight:900;color:#fff;margin-top:3px}
+    .ow-game-pitcher{font-size:10px;color:#9fa9b9;margin-top:3px}
+    .ow-game-vs{font-size:12px;font-weight:900;color:#f6c43c;text-align:center}
+    .ow-game-metric-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:10px}
+    .ow-game-metric{background:#111827;border:1px solid #263247;border-radius:9px;padding:6px;text-align:center}
+    .ow-game-metric span{display:block;font-size:8px;color:#8f98ad;font-weight:800}
+    .ow-game-metric b{display:block;font-size:13px;color:#f8f8ff;margin-top:2px}
+    .ow-game-team-preview{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:7px 0 12px}
+    .ow-game-team-panel{background:#0c121d;border:1px solid #27364d;border-radius:10px;padding:8px}
+    .ow-game-team-title{font-size:11px;color:#f6c43c;font-weight:900;margin-bottom:4px}
+    .ow-game-team-row{display:flex;justify-content:space-between;gap:7px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:9px;color:#d9e0eb}
+    .ow-game-team-row:last-child{border-bottom:0}.ow-game-team-row span{color:#9fa9b9;white-space:nowrap}.ow-game-team-empty{font-size:9px;color:#777}
+    @media(max-width:700px){.ow-game-header-main{gap:8px}.ow-game-team-block{min-width:0;flex:1}.ow-game-team-name{font-size:15px}.ow-game-metric-row{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.ow-game-team-preview{grid-template-columns:1fr 1fr;gap:5px}.ow-game-team-row{font-size:8px;flex-direction:column;gap:1px}}
+    </style>
+    """, unsafe_allow_html=True)
+
+    sort_mode = st.selectbox("Sort games", ["Start time", "Highest GAME", "Best play"], key=_v3_unique_widget_key("ow_games_sort"))
+    if sort_mode == "Highest GAME":
+        games = sorted(games, key=lambda x: (_ow_games_num(x.get("game_score"), -1), str(x.get("game_time") or "")), reverse=True)
+    elif sort_mode == "Best play":
+        games = sorted(games, key=lambda x: (_ow_games_num((x.get("best") or {}).get("likely"), -1), str(x.get("game_time") or "")), reverse=True)
+    else:
+        games = sorted(games, key=lambda x: (str(x.get("date") or ""), str(x.get("game_time") or "")))
+
+    selected_key = str(st.session_state.get("ow_games_selected") or "")
+    valid_keys = {str(g["key"]) for g in games}
+    if selected_key not in valid_keys:
+        # Default to the game with the strongest available play; otherwise first scheduled game.
+        with_plays = [g for g in games if isinstance(g.get("rows"), pd.DataFrame) and not g["rows"].empty]
+        default_g = max(with_plays, key=lambda x: _ow_games_num((x.get("best") or {}).get("likely"), -1)) if with_plays else games[0]
+        selected_key = str(default_g["key"])
+        st.session_state["ow_games_selected"] = selected_key
+
+    st.markdown("#### All Games")
+    for g in games:
+        away, home = g["away"], g["home"]
+        best = g.get("best") or {}
+        prob = best.get("prob")
+        prob_txt = "" if prob is None else f" · {prob:.1f}%"
+        likely = best.get("likely")
+        likely_txt = "—" if likely is None else f"{likely:.0f}"
+        game_score = g.get("game_score")
+        game_txt = "—" if game_score is None else f"{game_score:.0f}"
+        total = g.get("game_total")
+        total_txt = "—" if total is None else f"{total:.1f}"
+        away_runs = g.get("away_runs"); home_runs = g.get("home_runs")
+        ar = "—" if away_runs is None else f"{away_runs:.2f}"; hr = "—" if home_runs is None else f"{home_runs:.2f}"
+        active = str(g["key"]) == selected_key
+        border = "#55e3aa" if active else "#f6c43c"
+        st.markdown(f"""
+        <div class='ow-game-browser-card' style='border-color:{border}'>
+          <div class='ow-game-browser-head'>
+            <div class='ow-game-browser-match'>{_mlui_logo(away,28)} &nbsp; {html.escape(away)} @ {html.escape(home)} &nbsp; {_mlui_logo(home,28)}</div>
+            <div style='font-size:10px;color:#f6c43c;font-weight:900'>{html.escape(g.get('time_label') or '—')}</div>
+          </div>
+          <div class='ow-game-browser-meta'>{html.escape(str(g.get('away_pitcher') or '—'))} {html.escape(str(g.get('away_pitcher_hand') or '—'))}HP vs {html.escape(str(g.get('home_pitcher') or '—'))} {html.escape(str(g.get('home_pitcher_hand') or '—'))}HP · {html.escape(str(g.get('venue') or ''))}</div>
+          <div class='ow-game-browser-best'>BEST: {html.escape(str(best.get('player') or '—'))} · {html.escape(str(best.get('market') or '—'))} · {html.escape(str(best.get('pick') or '—'))} {_ow_fmt_slate_num(best.get('line'),1)}{prob_txt} · LIKELY {likely_txt}</div>
+          <div class='ow-game-browser-metrics'><span class='ow-game-browser-chip'>GAME {game_txt}</span><span class='ow-game-browser-chip'>TOTAL {total_txt}</span><span class='ow-game-browser-chip'>{away} {ar} R</span><span class='ow-game-browser-chip'>{home} {hr} R</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button(("✓ OPENED " if active else "OPEN ") + f"{away} @ {home}", key=_v3_unique_widget_key(f"ow_open_game_{g['key']}"), use_container_width=True):
+            st.session_state["ow_games_selected"] = str(g["key"])
+            selected_key = str(g["key"])
+            try: st.rerun()
+            except Exception: pass
+
+    selected = next((g for g in games if str(g["key"]) == str(selected_key)), games[0])
+    away, home = selected["away"], selected["home"]
+    game_score = selected.get("game_score"); game_total = selected.get("game_total"); blow = selected.get("blowout_score")
+    ar, hr = selected.get("away_runs"), selected.get("home_runs")
+    st.markdown("---")
+    st.markdown(f"""
+    <div class='ow-game-header'>
+      <div class='ow-game-header-main'>
+        <div class='ow-game-team-block'>{_mlui_logo(away,46)}<div class='ow-game-team-name'>{away}</div><div class='ow-game-pitcher'>{html.escape(str(selected.get('away_pitcher') or '—'))} {html.escape(str(selected.get('away_pitcher_hand') or '—'))}HP</div></div>
+        <div class='ow-game-vs'>{html.escape(str(selected.get('time_label') or '—'))}<br>VS<br><span style='color:#9fa9b9'>{html.escape(str(selected.get('status') or ''))}</span></div>
+        <div class='ow-game-team-block'>{_mlui_logo(home,46)}<div class='ow-game-team-name'>{home}</div><div class='ow-game-pitcher'>{html.escape(str(selected.get('home_pitcher') or '—'))} {html.escape(str(selected.get('home_pitcher_hand') or '—'))}HP</div></div>
+      </div>
+      <div class='ow-game-metric-row'>
+        <div class='ow-game-metric'><span>GAME</span><b>{'—' if game_score is None else f'{game_score:.0f}'}</b></div>
+        <div class='ow-game-metric'><span>TOTAL</span><b>{'—' if game_total is None else f'{game_total:.1f}'}</b></div>
+        <div class='ow-game-metric'><span>{away} RUNS</span><b>{'—' if ar is None else f'{ar:.2f}'}</b></div>
+        <div class='ow-game-metric'><span>{home} RUNS</span><b>{'—' if hr is None else f'{hr:.2f}'}</b></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    overall_rows = _ow_games_player_rows_for_matchup(upside, away, home)
+    st.markdown(f"<div class='ow-game-team-preview'><div class='ow-game-team-panel'><div class='ow-game-team-title'>{away} BEST BATTERS</div>{_ow_games_team_top_html(overall_rows, away)}</div><div class='ow-game-team-panel'><div class='ow-game-team-title'>{home} BEST BATTERS</div>{_ow_games_team_top_html(overall_rows, home)}</div></div>", unsafe_allow_html=True)
+
+    view = st.radio("Game board", ["BEST OVERALL", "H+R+RBI", "HOME RUNS", "FANTASY"], horizontal=True, key=_v3_unique_widget_key("ow_games_market_view"))
+    team_view = st.radio("Show", ["BOTH TEAMS", away, home], horizontal=True, key=_v3_unique_widget_key("ow_games_team_view"))
+
+    if view == "BEST OVERALL":
+        board = overall_rows.copy()
+    elif view == "H+R+RBI":
+        try:
+            board, _meta = build_v3_batter_research_table("HRR")
+            board = _ow_games_player_rows_for_matchup(board, away, home)
+        except Exception:
+            board = pd.DataFrame()
+    elif view == "HOME RUNS":
+        try:
+            board, _meta = build_v3_home_run_table()
+            board = _ow_games_player_rows_for_matchup(board, away, home)
+        except Exception:
+            board = pd.DataFrame()
+    else:
+        fs = st.session_state.get("ow_bfs_df")
+        board = _ow_games_fs_cards_df(fs) if isinstance(fs, pd.DataFrame) else pd.DataFrame()
+        board = _ow_games_player_rows_for_matchup(board, away, home)
+        if board.empty:
+            st.info("Fantasy board is not built for this slate yet. Open Batter Fantasy or refresh the Batter Upside board to build/restore it.")
+
+    if isinstance(board, pd.DataFrame) and not board.empty and team_view != "BOTH TEAMS":
+        board = board[board["Team"].map(_ow_team_abbr).eq(team_view)].copy() if "Team" in board.columns else board
+
+    if not isinstance(board, pd.DataFrame) or board.empty:
+        st.info(f"No active {view} batter plays are available for {away} @ {home} right now.")
+        return
+
+    sort_cols = [c for c in ["Likely Score", "Best Win/Hit %", "Win Probability %", "Model Win Probability %", "HR Probability %", "Confidence"] if c in board.columns]
+    if sort_cols:
+        for c in sort_cols: board[c] = pd.to_numeric(board[c], errors="coerce")
+        board = board.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    st.markdown(f"#### {view} — {team_view}")
+    _ow_render_player_card_rows(board, f"{away} @ {home} · {view}", max_rows=len(board), key=f"games_{selected_key}_{view}_{team_view}")
+
+
+
+# ============================================================
+# HR STADIUM / WEATHER V3 — CURRENT PARK + BATTED-BALL SHAPE
+# Added 2026-08-28.
+# Home Run only. HRR and Batter Fantasy formulas remain untouched.
+# - Uses current 2026 Baseball Savant HR park factors by batter side when available.
+# - Shrinks current-year park factor toward a 3-year handedness baseline for stability.
+# - Uses live wind direction relative to the batter's pull field rather than CF only.
+# - Adds xISO, Sweet Spot%, Pull%, FlyBall%, Avg LA as independent HR evidence.
+# - Keeps the adjustment capped so stadium/weather cannot hijack the base HR model.
+# ============================================================
+OW_HR_STADIUM_V3_VERSION = "OW_HR_STADIUM_WEATHER_V3_2026_08_28"
+OW_HR_STADIUM_V3_YEAR = 2026
+
+
+def _ow_hr_v3_norm_colname(c):
+    if isinstance(c, tuple):
+        c = " ".join(str(x) for x in c if str(x).lower() != "nan")
+    return re.sub(r"\s+", " ", str(c or "")).strip()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_savant_hr_park_table_v3(bat_side="", rolling=1, year=OW_HR_STADIUM_V3_YEAR):
+    """Best-effort live Statcast HR park-factor table. Failure is neutral/fallback-safe."""
+    try:
+        params = {
+            "batSide": str(bat_side or ""),
+            "condition": "All",
+            "parks": "mlb",
+            "rolling": int(rolling),
+            "stat": "index_HR",
+            "type": "venue",
+            "year": int(year),
+        }
+        resp = requests.get(
+            "https://baseballsavant.mlb.com/leaderboard/statcast-park-factors",
+            params=params,
+            timeout=18,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code != 200 or not resp.text.strip():
+            return pd.DataFrame()
+        tables = pd.read_html(io.StringIO(resp.text))
+        for raw in tables:
+            if not isinstance(raw, pd.DataFrame) or raw.empty:
+                continue
+            d = raw.copy()
+            d.columns = [_ow_hr_v3_norm_colname(c) for c in d.columns]
+            venue_col = next((c for c in d.columns if str(c).strip().lower() == "venue"), None)
+            year_col = next((c for c in d.columns if str(c).strip() == str(year)), None)
+            if venue_col and year_col:
+                out = d[[venue_col, year_col]].copy()
+                out.columns = ["Venue", "HR Park Index"]
+                out["HR Park Index"] = pd.to_numeric(out["HR Park Index"], errors="coerce")
+                out = out.dropna(subset=["Venue", "HR Park Index"])
+                return out
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _ow_hr_v3_resolve_batter_side(row):
+    hand = str((row or {}).get("Batter Hand") or (row or {}).get("Bats") or "").upper().strip()[:1]
+    p_hand = str((row or {}).get("Pitcher Hand") or "").upper().strip()[:1]
+    if hand == "S":
+        if p_hand == "R":
+            hand = "L"
+        elif p_hand == "L":
+            hand = "R"
+    return hand if hand in {"L", "R"} else ""
+
+
+def _ow_hr_v3_park_index(venue, batter_side=""):
+    venue = str(venue or "").strip()
+    if not venue or venue == "—":
+        return None, None, None, "MISSING"
+    current = None
+    stable = None
+    try:
+        for rolling, target in [(1, "current"), (3, "stable")]:
+            d = _ow_savant_hr_park_table_v3(batter_side, rolling, OW_HR_STADIUM_V3_YEAR)
+            if not isinstance(d, pd.DataFrame) or d.empty:
+                continue
+            vnorm = normalize_name(venue) if "normalize_name" in globals() else venue.lower()
+            exact = d[d["Venue"].map(lambda x: normalize_name(x) if "normalize_name" in globals() else str(x).lower()).eq(vnorm)]
+            if exact.empty:
+                exact = d[d["Venue"].astype(str).str.contains(re.escape(venue), case=False, regex=True, na=False)]
+            if exact.empty:
+                continue
+            val = _v3_safe_num(exact.iloc[0].get("HR Park Index"), None)
+            if rolling == 1:
+                current = val
+            else:
+                stable = val
+    except Exception:
+        pass
+    # Static HR park factor is the verified fallback already used by the production app.
+    static_idx = None
+    try:
+        static_idx = (_v3_safe_num((OW_FINAL_PARK_FACTORS.get(venue) or {}).get("HR"), None) or 1.0) * 100.0
+    except Exception:
+        static_idx = 100.0
+    if current is None and stable is None:
+        return static_idx, None, None, "STATIC_FALLBACK"
+    if current is None:
+        current = stable
+    if stable is None:
+        stable = static_idx
+    # 2026 Kauffman geometry changed materially, so current-season observation deserves extra weight.
+    current_w = 0.80 if "kauffman" in venue.lower() else 0.65
+    blended = current_w * float(current) + (1.0 - current_w) * float(stable)
+    return float(blended), float(current), float(stable), "SAVANT_2026"
+
+
+# Enrich the existing current-Savant hitter context with batted-ball shape fields.
+_ow_baseball_savant_hitter_context_before_hr_stadium_v3 = _ow_baseball_savant_hitter_context
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ow_baseball_savant_hitter_context(player, season=2026):
+    out = dict(_ow_baseball_savant_hitter_context_before_hr_stadium_v3(player, season) or {})
+    out.setdefault("Savant SweetSpot%", None)
+    out.setdefault("Savant Pull%", None)
+    out.setdefault("Savant FlyBall%", None)
+    out.setdefault("Savant GroundBall%", None)
+    out.setdefault("Savant xISO", None)
+    try:
+        df = _ow_baseball_savant_leaderboard("batter", season)
+        row = _ow_savant_player_row(df, player)
+        if row:
+            sweet = _ow_savant_num(row, "sweet_spot_percent", "sweet spot%", "sweetspot%")
+            pull = _ow_savant_num(row, "pull_percent", "pull%", "pull pct")
+            fb = _ow_savant_num(row, "flyballs_percent", "fly ball%", "fb%")
+            gb = _ow_savant_num(row, "groundballs_percent", "ground ball%", "gb%")
+            for key, val in [("Savant SweetSpot%", sweet), ("Savant Pull%", pull), ("Savant FlyBall%", fb), ("Savant GroundBall%", gb)]:
+                if val is not None:
+                    val = val * 100.0 if abs(val) <= 1.0 else val
+                    out[key] = round(float(val), 1)
+            xba = _v3_safe_num(out.get("Savant xBA"), None)
+            xslg = _v3_safe_num(out.get("Savant xSLG"), None)
+            if xba is not None and xslg is not None:
+                out["Savant xISO"] = round(max(0.0, float(xslg) - float(xba)), 3)
+    except Exception:
+        pass
+    return out
+
+
+def _ow_hr_stadium_weather_v3_context(row):
+    """Batter-side park geometry + pull-field wind alignment + live air conditions."""
+    r = row or {}
+    team = _ow_team_abbr(r.get("Team"))
+    ctx = _ow_team_context(team) if team else {}
+    venue = str(r.get("Park") or (ctx or {}).get("Venue") or "")
+    side = _ow_hr_v3_resolve_batter_side(r)
+    park_idx, current_idx, stable_idx, park_source = _ow_hr_v3_park_index(venue, side)
+    if park_idx is None:
+        park_idx = 100.0
+    park_factor = float(clamp(float(park_idx) / 100.0, 0.82, 1.22))
+
+    temp = _v3_safe_num(r.get("Weather Temp F"), None)
+    wind = _v3_safe_num(r.get("Weather Wind MPH"), None)
+    wind_dir = _v3_safe_num(r.get("Weather Wind Direction"), None)
+    humidity = _v3_safe_num(r.get("Weather Humidity %"), None)
+    roof_status = str((ctx or {}).get("Roof") or (ctx or {}).get("Roof Status") or "").upper()
+    roof_neutral = bool(venue in OW_FINAL_ROOF_NEUTRAL_VENUES and "OPEN" not in roof_status)
+
+    air_factor = 1.0
+    if not roof_neutral:
+        if temp is not None:
+            air_factor *= float(clamp(1.0 + (float(temp) - 72.0) * 0.0014, 0.965, 1.035))
+        if humidity is not None:
+            air_factor *= float(clamp(1.0 + (float(humidity) - 55.0) * 0.00025, 0.988, 1.012))
+
+    cf_bearing = _v3_safe_num(OW_FINAL_PARK_CF_BEARING.get(venue), None)
+    pull_bearing = None
+    wind_pull_alignment = None
+    wind_pull_factor = 1.0
+    wind_label = "UNKNOWN"
+    if roof_neutral:
+        wind_label = "ROOF_NEUTRAL"
+    elif cf_bearing is not None and wind is not None and wind_dir is not None and side in {"L", "R"}:
+        # Looking from home plate: LF is ~35 degrees counter-clockwise from CF; RF is clockwise.
+        pull_bearing = (float(cf_bearing) + (-35.0 if side == "R" else 35.0)) % 360.0
+        blowing_to = (float(wind_dir) + 180.0) % 360.0
+        diff = abs((blowing_to - pull_bearing + 180.0) % 360.0 - 180.0)
+        wind_pull_alignment = math.cos(math.radians(diff))
+        # ~4% at 10 mph directly to pull field; capped because wind is noisy.
+        wind_pull_factor = float(clamp(1.0 + float(wind) * 0.0040 * wind_pull_alignment, 0.92, 1.08))
+        if wind_pull_alignment >= 0.65:
+            wind_label = "OUT_TO_PULL"
+        elif wind_pull_alignment <= -0.65:
+            wind_label = "IN_FROM_PULL"
+        else:
+            wind_label = "CROSS_PULL"
+
+    combined = float(clamp((park_factor ** 0.72) * air_factor * wind_pull_factor, 0.82, 1.24))
+    score = int(round(clamp(50 + (park_idx - 100.0) * 1.45 + (combined - park_factor) * 240.0, 5, 96)))
+    label = "HR BOOST" if score >= 70 else "FAVORABLE" if score >= 58 else "HR SUPPRESS" if score <= 34 else "TOUGH" if score <= 43 else "NEUTRAL"
+    return {
+        "HR Stadium V3 Version": OW_HR_STADIUM_V3_VERSION,
+        "HR Park Index V3": round(float(park_idx), 1),
+        "HR Park Current 2026 V3": None if current_idx is None else round(float(current_idx), 1),
+        "HR Park Stable V3": None if stable_idx is None else round(float(stable_idx), 1),
+        "HR Park Source V3": park_source,
+        "HR Stadium Score V3": score,
+        "HR Stadium Label V3": label,
+        "HR Stadium Factor V3": round(combined, 3),
+        "HR Batter Side V3": side or "—",
+        "HR Pull Bearing V3": None if pull_bearing is None else round(pull_bearing, 1),
+        "HR Wind Pull Alignment V3": None if wind_pull_alignment is None else round(wind_pull_alignment, 3),
+        "HR Wind Pull Factor V3": round(float(wind_pull_factor), 3),
+        "HR Wind Pull Label V3": wind_label,
+        "HR Air Factor V3": round(float(air_factor), 3),
+        "HR Roof Status V3": roof_status or ("RETRACTABLE/UNKNOWN" if venue in OW_FINAL_ROOF_NEUTRAL_VENUES else "OPEN_AIR"),
+        "HR Stadium Note V3": f"{venue or 'Unknown park'} · {side or 'all'}HB HR PF {park_idx:.0f} · {wind_label} · stadium/weather x{combined:.3f}",
+    }
+
+
+def _ow_hr_batted_ball_shape_v3(row):
+    r = row or {}
+    player = str(r.get("Player") or "")
+    sav = {}
+    try:
+        if player:
+            sav = _ow_baseball_savant_hitter_context(player, OW_HR_STADIUM_V3_YEAR) or {}
+    except Exception:
+        sav = {}
+    xba = _v3_safe_num(r.get("Savant xBA"), _v3_safe_num(sav.get("Savant xBA"), None))
+    xslg = _v3_safe_num(r.get("Savant xSLG"), _v3_safe_num(r.get("Batter xSLG"), _v3_safe_num(sav.get("Savant xSLG"), None)))
+    xiso = _v3_safe_num(sav.get("Savant xISO"), None)
+    if xiso is None and xba is not None and xslg is not None:
+        xiso = max(0.0, xslg - xba)
+    sweet = _v3_safe_num(sav.get("Savant SweetSpot%"), None)
+    pull = _v3_safe_num(sav.get("Savant Pull%"), None)
+    fly = _v3_safe_num(sav.get("Savant FlyBall%"), None)
+    avg_la = _v3_safe_num(r.get("Batter Avg LA"), None)
+    ev = _v3_safe_num(r.get("Batter Avg EV"), _v3_safe_num(r.get("Savant Avg EV"), None))
+    barrel = _v3_safe_num(r.get("Batter Barrel%"), _v3_safe_num(r.get("Savant Barrel%"), None))
+    hh = _v3_safe_num(r.get("Batter HardHit%"), _v3_safe_num(r.get("Savant HardHit%"), None))
+
+    factor = 1.0
+    score = 50.0
+    coverage = 0
+    notes = []
+    if xiso is not None:
+        coverage += 1
+        factor *= float(clamp((xiso / 0.175) ** 0.18, 0.86, 1.22))
+        score += clamp((xiso - 0.175) * 95, -12, 16)
+        notes.append(f"xISO {xiso:.3f}")
+    if sweet is not None:
+        coverage += 1
+        factor *= float(clamp((sweet / 33.0) ** 0.10, 0.93, 1.10))
+        score += clamp((sweet - 33.0) * 0.45, -6, 7)
+    if pull is not None:
+        coverage += 1
+        factor *= float(clamp((pull / 40.0) ** 0.08, 0.94, 1.08))
+        score += clamp((pull - 40.0) * 0.25, -5, 6)
+    if fly is not None:
+        coverage += 1
+        # Very low FB% is bad for HR; ultra-high FB% gets only a small extra reward.
+        factor *= float(clamp((fly / 35.0) ** 0.08, 0.93, 1.08))
+        score += clamp((fly - 35.0) * 0.22, -5, 6)
+    if avg_la is not None:
+        coverage += 1
+        if 12 <= avg_la <= 24:
+            factor *= 1.025
+            score += 4
+            notes.append(f"LA {avg_la:.1f} sweet")
+        elif avg_la < 5:
+            factor *= 0.965
+            score -= 5
+    # EV/Barrel/HH are already in HR Power V2; only use them for the descriptive score, not another multiplicative boost.
+    if ev is not None:
+        coverage += 1
+        score += clamp((ev - 88.5) * 0.65, -5, 6)
+    if barrel is not None:
+        coverage += 1
+        score += clamp((barrel - 8.5) * 0.75, -6, 8)
+    if hh is not None:
+        coverage += 1
+        score += clamp((hh - 39.0) * 0.25, -5, 6)
+    return {
+        "HR Shape Score V3": int(round(clamp(score, 5, 96))),
+        "HR Shape Factor V3": round(float(clamp(factor, 0.86, 1.18)), 3),
+        "HR Shape Coverage V3": coverage,
+        "HR xISO V3": None if xiso is None else round(float(xiso), 3),
+        "HR SweetSpot% V3": None if sweet is None else round(float(sweet), 1),
+        "HR Pull% V3": None if pull is None else round(float(pull), 1),
+        "HR FlyBall% V3": None if fly is None else round(float(fly), 1),
+        "HR Shape Note V3": ", ".join(notes[:4]) if notes else "Batted-ball shape neutral/partial",
+    }
+
+
+def _ow_hr_pitcher_profile_v3(row):
+    r = row or {}
+    hr9 = _v3_safe_num(r.get("Pitcher Recent HR/9"), _v3_safe_num(r.get("Pitcher HR9"), None))
+    barrel = _v3_safe_num(r.get("Pitcher Allowed Barrel%"), None)
+    xslg = _v3_safe_num(r.get("Pitcher Allowed xSLG"), None)
+    if hr9 is not None and hr9 >= 1.55:
+        label = "HR-PRONE"
+    elif hr9 is not None and hr9 <= 0.75:
+        label = "HR-SUPPRESSOR"
+    elif (barrel is not None and barrel >= 9.5) or (xslg is not None and xslg >= 0.470):
+        label = "POWER-VULNERABLE"
+    else:
+        label = "NEUTRAL"
+    score = 50.0
+    if hr9 is not None: score += clamp((hr9 - 1.15) * 12.0, -14, 16)
+    if barrel is not None: score += clamp((barrel - 8.5) * 0.8, -6, 8)
+    if xslg is not None: score += clamp((xslg - 0.420) * 45, -7, 9)
+    return {"Pitcher HR Profile V3": label, "Pitcher HR Vulnerability Score V3": int(round(clamp(score, 5, 95)))}
+
+
+# Wrap the route-corrected HR table so the new signal sees the correct current matchup.
+_ow_build_v3_home_run_before_stadium_v3 = build_v3_home_run_table
+
+def build_v3_home_run_table():
+    df, meta = _ow_build_v3_home_run_before_stadium_v3()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df, meta
+    rows = []
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        stadium = _ow_hr_stadium_weather_v3_context(r)
+        shape = _ow_hr_batted_ball_shape_v3(r)
+        pprof = _ow_hr_pitcher_profile_v3(r)
+        r.update(stadium); r.update(shape); r.update(pprof)
+        current_lam = _v3_safe_num(r.get("HR Projection"), None)
+        current_prob = _v3_safe_num(r.get("HR Probability %"), None)
+        feature_lam = _v3_safe_num(r.get("HR Feature xHR V2"), current_lam)
+        stadium_factor = _v3_safe_num(stadium.get("HR Stadium Factor V3"), 1.0) or 1.0
+        shape_factor = _v3_safe_num(shape.get("HR Shape Factor V3"), 1.0) or 1.0
+        shape_cov = int(_v3_safe_num(shape.get("HR Shape Coverage V3"), 0) or 0)
+        if current_lam is not None and feature_lam is not None:
+            # The independent V3 support target adds only genuinely new evidence.
+            support_target = float(feature_lam) * (stadium_factor ** 0.52) * (shape_factor ** 0.55)
+            w = 0.16 if shape_cov >= 4 and stadium.get("HR Park Source V3") == "SAVANT_2026" else 0.10
+            v3_lam = (1.0 - w) * float(current_lam) + w * support_target
+            v3_lam = float(clamp(v3_lam, float(current_lam) * 0.92, float(current_lam) * 1.09))
+            line = _v3_safe_num(r.get("Line"), 0.5) or 0.5
+            threshold = int(math.floor(float(line))) + 1
+            v3_prob_model = (_ow_poisson_tail_v3(v3_lam, threshold) or 0.0) * 100.0
+            if current_prob is None:
+                final_prob = v3_prob_model
+            else:
+                final_prob = 0.82 * float(current_prob) + 0.18 * float(v3_prob_model)
+            final_prob = float(clamp(final_prob, 1.0, 58.0))
+            r["HR Projection V2 Before Stadium"] = round(float(current_lam), 3)
+            r["HR Probability V2 Before Stadium %"] = None if current_prob is None else round(float(current_prob), 1)
+            r["HR Projection"] = round(v3_lam, 3)
+            r["HR Probability %"] = round(final_prob, 1)
+            r["Win Probability %"] = round(max(final_prob, 100.0 - final_prob), 1)
+            r["Edge"] = round(v3_lam - float(line), 3)
+            r["HR Grade"] = _ow_grade_hr_probability(final_prob)
+            power_score = _v3_safe_num(r.get("HR Power Score V2"), 50) or 50
+            context_score = int(round(clamp(
+                power_score * 0.55 +
+                (_v3_safe_num(shape.get("HR Shape Score V3"), 50) or 50) * 0.18 +
+                (_v3_safe_num(stadium.get("HR Stadium Score V3"), 50) or 50) * 0.17 +
+                (_v3_safe_num(pprof.get("Pitcher HR Vulnerability Score V3"), 50) or 50) * 0.10,
+                5, 96)))
+            r["HR Composite Score V3"] = context_score
+            r["HR Signal"] = "STRONG" if final_prob >= 26 and context_score >= 66 else "SPRINKLE" if final_prob >= 19 else "PASS"
+        r["HR Stadium/Weather V3 Note"] = (
+            f"{stadium.get('HR Stadium Note V3')}; shape {shape.get('HR Shape Score V3')}/100 "
+            f"(xISO {shape.get('HR xISO V3')}, Sweet {shape.get('HR SweetSpot% V3')}, Pull {shape.get('HR Pull% V3')}, FB {shape.get('HR FlyBall% V3')}); "
+            f"pitcher {pprof.get('Pitcher HR Profile V3')}."
+        )
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    sort_cols = [c for c in ["HR Probability %", "HR Composite Score V3", "HR Power Score V2", "Projected PA"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    meta = dict(meta or {})
+    meta["hr_stadium_weather_v3"] = OW_HR_STADIUM_V3_VERSION
+    return out, meta
+
+
+# Make the new HR context available on Batter Upside / Games without changing HRR math.
+_ow_build_v3_batter_upside_before_hr_stadium_v3 = build_v3_batter_upside_board_final
+
+def build_v3_batter_upside_board_final():
+    base = _ow_build_v3_batter_upside_before_hr_stadium_v3()
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    try:
+        hdf, _ = build_v3_home_run_table()
+        if not isinstance(hdf, pd.DataFrame) or hdf.empty:
+            return base
+        hmap = {_v3_final_norm_player(r.get("Player")): r for r in hdf.to_dict("records")}
+        fields = [
+            "HR Composite Score V3", "HR Stadium Score V3", "HR Stadium Label V3", "HR Stadium Factor V3",
+            "HR Park Index V3", "HR Park Current 2026 V3", "HR Park Stable V3", "HR Park Source V3",
+            "HR Wind Pull Label V3", "HR Wind Pull Factor V3", "HR Roof Status V3", "HR Stadium Note V3",
+            "HR Shape Score V3", "HR Shape Coverage V3", "HR xISO V3", "HR SweetSpot% V3", "HR Pull% V3", "HR FlyBall% V3",
+            "Pitcher HR Profile V3", "Pitcher HR Vulnerability Score V3", "HR Stadium/Weather V3 Note",
+        ]
+        d = base.copy()
+        for idx, rr in d.iterrows():
+            h = hmap.get(_v3_final_norm_player(rr.get("Player"))) or {}
+            for f in fields:
+                if h.get(f) not in (None, "", "—"):
+                    d.at[idx, f] = h.get(f)
+        return d
+    except Exception:
+        return base
+
+# =========================
+# UNIFIED PLAYER CARD V4 — BATTER FANTASY ADAPTERS
+# UI-only: maps the existing Fantasy board into the same card contract used by
+# Batter Upside / HRR / Home Runs / Games. Fantasy formulas remain untouched.
+# =========================
+def _ow_bfs_to_unified_card_df(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    if "Best Market" not in d.columns: d["Best Market"] = "BATTER FANTASY"
+    if "Market" not in d.columns: d["Market"] = "BATTER FANTASY"
+    if "Best Pick" not in d.columns: d["Best Pick"] = d.get("Model Direction Alt", d.get("Model Direction", d.get("Pick", "—")))
+    if "Best Line" not in d.columns: d["Best Line"] = d.get("Line")
+    if "Best Projection" not in d.columns: d["Best Projection"] = d.get("Projection")
+    if "Best Win/Hit %" not in d.columns: d["Best Win/Hit %"] = d.get("Model Win Probability %", d.get("Win Probability %"))
+    if "Win Probability %" not in d.columns and "Model Win Probability %" in d.columns: d["Win Probability %"] = d["Model Win Probability %"]
+    if "Likely Score" not in d.columns: d["Likely Score"] = d.get("Model Win Probability %", d.get("Confidence", 50))
+    if "Overall Rating" not in d.columns: d["Overall Rating"] = d.get("Rank Score", d.get("Confidence", d.get("Model Win Probability %", 50)))
+    if "Projected PA" not in d.columns:
+        for c in ["PA", "Expected PA", "PA Mean"]:
+            if c in d.columns:
+                d["Projected PA"] = d[c]
+                break
+    return d
+
+
+def _ow_bfs_render_cards(df):
+    d = _ow_bfs_to_unified_card_df(df)
+    if d.empty:
+        return
+    _ow_render_player_card_rows(d, "BATTER FANTASY", max_rows=len(d), key="bfs_unified_v4")
+
+
+def _ow_bfs_render_best_plays(df, limit=8):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    d = _ow_bfs_rank_full_board(df).head(int(limit)) if "_ow_bfs_rank_full_board" in globals() else df.head(int(limit))
+    d = _ow_bfs_to_unified_card_df(d)
+    if d.empty:
+        return
+    _ow_render_player_card_rows(d, "BATTER FANTASY", max_rows=len(d), key="bfs_best_unified_v4")
+
+
 _ow_persist_rich_postgame_if_ready()
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
 _ow_bfs_restore_saved_board_to_session()
 
-tab_top, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_poster, tab_calibration, tab_settings = st.tabs([
+tab_top, tab_games, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
+    "⚾ GAMES",
     "1️⃣ H+R+RBI",
     "2️⃣ HOME RUNS",
     "3️⃣ BATTER FANTASY",
     "🧠 BATTER LEARNING",
     "✅ OFFICIAL PLAYS",
-    "🖼️ POSTER",
     "CALIBRATION AUDIT",
     "⚙️ SETTINGS",
 ])
 
 with tab_top:
     render_v3_top_batter_plays_board()
+
+with tab_games:
+    render_v3_games_tab()
 
 with tab_hrr:
     render_v3_batter_research_tab("HRR")
@@ -41476,8 +42361,6 @@ with tab_learning:
 with tab_official:
     render_v3_batter_official_plays_tab()
 
-with tab_poster:
-    render_v3_discord_poster_studio_tab()
 
 with tab_calibration:
     render_calibration_audit_tab()
