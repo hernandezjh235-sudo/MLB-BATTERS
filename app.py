@@ -41213,6 +41213,234 @@ def _ow_persist_rich_postgame_if_ready():
     except Exception:
         pass
 
+
+# ============================================================
+# OPPONENT ROUTING FIX V1 — 2026-08-28
+# Schedule-authoritative matchup routing for batter markets.
+#
+# Root cause fixed:
+# - Sidebar defaults to "Today + Tomorrow".
+# - Older duplicate schedule-map definitions wrote one dict entry per team,
+#   so the later date could overwrite the current-date opponent.
+# - Pitcher lookup could still return the first/current game, producing a
+#   mismatched card such as current pitcher + tomorrow opponent.
+#
+# This layer makes MLB schedule context authoritative for Team/Opponent,
+# GamePk, venue and probable pitcher. Historical game-log opponent remains
+# history only and can no longer overwrite the live slate matchup.
+# No HRR/HR/FS formula weights are changed here.
+# ============================================================
+OW_OPPONENT_ROUTE_FIX_VERSION = "OW_OPPONENT_ROUTE_FIX_V1_2026_08_28"
+
+
+def _ow_schedule_candidate_priority(ctx):
+    """Choose the correct game when Today + Tomorrow or a double slate is loaded."""
+    try:
+        mode = str(globals().get("day_mode") or "Today + Tomorrow")
+        today = california_now().strftime("%Y-%m-%d")
+        tomorrow = (california_now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        dd = str(ctx.get("Date") or "")[:10]
+        abstract = str(ctx.get("abstractGameState") or ctx.get("Status") or "").upper()
+        detailed = str(ctx.get("Detailed State") or ctx.get("Game Status") or "").upper()
+        state_blob = f"{abstract} {detailed}"
+
+        # Explicit sidebar modes are strict.
+        if mode == "Today" and dd != today:
+            return -10000
+        if mode == "Tomorrow" and dd != tomorrow:
+            return -10000
+
+        if any(x in state_blob for x in ["POSTPON", "CANCEL", "SUSPEND"]):
+            state_score = -300
+        elif "LIVE" in state_blob or "IN PROGRESS" in state_blob:
+            state_score = 500
+        elif any(x in state_blob for x in ["PREVIEW", "SCHEDULED", "WARMUP", "PREGAME"]):
+            state_score = 400
+        elif "FINAL" in state_blob or "COMPLETED" in state_blob:
+            state_score = 100
+        else:
+            state_score = 300
+
+        # In Today + Tomorrow mode:
+        # - today wins when both games are upcoming;
+        # - tomorrow wins once today's game is already final and tomorrow is posted.
+        if dd == today:
+            date_score = 60
+        elif dd == tomorrow:
+            date_score = 45
+        else:
+            date_score = 0
+
+        # Slight preference for a candidate with an identified opponent pitcher.
+        pitcher_score = 8 if ctx.get("Opp Probable Pitcher ID") or ctx.get("Opp Probable Pitcher") not in (None, "", "—") else 0
+        return state_score + date_score + pitcher_score
+    except Exception:
+        return 0
+
+
+def _v3_team_schedule_context_map():
+    """Authoritative team -> active-game context without Today/Tomorrow overwrite."""
+    candidates = {}
+    try:
+        ds = list(globals().get("dates") or [])
+        if not ds:
+            mode = str(globals().get("day_mode") or "Today")
+            ds = target_dates(mode)
+        # De-duplicate dates but preserve requested order.
+        seen_dates = set()
+        ds = [str(x)[:10] for x in ds if str(x)[:10] and not (str(x)[:10] in seen_dates or seen_dates.add(str(x)[:10]))]
+
+        for dd in ds:
+            sched = get_schedule(dd) or {}
+            for d0 in sched.get("dates", []) or []:
+                for g in d0.get("games", []) or []:
+                    teams = g.get("teams", {}) or {}
+                    away_slot = teams.get("away") or {}
+                    home_slot = teams.get("home") or {}
+                    away = away_slot.get("team") or {}
+                    home = home_slot.get("team") or {}
+                    away_abbr = _ow_team_abbr(away.get("abbreviation") or away.get("teamCode") or away.get("name"))
+                    home_abbr = _ow_team_abbr(home.get("abbreviation") or home.get("teamCode") or home.get("name"))
+                    if not away_abbr or not home_abbr or away_abbr == "—" or home_abbr == "—":
+                        continue
+                    status = g.get("status") or {}
+                    away_pp = away_slot.get("probablePitcher") or {}
+                    home_pp = home_slot.get("probablePitcher") or {}
+                    away_hand = ((away_pp.get("pitchHand") or {}).get("code") or (away_pp.get("pitchHand") or {}).get("description") or "")
+                    home_hand = ((home_pp.get("pitchHand") or {}).get("code") or (home_pp.get("pitchHand") or {}).get("description") or "")
+                    common = {
+                        "Matchup": f"{away_abbr} @ {home_abbr}",
+                        "GamePk": g.get("gamePk"),
+                        "Date": str(g.get("officialDate") or dd)[:10],
+                        "Game Time": g.get("gameDate") or "",
+                        "Venue": (g.get("venue") or {}).get("name", ""),
+                        "Status": status.get("abstractGameState") or "",
+                        "Game Status": status.get("detailedState") or "",
+                        "Detailed State": status.get("detailedState") or "",
+                        "codedGameState": status.get("codedGameState") or "",
+                        "abstractGameState": status.get("abstractGameState") or "",
+                        "Opponent Routing Source": "MLB_SCHEDULE",
+                        "Opponent Route Version": OW_OPPONENT_ROUTE_FIX_VERSION,
+                    }
+                    away_ctx = {
+                        **common,
+                        "Team": away_abbr, "Opponent": home_abbr, "Home/Away": "AWAY",
+                        "Team ID": away.get("id"), "Opp Team ID": home.get("id"),
+                        "Own Probable Pitcher ID": away_pp.get("id"),
+                        "Own Probable Pitcher": away_pp.get("fullName") or "—",
+                        "Own Probable Pitcher Hand": str(away_hand or "—").upper()[:1],
+                        "Opp Probable Pitcher ID": home_pp.get("id"),
+                        "Opp Probable Pitcher": home_pp.get("fullName") or "—",
+                        "Opp Probable Pitcher Hand": str(home_hand or "—").upper()[:1],
+                    }
+                    home_ctx = {
+                        **common,
+                        "Team": home_abbr, "Opponent": away_abbr, "Home/Away": "HOME",
+                        "Team ID": home.get("id"), "Opp Team ID": away.get("id"),
+                        "Own Probable Pitcher ID": home_pp.get("id"),
+                        "Own Probable Pitcher": home_pp.get("fullName") or "—",
+                        "Own Probable Pitcher Hand": str(home_hand or "—").upper()[:1],
+                        "Opp Probable Pitcher ID": away_pp.get("id"),
+                        "Opp Probable Pitcher": away_pp.get("fullName") or "—",
+                        "Opp Probable Pitcher Hand": str(away_hand or "—").upper()[:1],
+                    }
+                    for tc in (away_ctx, home_ctx):
+                        key = str(tc.get("Team") or "").upper()
+                        candidates.setdefault(key, []).append(tc)
+    except Exception:
+        pass
+
+    resolved = {}
+    for key, opts in candidates.items():
+        if not opts:
+            continue
+        ranked = sorted(opts, key=_ow_schedule_candidate_priority, reverse=True)
+        best = dict(ranked[0])
+        best["Opponent Routing Candidates"] = len(opts)
+        best["Opponent Routing Priority"] = _ow_schedule_candidate_priority(best)
+        resolved[key] = best
+    return resolved
+
+
+def _ow_today_game_pk_for_team(team, opponent=None):
+    """Use the same authoritative schedule context as opponent/pitcher routing."""
+    team_abbr = _ow_team_abbr(team)
+    opp_abbr = _ow_team_abbr(opponent)
+    try:
+        ctx = (_v3_team_schedule_context_map() or {}).get(str(team_abbr or "").upper()) or {}
+        actual_opp = _ow_team_abbr(ctx.get("Opponent"))
+        if opp_abbr not in (None, "", "—") and actual_opp not in (None, "", "—") and opp_abbr != actual_opp:
+            # Do not reject the MLB schedule game just because a stale historical opponent was passed in.
+            pass
+        return ctx.get("GamePk")
+    except Exception:
+        return None
+
+
+def _ow_apply_authoritative_matchup_to_df(df):
+    """Final-output guard: live schedule wins over historical Opponent fields."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    sched = _v3_team_schedule_context_map() or {}
+    corrected = []
+    for idx, rr in d.iterrows():
+        team = _ow_team_abbr(rr.get("Team") or rr.get("Raw Log Team"))
+        ctx = sched.get(str(team or "").upper()) or {}
+        sched_opp = _ow_team_abbr(ctx.get("Opponent"))
+        old_opp = _ow_team_abbr(rr.get("Opponent"))
+        was_corrected = bool(sched_opp not in (None, "", "—") and old_opp not in (None, "", "—") and sched_opp != old_opp)
+        if sched_opp not in (None, "", "—"):
+            d.at[idx, "Opponent"] = sched_opp
+            d.at[idx, "Today Opponent"] = sched_opp
+            d.at[idx, "Matchup"] = f"{team} vs {sched_opp}" if team not in (None, "", "—") else rr.get("Matchup")
+            d.at[idx, "Home/Away Today"] = ctx.get("Home/Away") or rr.get("Home/Away Today")
+            d.at[idx, "Game PK"] = ctx.get("GamePk") or rr.get("Game PK")
+            d.at[idx, "Opponent Routing Source"] = "MLB_SCHEDULE"
+            d.at[idx, "Opponent Routing Date"] = ctx.get("Date")
+            d.at[idx, "Opponent Routing Status"] = "CORRECTED" if was_corrected else "OK"
+            d.at[idx, "Opp Team ID"] = ctx.get("Opp Team ID")
+            d.at[idx, "Team ID"] = ctx.get("Team ID")
+            # Probable pitcher fields are schedule-authoritative too. This prevents
+            # current-opponent text and pitcher from drifting apart again.
+            sched_pitcher = ctx.get("Opp Probable Pitcher")
+            if sched_pitcher not in (None, "", "—"):
+                d.at[idx, "Opp Pitcher"] = sched_pitcher
+            sched_hand = ctx.get("Opp Probable Pitcher Hand")
+            if sched_hand not in (None, "", "—"):
+                d.at[idx, "Pitcher Hand"] = sched_hand
+        corrected.append(was_corrected)
+    d["Opponent Routing Corrected"] = corrected
+    return d
+
+
+# Wrap visible batter builders with a final schedule-authoritative guard.
+_ow_build_v3_batter_research_before_route_fix = build_v3_batter_research_table
+
+def build_v3_batter_research_table(market="HRR"):
+    df, meta = _ow_build_v3_batter_research_before_route_fix(market)
+    df = _ow_apply_authoritative_matchup_to_df(df)
+    meta = dict(meta or {})
+    meta["opponent_route_version"] = OW_OPPONENT_ROUTE_FIX_VERSION
+    return df, meta
+
+
+_ow_build_v3_home_run_before_route_fix = build_v3_home_run_table
+
+def build_v3_home_run_table():
+    df, meta = _ow_build_v3_home_run_before_route_fix()
+    df = _ow_apply_authoritative_matchup_to_df(df)
+    meta = dict(meta or {})
+    meta["opponent_route_version"] = OW_OPPONENT_ROUTE_FIX_VERSION
+    return df, meta
+
+
+_ow_build_v3_batter_upside_before_route_fix = build_v3_batter_upside_board_final
+
+def build_v3_batter_upside_board_final():
+    df = _ow_build_v3_batter_upside_before_route_fix()
+    return _ow_apply_authoritative_matchup_to_df(df)
+
 _ow_persist_rich_postgame_if_ready()
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
