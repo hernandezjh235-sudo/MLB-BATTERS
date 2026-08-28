@@ -11579,9 +11579,41 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         p_hand_label = f"{p_hand}HP" if p_hand in {"R", "L"} else "—"
         p_era = first_num(row, ["Pitcher ERA"], None)
         p_whip = first_num(row, ["Pitcher WHIP", "Pitcher Recent WHIP"], None)
-        p_baa = first_num(row, ["Pitcher BAA"], None)
-        p_k = first_num(row, ["Pitcher K%", "Pitcher Recent K%", "Pitcher Split K%"], None, pct=True)
+        p_baa = first_num(row, ["Pitcher Split BAA", "Pitcher BAA"], None)
+        p_k = first_num(row, ["Pitcher Split K%", "Pitcher K%", "Pitcher Recent K%"], None, pct=True)
         p_hr9 = first_num(row, ["Pitcher Recent HR/9", "Pitcher HR9", "Pitcher HR/9"], None)
+
+        # Display/data-integrity refill: if merged card rows dropped a pitcher field,
+        # refill it from the authoritative MLB probable-pitcher context instead of
+        # showing a false blank. Prefer vs-batter-hand K%/BAA when a sufficient split exists.
+        try:
+            if any(v is None for v in [p_era, p_whip, p_baa, p_k, p_hr9]) and "_ow_probable_pitcher_context" in globals():
+                _live_p = _ow_probable_pitcher_context(team) or {}
+                # Only use the live context when it refers to the same schedule-routed pitcher.
+                _live_name = str(_live_p.get("Opp Pitcher") or "").strip()
+                _card_name = str(pitcher or "").strip()
+                _same_pitcher = (not _card_name or _card_name == "—" or not _live_name or _live_name == "—" or name_score(_card_name, _live_name) >= 0.86)
+                if _same_pitcher:
+                    if (not _card_name or _card_name == "—") and _live_name:
+                        pitcher = _live_name
+                    if p_era is None: p_era = _v3_safe_num(_live_p.get("Pitcher ERA"), None)
+                    if p_whip is None: p_whip = _v3_safe_num(_live_p.get("Pitcher WHIP"), None)
+                    if p_hr9 is None: p_hr9 = _v3_safe_num(_live_p.get("Pitcher HR9"), None)
+                    if p_k is None: p_k = _v3_safe_num(_live_p.get("Pitcher K%"), None)
+                    if p_baa is None: p_baa = _v3_safe_num(_live_p.get("Pitcher BAA"), None)
+                    _bh = str(row.get("Batter Hand") or row.get("Bats") or "").upper()[:1]
+                    _pid = _live_p.get("Pitcher ID")
+                    if _pid and _bh in {"L", "R", "S"} and "_ow_pitcher_allowed_split_context" in globals():
+                        _sp = _ow_pitcher_allowed_split_context(_pid, _bh, market="HR" if ("HOME RUN" in market_upper or market_upper in {"HR", "HOME RUNS"}) else "HRR") or {}
+                        _spk = _v3_safe_num(_sp.get("Pitcher Split K%"), None)
+                        _spbaa = _v3_safe_num(_sp.get("Pitcher Split BAA"), None)
+                        if _spk is not None: p_k = _spk
+                        if _spbaa is not None: p_baa = _spbaa
+                        if _sp.get("Pitcher Split vs Batter Hand") and not row.get("Pitcher Split vs Batter Hand"):
+                            row["Pitcher Split vs Batter Hand"] = _sp.get("Pitcher Split vs Batter Hand")
+        except Exception:
+            pass
+
         pa = poster_value(row, "Projected PA", "PA", "Expected PA", default="—")
 
         team_abbr, logo_html = team_logo(team)
@@ -11600,8 +11632,12 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             skill_score, skill_inputs = real_skill_score(row)
             match_score = score_from_keys(row, ["Match", "Pitcher Run/Contact Score", "Pitcher Allows Hits Score", "Pitcher Power Damage Score", "Pitcher Contact/Leash Score"], default=None)
             contact_score, contact_inputs = real_contact_score(row)
-            l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("L3") or row.get("Recent 3") or row.get("L3 Hit Rate") or row.get("Last 3 %"))
-            l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("L5") or row.get("Recent 5") or row.get("L5 Hit Rate") or row.get("Last 5 %"))
+            if "HOME RUN" in market_upper or market_upper in {"HR", "HOME RUNS"}:
+                l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("Last 3 HR Rate %") or row.get("L3") or row.get("Recent 3"))
+                l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("Last 5 HR Rate %") or row.get("L5") or row.get("Recent 5"))
+            else:
+                l3_val = parse_ratio_or_pct(row.get("Last 3") or row.get("L3") or row.get("Recent 3") or row.get("L3 Hit Rate") or row.get("Last 3 %"))
+                l5_val = parse_ratio_or_pct(row.get("Last 5") or row.get("L5") or row.get("Recent 5") or row.get("L5 Hit Rate") or row.get("Last 5 %"))
             vals = [v for v in [l3_val, l5_val] if v is not None]
             form_score = sum(vals) / len(vals) if vals else None
             l3_txt = "—" if l3_val is None else f"{l3_val:.0f}"
@@ -11660,6 +11696,16 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             p_vuln = float(clamp(p_vuln, 5, 95))
 
         # Stadium/weather can be displayed on every batter tab even if HR V3 fields were not merged onto that row.
+        # If the row lost its weather columns during a merge, refill DISPLAY-ONLY values from the same live weather source.
+        if all(first_num(row, [k], None) is None for k in ["Weather Temp F", "Weather Wind MPH", "Weather Humidity %"]):
+            try:
+                wx_market = "HR" if ("HOME RUN" in market_upper or market_upper in {"HR", "HOME RUNS"}) else "HRR"
+                wx = _ow_weather_hitter_context(team, wx_market) if "_ow_weather_hitter_context" in globals() else {}
+                for k in ["Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Weather Humidity %", "Weather Precip %", "Wind Carry Label"]:
+                    if row.get(k) in (None, "", "—") and (wx or {}).get(k) not in (None, "", "—"):
+                        row[k] = (wx or {}).get(k)
+            except Exception:
+                pass
         stadium = {}
         if "_ow_hr_stadium_weather_v3_context" in globals():
             try:
@@ -11779,7 +11825,11 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
           </div>
         """).strip())
 
-    st.markdown('<div class="owv4-list">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+    _owv4_html = '<div class="owv4-list">' + ''.join(cards) + '</div>'
+    # Streamlit/Markdown can interpret indented nested HTML as a code block.
+    # Collapse inter-tag whitespace so every card stays pure HTML.
+    _owv4_html = re.sub(r">\s+<", "><", _owv4_html)
+    st.markdown(_owv4_html, unsafe_allow_html=True)
 
 
 def render_kproj_tab(board):
@@ -28934,7 +28984,7 @@ def _ow_team_abbr(team):
     return up[:3]
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _ow_live_boxscore_players(game_pk):
     if not game_pk:
         return []
@@ -28963,8 +29013,18 @@ def _ow_live_boxscore_players(game_pk):
     return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _ow_lineup_rows_for_team(team, pitcher_hand=None):
+    """Authoritative hitter lineup stack.
+
+    Priority:
+      1) MLB official live boxscore battingOrder (confirmed)
+      2) MLB recent/projected lineup engine before official lineup posts
+      3) no third-party lineup masquerading as official
+
+    This keeps the current MLB schedule/gamePk authoritative and refreshes quickly
+    so posted lineups replace projections within a couple of minutes.
+    """
     team_abbr = _ow_team_abbr(team)
     ctx = _ow_team_context(team_abbr)
     rows = []
@@ -28977,23 +29037,26 @@ def _ow_lineup_rows_for_team(team, pitcher_hand=None):
                 "Lineup Source": "MLB_CONFIRMED_LINEUP",
                 "Confirmed": True,
             })
-    if len(rows) >= 5:
+    # A posted MLB lineup should normally contain all nine hitters. Allow 8 as a
+    # temporary feed tolerance while still clearly marking it MLB-confirmed.
+    if len(rows) >= 8:
         return sorted(rows, key=lambda r: r.get("Order") or 99)[:9], "MLB_CONFIRMED_LINEUP", True
+
+    # Before official lineups post, stay inside MLB data: use recent MLB starting
+    # lineups to project the likely 1-9. Never label this as confirmed.
     try:
-        rw = get_rotowire_expected_lineups() if "get_rotowire_expected_lineups" in globals() else {}
-        rrows = (rw or {}).get(team_abbr) or []
-        if len(rrows) >= 5:
-            confirmed = any("CONFIRMED" in str(r.get("Lineup Source", "")).upper() for r in rrows)
-            return rrows[:9], "ROTOWIRE_CONFIRMED_LINEUP" if confirmed else "ROTOWIRE_EXPECTED_LINEUP", confirmed
+        team_id = ctx.get("Team ID")
+        proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=ctx.get("Date")) if team_id else []
+        if len(proj_rows or []) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+            for r in proj_rows:
+                if isinstance(r, dict):
+                    r["Lineup Source"] = "MLB_PROJECTED_RECENT_LINEUP"
+                    r["Confirmed"] = False
+            return proj_rows[:9], "MLB_PROJECTED_RECENT_LINEUP", False
     except Exception:
         pass
-    try:
-        frows = get_fangraphs_rosterresource_lineup(team_abbr, pitcher_hand=pitcher_hand) if "get_fangraphs_rosterresource_lineup" in globals() else []
-        if len(frows or []) >= 5:
-            return frows[:9], "FANGRAPHS_PROJECTED_LINEUP", False
-    except Exception:
-        pass
-    return [], "LINEUP_SOURCE_UNAVAILABLE", False
+
+    return [], "MLB_LINEUP_NOT_POSTED", False
 
 
 def _ow_lineup_context(player, team):
@@ -30829,52 +30892,113 @@ def _ow_savant_col(df, names):
     return None
 
 
+def _ow_verified_savant_roots():
+    """Only locations intended to hold CURRENT verified Savant snapshots."""
+    roots = []
+    for raw in [
+        os.getenv("MLB_VERIFIED_DATA_ROOT", ""),
+        os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""), "verified_current_data") if os.getenv("RAILWAY_VOLUME_MOUNT_PATH") else "",
+        os.path.join(str(STORAGE_DIR), "verified_current_data") if "STORAGE_DIR" in globals() else "",
+        os.path.join(os.getcwd(), "data", "verified_current"),
+    ]:
+        raw = str(raw or "").strip()
+        if raw and raw not in roots:
+            roots.append(raw)
+    return roots
+
+
 def _ow_local_savant_candidate_paths(kind="batter"):
-    names_by_kind = {
-        "batter": [
-            "Batter.csv",
-            "batter_profiles.csv",
-            "cleaned_batting_stats.csv",
-            "savant_batter_stats.csv",
-            "savant_hitter_stats.csv",
-            "savant_data.csv",
-        ],
-        "pitcher": [
-            "savant_pitcher_stats.csv",
-            "pitcher_profiles.csv",
-            "savant_pitch_level_heatmap_foul.csv",
-            "savant_pitcher_pitch_level.csv",
-            "savant_data (3).csv",
-            "pitch_mix_matchups.csv",
-        ],
-    }.get(str(kind or "batter").lower(), [])
-    roots = [
-        "/Users/j/Desktop",
-        "/Users/j/Downloads",
-        "/Users/j/Documents/Codex/data",
-        "/Users/j/Documents/Codex/data/raw",
-        os.path.join(os.getcwd(), "data"),
-        os.path.join(os.getcwd(), "data", "raw"),
+    """Current-only local Savant files. Generic historical/profile files are excluded."""
+    k = str(kind or "batter").lower()
+    if k == "pitcher":
+        names = [
+            "savant_pitcher_stats.csv", "savant_pitcher_profiles_2026.csv", "savant_pitcher_profiles.csv",
+            "current_pitcher_savant.csv", "savant_pitcher_stats.last_good.csv", "savant_pitcher_profiles.last_good.csv",
+        ]
+    else:
+        names = [
+            "savant_batter_stats.csv", "savant_batter_profiles_2026.csv", "savant_batter_profiles.csv",
+            "current_batter_savant.csv", "savant_batter_stats.last_good.csv", "savant_batter_profiles.last_good.csv",
+        ]
+    return [os.path.join(root, nm) for root in _ow_verified_savant_roots() for nm in names]
+
+
+def _ow_validate_current_savant_df(df, kind="batter", season=2026):
+    """Reject historical/wrong-season tables before they can occupy a current-season slot."""
+    if not isinstance(df, pd.DataFrame) or df.empty or len(df) < 80:
+        return False, "empty/too few rows"
+    low_cols = {str(c).lower(): c for c in df.columns}
+    blob = " ".join(low_cols)
+    if any(tok in blob for tok in ["historical_pa", "career_pa", "career_xwoba", "career_xba", "career_xslg"]):
+        return False, "historical/career schema"
+    # If a season/year column exists it MUST include the requested season.
+    scol = next((c for c in df.columns if str(c).lower() in {"season", "year", "season_year"}), None)
+    if scol is not None:
+        vals = pd.to_numeric(df[scol], errors="coerce").dropna().astype(int)
+        if not vals.empty and int(season) not in set(vals.tolist()):
+            return False, f"wrong season ({sorted(set(vals.tolist()))[-4:]})"
+    name_col = _ow_savant_col(df, ["player_name", "last_name, first_name", "Name", "Player", "player"])
+    id_col = _ow_savant_col(df, ["player_id", "mlbam_id", "id"])
+    if not name_col:
+        return False, "missing player identity"
+    if id_col:
+        id_cov = pd.to_numeric(df[id_col], errors="coerce").notna().mean()
+        if id_cov < 0.75:
+            return False, "low MLBAM/player-id coverage"
+    metric_groups = [
+        ["xwoba", "est_woba", "estimated_woba_using_speedangle"],
+        ["xba", "est_ba", "estimated_ba_using_speedangle"],
+        ["xslg", "est_slg", "estimated_slg_using_speedangle"],
+        ["hard_hit_percent", "hardhit_percent", "hard_hit%"],
+        ["barrel_batted_rate", "barrels_per_bbe_percent", "brl_percent", "barrel%"],
+        ["whiff_percent", "whiff%"],
+        ["k_percent", "strikeout_percent", "k%"],
+        ["bb_percent", "walk_percent", "bb%"],
     ]
-    out = []
-    for root in roots:
-        for nm in names_by_kind:
-            out.append(os.path.join(root, nm))
-    return out
+    have = 0
+    for aliases in metric_groups:
+        if _ow_savant_col(df, aliases) is not None:
+            have += 1
+    if have < 3:
+        return False, f"insufficient Statcast metric coverage ({have}/8)"
+    return True, "verified current schema"
+
+
+def _ow_tag_savant_df(df, source, state, season):
+    d = df.copy()
+    d["_OW Savant URL"] = source
+    d["_OW Savant Current Verified"] = True
+    d["_OW Savant Data State"] = state
+    d["_OW Savant Season"] = int(season)
+    return d
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def _ow_baseball_savant_leaderboard(kind="batter", season=2026):
+    """Current-season Savant routing: fresh verified local -> live -> verified stale local -> empty."""
+    stale_verified = None
     for path in _ow_local_savant_candidate_paths(kind):
         if not os.path.exists(path):
             continue
         try:
             df = pd.read_csv(path, low_memory=False)
-            if isinstance(df, pd.DataFrame) and not df.empty and len(df.columns) >= 4:
-                df["_OW Savant URL"] = f"LOCAL:{os.path.basename(path)}"
-                return df
+            ok, _reason = _ow_validate_current_savant_df(df, kind, season)
+            if not ok:
+                continue
+            age_h = max(0.0, (datetime.now().timestamp() - os.path.getmtime(path)) / 3600.0)
+            repo_snapshot = os.path.abspath(path).startswith(os.path.abspath(os.path.join(os.getcwd(), "data", "verified_current")))
+            tagged = _ow_tag_savant_df(df, f"VERIFIED_LOCAL:{os.path.basename(path)}", "STALE_CURRENT" if (repo_snapshot or age_h > 30) else "CURRENT", season)
+            tagged["_OW Savant Data Age Hours"] = round(age_h, 1)
+            # Runtime/persistent-volume snapshots can be trusted as fresh by mtime.
+            # Repo snapshots are fallback-only because checkout time can hide their true data age.
+            if age_h <= 30 and not repo_snapshot:
+                return tagged
+            if stale_verified is None:
+                stale_verified = tagged
         except Exception:
             continue
+
+    # Live current-season Baseball Savant. Validate the schema before accepting it.
     urls = [
         f"https://baseballsavant.mlb.com/leaderboard/statcast?type={kind}&year={season}&csv=true",
         f"https://baseballsavant.mlb.com/leaderboard/statcast?type={kind}&season={season}&csv=true",
@@ -30884,16 +31008,18 @@ def _ow_baseball_savant_leaderboard(kind="batter", season=2026):
     for url in urls:
         try:
             r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            text = (r.text or "").strip()
-            if r.status_code != 200 or not text or text.startswith("<") or "," not in text[:300]:
+            body = (r.text or "").strip()
+            if r.status_code != 200 or not body or body.startswith("<") or "," not in body[:500]:
                 continue
-            df = pd.read_csv(io.StringIO(text), low_memory=False)
-            if isinstance(df, pd.DataFrame) and not df.empty and len(df.columns) >= 4:
-                df["_OW Savant URL"] = url
-                return df
+            df = pd.read_csv(io.StringIO(body), low_memory=False)
+            ok, _reason = _ow_validate_current_savant_df(df, kind, season)
+            if ok:
+                tagged = _ow_tag_savant_df(df, url, "LIVE_CURRENT", season)
+                tagged["_OW Savant Data Age Hours"] = 0.0
+                return tagged
         except Exception:
             continue
-    return pd.DataFrame()
+    return stale_verified if isinstance(stale_verified, pd.DataFrame) else pd.DataFrame()
 
 
 def _ow_savant_player_row(df, player):
@@ -34721,6 +34847,7 @@ def _ow_build_hr_rows_from_ud(raw_rows):
         edge = round(proj_hr - float(line), 3)
         win_prob = round(max(p_over, 1.0 - p_over) * 100, 1)
         grade = _ow_grade_hr_probability(prob_pct)
+        hr_l3, hr_l3_pct = _ow_hit_rate_text(hr_vals[-3:], float(line), "OVER")
         hr_l5, hr_l5_pct = _ow_hit_rate_text(hr_vals[-5:], float(line), "OVER")
         hr_l10, hr_l10_pct = _ow_hit_rate_text(hr_vals[-10:], float(line), "OVER")
         hr_l15, hr_l15_pct = _ow_hit_rate_text(hr_vals[-15:], float(line), "OVER")
@@ -35167,6 +35294,7 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "Volatility Note": risk_ctx.get("Volatility Note"),
             "Overall Rating": risk_ctx.get("Overall Rating"),
             "No-Bet Risk Flags": risk_ctx.get("No-Bet Risk Flags"),
+            "Last 3": hr_l3,
             "Last 5": hr_l5,
             "Last 10": hr_l10,
             "Last 15": hr_l15,
@@ -35176,11 +35304,13 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "H2H Games": len(h2h_hr_vals),
             "H2H HR": int(sum(h2h_hr_vals)) if h2h_hr_vals else 0,
             "H2H HR Rate %": round((h2h_hr_pct or 0) * 100, 1) if h2h_hr_vals else "—",
+            "Last 3 HR": int(sum(hr_vals[-3:])) if hr_vals else 0,
             "Last 5 HR": int(sum(hr_vals[-5:])) if hr_vals else 0,
             "Last 10 HR": int(sum(hr_vals[-10:])) if hr_vals else 0,
             "Last 15 HR": int(sum(hr_vals[-15:])) if hr_vals else 0,
             "Last 20 HR": int(sum(hr_vals[-20:])) if hr_vals else 0,
             "Last 30 HR": int(sum(hr_vals[-30:])) if hr_vals else 0,
+            "Last 3 HR Rate %": round((hr_l3_pct or 0) * 100, 1) if hr_vals else "—",
             "Last 5 HR Rate %": round((hr_l5_pct or 0) * 100, 1) if hr_vals else "—",
             "Last 10 HR Rate %": round((hr_l10_pct or 0) * 100, 1) if hr_vals else "—",
             "Last 15 HR Rate %": round((hr_l15_pct or 0) * 100, 1) if hr_vals else "—",
@@ -35917,7 +36047,7 @@ def render_v3_home_run_tab():
     if s2.button("Grade HR snapshots", key=_v3_unique_widget_key("ow_grade_hr_snapshot"), use_container_width=True):
         info = _ow_grade_batter_snapshots()
         st.success(f"Graded {info.get('graded', 0)} batter rows. Waiting final: {info.get('waiting_final', 0)}.")
-    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "HR Projection Base", "Edge", "HR Probability %", "HR Probability Base %", "HR Power Score V2", "HR Power Label V2", "HR Power Coverage V2", "HR Feature xHR V2", "HR Composite Score V3", "HR Stadium Score V3", "HR Stadium Label V3", "HR Park Index V3", "HR Park Current 2026 V3", "HR Park Stable V3", "HR Park Source V3", "HR Stadium Factor V3", "HR Wind Pull Label V3", "HR Wind Pull Factor V3", "HR Roof Status V3", "HR Shape Score V3", "HR Shape Coverage V3", "HR xISO V3", "HR SweetSpot% V3", "HR Pull% V3", "HR FlyBall% V3", "Pitcher HR Profile V3", "Pitcher HR Vulnerability Score V3", "Game V3 Score", "Game V3 Label", "Team Runs V3", "Game Total V3", "P Game 11+ Runs V3", "Blowout V3 Score", "P Margin 5+ V3", "Starter IP P50 V3", "Starter Early Exit Risk % V3", "Bullpen V3 Score", "Bullpen V3 Label", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Team Run Environment", "Blowout Environment Factor", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
+    cols = [c for c in ["Player", "Team", "Raw Log Team", "Team Source", "Opponent", "Matchup Data Status", "Pitcher Matchup Verified", "Market", "Line", "Pick", "HR Signal", "HR Projection", "HR Projection Base", "Edge", "HR Probability %", "HR Probability Base %", "HR Power Score V2", "HR Power Label V2", "HR Power Coverage V2", "HR Feature xHR V2", "HR Composite Score V3", "HR Stadium Score V3", "HR Stadium Label V3", "HR Park Index V3", "HR Park Current 2026 V3", "HR Park Stable V3", "HR Park Source V3", "HR Stadium Factor V3", "HR Wind Pull Label V3", "HR Wind Pull Factor V3", "HR Roof Status V3", "HR Shape Score V3", "HR Shape Coverage V3", "HR xISO V3", "HR SweetSpot% V3", "HR Pull% V3", "HR FlyBall% V3", "Pitcher HR Profile V3", "Pitcher HR Vulnerability Score V3", "Game V3 Score", "Game V3 Label", "Team Runs V3", "Game Total V3", "P Game 11+ Runs V3", "Blowout V3 Score", "P Margin 5+ V3", "Starter IP P50 V3", "Starter Early Exit Risk % V3", "Bullpen V3 Score", "Bullpen V3 Label", "Win Probability %", "HR Grade", "HR Score", "HR Score Label", "HR Likelihood Rank", "PA Sim HR Mean", "PA Sim HR Over %", "PA Sim H+R+RBI Mean", "PA Sim Hit/G", "PA Sim BB/G", "PA Sim K/G", "PA Outcome Hit %", "PA Outcome HR %", "PA Outcome BB %", "PA Outcome K %", "Fantasy Involvement Score", "Fantasy Involvement Label", "Batter Outcome Tags", "PA Sim Volatility CV", "PA Sim Volatility Label", "PA Sim Note", "Data Confidence", "Daily Data Score", "Daily Data Label", "Daily Data Warnings", "Opportunity Tier", "Opportunity Reason", "Final Data Quality Score", "Final Data Guardrail Label", "Final Data Guardrail Factor", "Result Gate Label", "Result Gate Factor", "Result Gate Samples", "Result Gate Win Rate %", "Overall Rating", "No-Bet Risk Flags", "Data Flags", "Projected PA", "Season PA", "Season AVG", "Season H", "Season R", "Season RBI", "Season HR", "Season OPS", "Season wRC+ Proxy", "Split vs Hand", "Split PA", "Split AVG", "Split H", "Split R", "Split RBI", "Split HR", "Split OPS", "Split wRC+ Proxy", "Key Matchup Stats Factor", "Key Matchup Stats Note", "Lineup Slot", "Lineup Status", "Lineup Source", "Lineup Quality Factor", "Lineup Quality Note", "Pre-Lineup Note", "Pre-Lineup PA L5", "Pre-Lineup PA L10", "Opening Line", "Current Line", "Line Move", "Line Move Label", "Line Move Note", "Sportsbook Market Status", "Sportsbook Consensus Line", "Sportsbook Line Edge", "Sportsbook Books", "Sportsbook Market Note", "Batter Learning Factor", "Batter Learning Samples", "Batter Learning Win Rate %", "Batter Learning Note", "Projection Calibration Add", "Projection Calibration Factor", "Projection Calibration Samples", "Projection Calibration Avg Error", "Projection Calibration Label", "Projection Calibration Note", "Daily Data Checks", "Daily Data Note", "Final Data Guardrail Note", "Result Gate Note", "Lineup ProtectionFactor", "Lineup Protection Factor", "Lineup Slot TrendFactor", "Lineup Slot Trend Factor", "Availability Factor", "Days Since Last Game", "Ahead OBP", "Behind SLG", "Protection Source", "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher Confirmation Factor", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher Hits Allowed", "Pitcher Runs Allowed", "Pitcher ER Allowed", "Pitcher Walks Allowed", "Pitcher H/9", "Pitcher BB/9", "Pitcher BABIP", "Pitcher FIP", "Pitcher xFIP", "Pitcher SIERA", "Pitcher Contact Factor", "Pitcher IP", "Pitcher Starts", "Pitcher HR9", "Pitcher K%", "Pitcher CSW%", "Pitcher Whiff%", "Pitcher Chase%", "Pitcher Zone Contact%", "Primary Pitch", "Slider/Sweeper Usage %", "Slider/Sweeper Whiff%", "Pitcher Stuff Factor", "Pitcher Matchup Factor", "Bullpen/Leash Factor", "Starter Leash Label", "Team Run Environment", "Blowout Environment Factor", "Blowout Run Score", "Blowout Stack Signal", "Blowout Risk Label", "Blowout Note", "Pitch Mix Matchup Factor", "Pitch Mix Matchup Pitch", "Batter Pitch PC", "Batter Pitch PA", "Batter Pitch K%", "Batter Pitch wOBA", "Batter Pitch Whiff%", "Batter Pitch Contact%", "Batter Pitch SLG", "Batter Quality Factor", "Profile CSV Found", "Profile Factor", "Profile hrr_pa", "Profile hr_pa", "Profile k_pa", "Profile BA", "Profile H", "Profile R", "Profile RBI", "Profile wRC+ Proxy", "Profile OPS", "Profile OPS+", "Profile PA", "Batter Avg EV", "Batter HardHit%", "Batter Barrel%", "Batter Avg LA", "Batter Whiff%", "Batter xwOBA", "Batter xSLG", "Recent 15d HardHit%", "Recent 15d Barrel%", "Recent 15d xwOBA", "Recent 30d xwOBA", "Recent Statcast Factor HR", "Ahead Count xwOBA", "Behind Count xwOBA", "Count Leverage Factor", "Volatility Factor", "Volatility Label", "Split Factor", "PA Factor", "Park", "Park Factor", "Weather Factor", "Weather Temp F", "Weather Wind MPH", "Weather Wind Direction", "Wind Carry Label", "Weather Humidity %", "Umpire Hitter Factor", "Umpire Name", "Defense/Framing Factor", "Opponent Defense Score", "Opponent Framing Score", "HR CSV Prior", "Prior HR Projection", "Prior HR Probability %", "Prior Source", "Last 3", "Last 5", "Last 10", "Last 15", "Last 20", "Last 30", "H2H", "H2H Games", "H2H HR", "H2H HR Rate %", "Last 3 HR", "Last 5 HR", "Last 10 HR", "Last 15 HR", "Last 20 HR", "Last 30 HR", "Last 3 HR Rate %", "Last 5 HR Rate %", "Last 10 HR Rate %", "Last 15 HR Rate %", "Last 20 HR Rate %", "Last 30 HR Rate %", "L7 HR", "L15 HR", "L30 HR", "Official Play Filter"] if c in df.columns]
     for c in ["Pitcher Contact/Leash Factor", "Pitcher Contact/Leash Score", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note"]:
         if c in df.columns and c not in cols:
             anchor = cols.index("Pitch Mix Matchup Factor") if "Pitch Mix Matchup Factor" in cols else len(cols)
@@ -39798,6 +39928,40 @@ def _ow_bfs_installed_df(kind):
     if not path.exists():
         return pd.DataFrame()
     try:
+        df = pd.read_csv(path, low_memory=False)
+        k = str(kind or "").upper()
+        current_core = {"BATTER_PROFILE", "PITCHER_PROFILE", "PITCHER_ARSENAL", "BATTER_PLATOON", "BATTER_PITCH_TYPE", "BULLPEN", "LINEUPS"}
+        if k in current_core and isinstance(df, pd.DataFrame) and not df.empty:
+            year = int(california_now().year if "california_now" in globals() else datetime.now().year)
+            scol = next((c for c in df.columns if str(c).lower() in {"season", "year", "season_year"}), None)
+            if scol is not None:
+                vals = pd.to_numeric(df[scol], errors="coerce").dropna().astype(int)
+                if not vals.empty and year not in set(vals.tolist()):
+                    return pd.DataFrame()
+            else:
+                # No explicit season: only let a recent install override live data.
+                try:
+                    idx = _ow_bfs_install_index_load()
+                    active = (((idx.get("datasets") or {}).get(k) or {}).get("active") or {})
+                    stamp = active.get("installed_at")
+                    src = str(active.get("source_file") or "")
+                    fresh = False
+                    if stamp:
+                        ts = pd.to_datetime(stamp, errors="coerce", utc=True)
+                        if pd.notna(ts):
+                            fresh = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() <= 72 * 3600
+                    explicitly_current = str(year) in src
+                    if not (fresh or explicitly_current):
+                        return pd.DataFrame()
+                except Exception:
+                    return pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
+    path = OW_BFS_INSTALL_DIR / canonical
+    if not path.exists():
+        return pd.DataFrame()
+    try:
         return pd.read_csv(path, low_memory=False)
     except Exception:
         return pd.DataFrame()
@@ -42323,6 +42487,42 @@ def _ow_bfs_render_best_plays(df, limit=8):
     _ow_render_player_card_rows(d, "BATTER FANTASY", max_rows=len(d), key="bfs_best_unified_v4")
 
 
+
+# =========================
+# DATA HEALTH AUDIT V4 — on-demand, Settings only
+# Does not change any projection formula.
+# =========================
+def _ow_render_data_health_audit_v4():
+    with st.expander("🩺 DATA HEALTH / CURRENT SOURCES", expanded=False):
+        st.caption("On-demand source check. It does not alter projections or saved boards.")
+        if not st.button("Run Data Health Check", key="ow_data_health_v4_btn"):
+            return
+        rows = []
+        year = int(california_now().year if "california_now" in globals() else datetime.now().year)
+        for kind, label in [("batter", "Batter Savant"), ("pitcher", "Pitcher Savant")]:
+            try:
+                d = _ow_baseball_savant_leaderboard(kind, year)
+                source = str(d["_OW Savant URL"].iloc[0]) if isinstance(d, pd.DataFrame) and not d.empty and "_OW Savant URL" in d.columns else "MISSING"
+                state = str(d["_OW Savant Data State"].iloc[0]) if isinstance(d, pd.DataFrame) and not d.empty and "_OW Savant Data State" in d.columns else "MISSING"
+                rows.append({"Layer": label, "Status": "OK" if isinstance(d, pd.DataFrame) and not d.empty else "MISSING", "Rows": len(d) if isinstance(d, pd.DataFrame) else 0, "Source / State": f"{state} · {source}"})
+            except Exception as e:
+                rows.append({"Layer": label, "Status": "ERROR", "Rows": 0, "Source / State": str(e)[:120]})
+        try:
+            smap = _v3_team_schedule_context_map() if "_v3_team_schedule_context_map" in globals() else {}
+            rows.append({"Layer": "MLB schedule / opponents", "Status": "OK" if smap else "MISSING", "Rows": len(smap) if isinstance(smap, dict) else 0, "Source / State": "MLB Stats API · authoritative route"})
+        except Exception as e:
+            rows.append({"Layer": "MLB schedule / opponents", "Status": "ERROR", "Rows": 0, "Source / State": str(e)[:120]})
+        rows.append({"Layer": "Team implied runs", "Status": "ODDS ENABLED" if bool(get_secret("ODDS_API_KEY", "")) else "MLB PROXY FALLBACK", "Rows": "—", "Source / State": "Sportsbook totals first; 2026 MLB offense proxy fallback"})
+        rows.append({"Layer": "Weather", "Status": "LIVE FALLBACK", "Rows": len(VENUE_WEATHER_META) if "VENUE_WEATHER_META" in globals() else 0, "Source / State": "Open-Meteo + venue/roof rules"})
+        try:
+            inst, _ = _ow_bfs_installer_status()
+            active = int((pd.to_numeric(inst.get("Active Rows"), errors="coerce").fillna(0) > 0).sum()) if isinstance(inst, pd.DataFrame) and not inst.empty else 0
+        except Exception:
+            active = 0
+        rows.append({"Layer": "Optional installed BFS data", "Status": f"{active} active datasets", "Rows": "—", "Source / State": "Wrong-season/old unverified core files are now blocked"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("Core live paths: MLB schedule/lineups/boxscores, current Savant, live pitch-type Statcast, bullpen workload, park factors, weather, and sportsbook totals when configured.")
+
 _ow_persist_rich_postgame_if_ready()
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
@@ -42367,3 +42567,4 @@ with tab_calibration:
 
 with tab_settings:
     render_v3_settings_tab()
+    _ow_render_data_health_audit_v4()
