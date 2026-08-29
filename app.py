@@ -43206,25 +43206,123 @@ def _ow_game_raw_team_v3(row):
     return None
 
 
-def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
-    """Resolve only rows that can belong to the selected game; never enrich the full slate."""
+@st.cache_data(ttl=180, show_spinner=False)
+def _ow_game_selected_roster_map_v4(away, home):
+    """Build a small authoritative MLB name->team/id map for ONLY the opened matchup.
+
+    This avoids enriching hundreds of Underdog rows. Official MLB active roster is
+    preferred; 40-man is a recovery fallback for recently activated/optioned players.
+    """
     teams = {str(away).upper(), str(home).upper()}
-    selected, unresolved = [], []
+    sched = _v3_team_schedule_context_map() or {}
+    season = 2026
+    try:
+        season = int(globals().get("SEASON") or globals().get("CURRENT_SEASON") or _fs_season() or 2026)
+    except Exception:
+        season = 2026
+    name_map = {}
+    debug = {"teams": {}, "season": season}
+    for tm in teams:
+        ctx = sched.get(tm) or {}
+        team_id = ctx.get("Team ID")
+        team_debug = {"team_id": team_id, "active": 0, "40Man": 0, "lineup": 0}
+
+        # MLB posted/projected lineup gives us the most relevant names first.
+        try:
+            ph = ctx.get("Opp Probable Pitcher Hand")
+            for row in _ow_lineup_rows_for_team(tm, pitcher_hand=ph) or []:
+                nm = str((row or {}).get("Batter") or "").strip()
+                nk = _v3_norm_name(nm)
+                if nk:
+                    name_map[nk] = {"Team": tm, "Player ID": (row or {}).get("Player ID"), "Source": (row or {}).get("Lineup Source") or "MLB_LINEUP"}
+                    team_debug["lineup"] += 1
+        except Exception:
+            pass
+
+        if not team_id:
+            debug["teams"][tm] = team_debug
+            continue
+
+        for roster_type in ("active", "40Man"):
+            try:
+                url = f"{MLB_BASE}/teams/{team_id}/roster?rosterType={roster_type}&season={season}"
+                js = safe_get_json(url, timeout=12) or {}
+                for item in js.get("roster", []) or []:
+                    person = (item or {}).get("person") or {}
+                    pid = person.get("id")
+                    nm = str(person.get("fullName") or "").strip()
+                    if not nm:
+                        continue
+                    nk = _v3_norm_name(nm)
+                    if not nk:
+                        continue
+                    # Do not let 40-man replace an active/lineup assignment.
+                    old = name_map.get(nk) or {}
+                    if old and old.get("Team") == tm and roster_type == "40Man":
+                        continue
+                    name_map[nk] = {"Team": tm, "Player ID": pid, "Source": f"MLB_{roster_type.upper()}_ROSTER"}
+                    team_debug[roster_type] += 1
+            except Exception:
+                continue
+        debug["teams"][tm] = team_debug
+    debug["mapped_names"] = len(name_map)
+    return name_map, debug
+
+
+def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
+    """Resolve posted Underdog rows to the opened MLB matchup using MLB rosters/IDs.
+
+    Underdog sometimes supplies a valid player/line but omits or changes the team
+    relationship. We therefore use the selected game's two MLB rosters as the
+    authoritative membership test, then enrich only the matched rows.
+    """
+    away = str(away).upper(); home = str(home).upper()
+    teams = {away, home}
+    sched = _v3_team_schedule_context_map() or {}
+    try:
+        roster_map, roster_debug = _ow_game_selected_roster_map_v4(away, home)
+    except Exception:
+        roster_map, roster_debug = {}, {"error": "roster_map_failed"}
+
+    selected = []
+    unresolved = []
+    counts = {"raw": len(raw_rows or []), "by_ud_team": 0, "by_mlb_roster": 0, "by_name_lookup": 0}
+
     for raw in raw_rows or []:
         r = dict(raw or {})
-        tm = _ow_game_raw_team_v3(r)
-        if tm in teams:
+        player = str(r.get("Player") or "").strip()
+        nk = _v3_norm_name(player)
+        roster_hit = roster_map.get(nk) if nk else None
+        parsed_tm = _ow_game_raw_team_v3(r)
+
+        # Official selected-game roster membership is the strongest game assignment.
+        if roster_hit and roster_hit.get("Team") in teams:
+            r["Team"] = roster_hit.get("Team")
+            if roster_hit.get("Player ID"):
+                r["Player ID"] = roster_hit.get("Player ID")
+            r["Game Match Source"] = roster_hit.get("Source") or "MLB_ROSTER"
             selected.append(r)
-        elif tm in (None, "", "—"):
+            counts["by_mlb_roster"] += 1
+            continue
+
+        # Keep a clean Underdog team assignment when it already matches the opened game.
+        if parsed_tm in teams:
+            r["Team"] = parsed_tm
+            r["Game Match Source"] = "UNDERDOG_TEAM"
+            selected.append(r)
+            counts["by_ud_team"] += 1
+            continue
+
+        # Only a small residue reaches name lookup. This is a recovery path, not the
+        # primary matcher, so opening one game remains fast.
+        if player:
             unresolved.append(r)
 
-    # Only name-resolve rows whose Underdog payload did not expose a team.
-    # This keeps full-board completeness while avoiding hundreds of MLB lookups.
-    for r in unresolved:
+    # Recovery for recently traded/activated players who may not yet be in the roster cache.
+    # Cap the expensive name-search path to avoid recreating the old full-slate slowdown.
+    for r in unresolved[:80]:
         try:
             player = str(r.get("Player") or "").strip()
-            if not player:
-                continue
             pid = r.get("Player ID") or _mlb_search_player_id_by_name(player)
             if not pid:
                 continue
@@ -43233,10 +43331,13 @@ def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
             if tm in teams:
                 r["Player ID"] = pid
                 r["Team"] = tm
+                r["Game Match Source"] = "MLB_PLAYER_LOOKUP"
                 selected.append(r)
+                counts["by_name_lookup"] += 1
         except Exception:
             continue
 
+    # Enrich only the rows proven to belong to this matchup.
     try:
         selected = _ow_games_full_ud_enrich_v3(selected)
     except Exception:
@@ -43248,6 +43349,19 @@ def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
         tm = _ow_game_raw_team_v3(r)
         if tm not in teams:
             continue
+        opp = home if tm == away else away
+        r["Team"] = tm
+        r["Opponent"] = opp
+        # Pin GamePk to the selected matchup only; never allow a Today/Tomorrow
+        # schedule candidate for another opponent to leak into this opened game.
+        try:
+            ctx = sched.get(tm) or {}
+            if _ow_team_abbr(ctx.get("Opponent")) == opp:
+                if ctx.get("GamePk"):
+                    r["Game PK"] = ctx.get("GamePk")
+                r["UD Matchup Source"] = "MLB_SELECTED_GAME"
+        except Exception:
+            pass
         market = str(r.get("Market") or "")
         line = _v3_safe_num(r.get("Line"), None)
         key = (_v3_norm_name(r.get("Player")), market, None if line is None else round(float(line), 3))
@@ -43255,6 +43369,18 @@ def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
             continue
         seen.add(key)
         final.append(dict(r))
+
+    try:
+        st.session_state["ow_game_match_debug_v4"] = {
+            **counts,
+            "final": len(final),
+            "away": away,
+            "home": home,
+            "roster": roster_debug,
+            "version": "OW_GAME_ROSTER_MATCH_V4_2026_08_29",
+        }
+    except Exception:
+        pass
     return final
 
 
@@ -43271,11 +43397,15 @@ def _ow_game_full_raw_rows_v3(game_key, away, home, force=False):
     except Exception as exc:
         raw_rows, debug = [], {"status": "ERROR", "error": str(exc)}
     rows = _ow_game_filter_full_ud_rows_v3(raw_rows, away, home)
+    try:
+        match_debug = dict(st.session_state.get("ow_game_match_debug_v4") or {})
+    except Exception:
+        match_debug = {}
     info = {
         "game_key": str(game_key),
         "ts": now_ts,
         "rows": rows,
-        "debug": {**dict(debug or {}), "selected_game_rows": len(rows), "version": OW_FAST_MAIN_ONDEMAND_GAMES_VERSION},
+        "debug": {**dict(debug or {}), "selected_game_rows": len(rows), "game_match": match_debug, "version": OW_FAST_MAIN_ONDEMAND_GAMES_VERSION},
     }
     st.session_state["ow_game_full_raw_cache_v3"] = info
     return rows, info["debug"]
