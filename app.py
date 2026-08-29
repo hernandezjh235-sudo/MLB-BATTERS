@@ -43097,9 +43097,391 @@ def _ow_auto_grade_batter_mlb_official_v2():
         pass
 
 
-# Keep the Games tab driven by the newly complete posted-line board.
-# No UI redesign here; the existing matchup-first concept remains unchanged.
+
+# ============================================================
+# FAST MAIN + ON-DEMAND FULL GAME PROJECTIONS V3
+# 2026-08-29
+# Goal:
+# - Restore the pre-full-board fast behavior on Batter Upside / HRR / HR.
+# - Keep the complete Underdog parser available ONLY when a user opens one game.
+# - Preserve MLB official final-box grading from the V2 grading repair.
+# - Do not alter HRR / HR / FS projection formulas.
+# ============================================================
+OW_FAST_MAIN_ONDEMAND_GAMES_VERSION = "OW_FAST_MAIN_ONDEMAND_GAMES_V3_2026_08_29"
+OW_MAIN_FAST_MAX_PROJECTED_LINES = 120
+OW_GAME_FULL_REFRESH_SECONDS = 90
+
+# Save the complete parser/enricher before restoring the faster slate path.
+_ow_games_full_ud_parser_v3 = _ow_fetch_ud_batter_hrr_hr_lines
+_ow_games_full_ud_enrich_v3 = _ow_ud_enrich_rows_with_mlb
+_ow_games_current_upside_builder_v3 = build_v3_batter_upside_board_final
+_ow_games_current_hrr_builder_v3 = build_v3_batter_research_table
+_ow_games_current_hr_builder_v3 = build_v3_home_run_table
+
+# Restore the exact pre-full-board formula entry points for the normal tabs.
+# These references were captured before the V2 completeness wrapper was installed.
+_ow_build_hrr_rows_from_ud = _ow_build_hrr_rows_from_ud_before_full_board_fix
+_ow_build_hr_rows_from_ud = _ow_build_hr_rows_from_ud_before_full_board_fix
+OW_FINAL_MAX_PROJECTED_LINES = OW_MAIN_FAST_MAX_PROJECTED_LINES
+
+
+def _ow_game_override_rows_v3():
+    try:
+        rows = st.session_state.get("_ow_game_projection_raw_override_v3")
+        return rows if isinstance(rows, list) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _ow_fast_main_ud_rows_v3():
+    """Use the pre-completeness parser for fast slate-level boards."""
+    try:
+        rows, debug = _ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix()
+        return list(rows or []), dict(debug or {})
+    except Exception as exc:
+        return [], {"status": "ERROR", "error": str(exc), "mode": "FAST_MAIN"}
+
+
+def fetch_underdog_batter_prop_rows():
+    """Fast main HRR feed; game override receives only the selected matchup rows."""
+    override = _ow_game_override_rows_v3()
+    if override is not None:
+        rows = [dict(r) for r in override if str((r or {}).get("Market") or "") == "HRR"]
+        try:
+            st.session_state["hrr_ud_debug"] = {
+                "status": "OK" if rows else "NO_LINES",
+                "mode": "GAME_ON_DEMAND_FULL",
+                "returned_hrr_rows": len(rows),
+                "version": OW_FAST_MAIN_ONDEMAND_GAMES_VERSION,
+            }
+        except Exception:
+            pass
+        return rows
+    rows, debug = _ow_fast_main_ud_rows_v3()
+    hrr = [dict(r) for r in rows if str((r or {}).get("Market") or "") == "HRR"]
+    try:
+        st.session_state["hrr_ud_debug"] = {**debug, "mode": "FAST_MAIN", "returned_hrr_rows": len(hrr)}
+    except Exception:
+        pass
+    return hrr
+
+
+def _v3_ud_hrr_rows():
+    return fetch_underdog_batter_prop_rows() or []
+
+
+def _v3_fetch_ud_home_run_rows():
+    """Fast main HR feed; game override receives only the selected matchup rows."""
+    override = _ow_game_override_rows_v3()
+    if override is not None:
+        rows = [dict(r) for r in override if str((r or {}).get("Market") or "") == "Home Runs"]
+        try:
+            st.session_state["hr_ud_debug"] = {
+                "status": "OK" if rows else "NO_LINES",
+                "mode": "GAME_ON_DEMAND_FULL",
+                "returned_hr_rows": len(rows),
+                "version": OW_FAST_MAIN_ONDEMAND_GAMES_VERSION,
+            }
+        except Exception:
+            pass
+        return rows
+    rows, debug = _ow_fast_main_ud_rows_v3()
+    hr = [dict(r) for r in rows if str((r or {}).get("Market") or "") == "Home Runs"]
+    try:
+        st.session_state["hr_ud_debug"] = {**debug, "mode": "FAST_MAIN", "returned_hr_rows": len(hr)}
+    except Exception:
+        pass
+    return hr
+
+
+def _ow_game_raw_team_v3(row):
+    for key in ("Team", "UD Team", "Raw Log Team"):
+        try:
+            tm = _ow_team_abbr((row or {}).get(key))
+        except Exception:
+            tm = None
+        if tm not in (None, "", "—"):
+            return tm
+    return None
+
+
+def _ow_game_filter_full_ud_rows_v3(raw_rows, away, home):
+    """Resolve only rows that can belong to the selected game; never enrich the full slate."""
+    teams = {str(away).upper(), str(home).upper()}
+    selected, unresolved = [], []
+    for raw in raw_rows or []:
+        r = dict(raw or {})
+        tm = _ow_game_raw_team_v3(r)
+        if tm in teams:
+            selected.append(r)
+        elif tm in (None, "", "—"):
+            unresolved.append(r)
+
+    # Only name-resolve rows whose Underdog payload did not expose a team.
+    # This keeps full-board completeness while avoiding hundreds of MLB lookups.
+    for r in unresolved:
+        try:
+            player = str(r.get("Player") or "").strip()
+            if not player:
+                continue
+            pid = r.get("Player ID") or _mlb_search_player_id_by_name(player)
+            if not pid:
+                continue
+            ctx = _ow_current_batter_team_context(pid) or {}
+            tm = _ow_team_abbr(ctx.get("Current Team") or ctx.get("Team"))
+            if tm in teams:
+                r["Player ID"] = pid
+                r["Team"] = tm
+                selected.append(r)
+        except Exception:
+            continue
+
+    try:
+        selected = _ow_games_full_ud_enrich_v3(selected)
+    except Exception:
+        pass
+
+    final = []
+    seen = set()
+    for r in selected:
+        tm = _ow_game_raw_team_v3(r)
+        if tm not in teams:
+            continue
+        market = str(r.get("Market") or "")
+        line = _v3_safe_num(r.get("Line"), None)
+        key = (_v3_norm_name(r.get("Player")), market, None if line is None else round(float(line), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        final.append(dict(r))
+    return final
+
+
+def _ow_game_full_raw_rows_v3(game_key, away, home, force=False):
+    now_ts = datetime.now().timestamp()
+    cache = st.session_state.get("ow_game_full_raw_cache_v3")
+    if isinstance(cache, dict) and not force:
+        if str(cache.get("game_key")) == str(game_key) and now_ts - float(cache.get("ts") or 0) < OW_GAME_FULL_REFRESH_SECONDS:
+            rows = cache.get("rows")
+            if isinstance(rows, list):
+                return rows, dict(cache.get("debug") or {})
+    try:
+        raw_rows, debug = _ow_games_full_ud_parser_v3()
+    except Exception as exc:
+        raw_rows, debug = [], {"status": "ERROR", "error": str(exc)}
+    rows = _ow_game_filter_full_ud_rows_v3(raw_rows, away, home)
+    info = {
+        "game_key": str(game_key),
+        "ts": now_ts,
+        "rows": rows,
+        "debug": {**dict(debug or {}), "selected_game_rows": len(rows), "version": OW_FAST_MAIN_ONDEMAND_GAMES_VERSION},
+    }
+    st.session_state["ow_game_full_raw_cache_v3"] = info
+    return rows, info["debug"]
+
+
+def _ow_with_game_rows_v3(rows, fn):
+    """Per-session injection into the existing builders; projection formulas stay unchanged."""
+    sentinel = object()
+    old = st.session_state.get("_ow_game_projection_raw_override_v3", sentinel)
+    try:
+        st.session_state["_ow_game_projection_raw_override_v3"] = list(rows or [])
+        return fn()
+    finally:
+        if old is sentinel:
+            st.session_state.pop("_ow_game_projection_raw_override_v3", None)
+        else:
+            st.session_state["_ow_game_projection_raw_override_v3"] = old
+
+
+def _ow_game_selected_upside_v3(game_key, away, home, force=False):
+    now_ts = datetime.now().timestamp()
+    cache = st.session_state.get("ow_game_upside_cache_v3")
+    if isinstance(cache, dict) and not force:
+        if str(cache.get("game_key")) == str(game_key) and now_ts - float(cache.get("ts") or 0) < OW_GAME_FULL_REFRESH_SECONDS:
+            df = cache.get("df")
+            if isinstance(df, pd.DataFrame):
+                return df.copy(), dict(cache.get("debug") or {})
+    rows, debug = _ow_game_full_raw_rows_v3(game_key, away, home, force=force)
+    try:
+        df = _ow_with_game_rows_v3(rows, _ow_games_current_upside_builder_v3)
+    except Exception as exc:
+        df = pd.DataFrame()
+        debug = {**dict(debug or {}), "projection_error": str(exc)}
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        df = _ow_games_player_rows_for_matchup(df, away, home)
+    st.session_state["ow_game_upside_cache_v3"] = {
+        "game_key": str(game_key), "ts": now_ts, "df": df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(), "debug": debug
+    }
+    return df, debug
+
+
+def _ow_game_selected_market_v3(game_key, away, home, market, force=False):
+    rows, debug = _ow_game_full_raw_rows_v3(game_key, away, home, force=force)
+    market = str(market or "").upper()
+    if market == "HRR":
+        fn = lambda: _ow_games_current_hrr_builder_v3("HRR")
+    elif market == "HR":
+        fn = _ow_games_current_hr_builder_v3
+    else:
+        return pd.DataFrame(), debug
+    try:
+        result = _ow_with_game_rows_v3(rows, fn)
+        df = result[0] if isinstance(result, tuple) else result
+    except Exception as exc:
+        df = pd.DataFrame()
+        debug = {**dict(debug or {}), "projection_error": str(exc)}
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        df = _ow_games_player_rows_for_matchup(df, away, home)
+    return df, debug
+
+
+def render_v3_games_tab():
+    """Fast schedule list; full projections are built only for the game the user opens."""
+    st.markdown('<div class="section-title-pro">⚾ GAMES — On-Demand Matchup Projections</div>', unsafe_allow_html=True)
+    st.caption("The main slate stays fast. Open one matchup to load the complete posted Underdog HRR/HR board for only that game, ranked best-to-worst with the existing model.")
+
+    games = _ow_games_schedule_rows(pd.DataFrame())
+    if not games:
+        st.info("No MLB schedule matchups loaded for the selected date mode yet.")
+        return
+
+    st.markdown("""
+    <style>
+    .ow-game-browser-card{background:linear-gradient(145deg,#090d16,#101725);border:1.5px solid rgba(246,196,60,.72);border-radius:15px;padding:10px 12px;margin:5px 0 4px;box-shadow:0 5px 18px rgba(0,0,0,.25)}
+    .ow-game-browser-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.ow-game-browser-match{font-size:15px;font-weight:900;color:#fff}
+    .ow-game-browser-meta{font-size:10px;color:#9da7b9;margin-top:4px;line-height:1.35}.ow-game-browser-best{font-size:10px;color:#55e3aa;margin-top:7px;font-weight:800}
+    .ow-game-browser-chip{font-size:9px;border:1px solid #27364d;border-radius:999px;padding:3px 7px;color:#c8d1df;background:#111827}.ow-game-browser-metrics{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}
+    .ow-game-header{background:linear-gradient(145deg,rgba(216,39,255,.10),#0c121d 45%,rgba(246,196,60,.08));border:2px solid #f6c43c;border-radius:18px;padding:12px 14px;margin:12px 0}
+    .ow-game-header-main{display:flex;justify-content:center;align-items:center;gap:18px}.ow-game-team-block{text-align:center;min-width:120px}.ow-game-team-name{font-size:18px;font-weight:900;color:#fff;margin-top:3px}
+    .ow-game-pitcher{font-size:10px;color:#9fa9b9;margin-top:3px}.ow-game-vs{font-size:12px;font-weight:900;color:#f6c43c;text-align:center}
+    .ow-game-metric-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:10px}.ow-game-metric{background:#111827;border:1px solid #263247;border-radius:9px;padding:6px;text-align:center}
+    .ow-game-metric span{display:block;font-size:8px;color:#8f98ad;font-weight:800}.ow-game-metric b{display:block;font-size:13px;color:#f8f8ff;margin-top:2px}
+    .ow-game-team-preview{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:7px 0 12px}.ow-game-team-panel{background:#0c121d;border:1px solid #27364d;border-radius:10px;padding:8px}
+    .ow-game-team-title{font-size:11px;color:#f6c43c;font-weight:900;margin-bottom:4px}.ow-game-team-row{display:flex;justify-content:space-between;gap:7px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:9px;color:#d9e0eb}
+    .ow-game-team-row:last-child{border-bottom:0}.ow-game-team-row span{color:#9fa9b9;white-space:nowrap}.ow-game-team-empty{font-size:9px;color:#777}
+    @media(max-width:700px){.ow-game-header-main{gap:8px}.ow-game-team-block{min-width:0;flex:1}.ow-game-team-name{font-size:15px}.ow-game-metric-row{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.ow-game-team-preview{grid-template-columns:1fr 1fr;gap:5px}.ow-game-team-row{font-size:8px;flex-direction:column;gap:1px}}
+    </style>
+    """, unsafe_allow_html=True)
+
+    games = sorted(games, key=lambda x: (str(x.get("date") or ""), str(x.get("game_time") or "")))
+    selected_key = str(st.session_state.get("ow_games_selected") or "")
+    valid_keys = {str(g["key"]) for g in games}
+    if selected_key not in valid_keys:
+        selected_key = ""
+        st.session_state.pop("ow_games_selected", None)
+
+    st.markdown("#### All Games")
+    for g in games:
+        away, home = g["away"], g["home"]
+        active = selected_key and str(g["key"]) == selected_key
+        border = "#55e3aa" if active else "#f6c43c"
+        status = "FULL PROJECTIONS LOADED" if active else "OPEN TO LOAD FULL POSTED BOARD"
+        st.markdown(f"""
+        <div class='ow-game-browser-card' style='border-color:{border}'>
+          <div class='ow-game-browser-head'>
+            <div class='ow-game-browser-match'>{_mlui_logo(away,28)} &nbsp; {html.escape(away)} @ {html.escape(home)} &nbsp; {_mlui_logo(home,28)}</div>
+            <div style='font-size:10px;color:#f6c43c;font-weight:900'>{html.escape(g.get('time_label') or '—')}</div>
+          </div>
+          <div class='ow-game-browser-meta'>{html.escape(str(g.get('away_pitcher') or '—'))} {html.escape(str(g.get('away_pitcher_hand') or '—'))}HP vs {html.escape(str(g.get('home_pitcher') or '—'))} {html.escape(str(g.get('home_pitcher_hand') or '—'))}HP · {html.escape(str(g.get('venue') or ''))}</div>
+          <div class='ow-game-browser-best'>{status}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button(("✓ OPENED " if active else "OPEN ") + f"{away} @ {home}", key=_v3_unique_widget_key(f"ow_open_game_v3_{g['key']}"), use_container_width=True):
+            if not active:
+                st.session_state["ow_games_selected"] = str(g["key"])
+                st.session_state.pop("ow_game_upside_cache_v3", None)
+                st.session_state.pop("ow_game_full_raw_cache_v3", None)
+            try:
+                st.rerun()
+            except Exception:
+                pass
+
+    if not selected_key:
+        st.info("Choose a game above. The app will then calculate every posted HRR/HR projection for only that matchup.")
+        return
+
+    selected = next((g for g in games if str(g["key"]) == selected_key), None)
+    if not selected:
+        return
+    away, home = selected["away"], selected["home"]
+
+    with st.spinner(f"Loading full {away} @ {home} batter projections…"):
+        upside, debug = _ow_game_selected_upside_v3(selected_key, away, home)
+
+    # Pull game environment metrics from the selected game's projected rows only.
+    game_score = game_total = blow = ar = hr = None
+    if isinstance(upside, pd.DataFrame) and not upside.empty:
+        first = upside.iloc[0].to_dict()
+        game_score = _ow_games_first_num(first, ["Game V3 Score", "High Scoring Game Score", "Game Environment Score", "Game Score"], None)
+        game_total = _ow_games_first_num(first, ["Game Total V3", "Projected Game Total"], None)
+        blow = _ow_games_first_num(first, ["Blowout V3 Score", "Blowout Risk Score", "Blowout Run Score"], None)
+        for tm in (away, home):
+            sub = upside[upside["Team"].map(_ow_team_abbr).eq(tm)] if "Team" in upside.columns else pd.DataFrame()
+            if not sub.empty:
+                val = _ow_games_first_num(sub.iloc[0].to_dict(), ["Team Runs V3", "Team Implied Runs"], None)
+                if tm == away: ar = val
+                else: hr = val
+
+    st.markdown("---")
+    st.markdown(f"""
+    <div class='ow-game-header'>
+      <div class='ow-game-header-main'>
+        <div class='ow-game-team-block'>{_mlui_logo(away,46)}<div class='ow-game-team-name'>{away}</div><div class='ow-game-pitcher'>{html.escape(str(selected.get('away_pitcher') or '—'))} {html.escape(str(selected.get('away_pitcher_hand') or '—'))}HP</div></div>
+        <div class='ow-game-vs'>{html.escape(str(selected.get('time_label') or '—'))}<br>VS<br><span style='color:#9fa9b9'>{html.escape(str(selected.get('status') or ''))}</span></div>
+        <div class='ow-game-team-block'>{_mlui_logo(home,46)}<div class='ow-game-team-name'>{home}</div><div class='ow-game-pitcher'>{html.escape(str(selected.get('home_pitcher') or '—'))} {html.escape(str(selected.get('home_pitcher_hand') or '—'))}HP</div></div>
+      </div>
+      <div class='ow-game-metric-row'>
+        <div class='ow-game-metric'><span>GAME</span><b>{'—' if game_score is None else f'{game_score:.0f}'}</b></div>
+        <div class='ow-game-metric'><span>TOTAL</span><b>{'—' if game_total is None else f'{game_total:.1f}'}</b></div>
+        <div class='ow-game-metric'><span>{away} RUNS</span><b>{'—' if ar is None else f'{ar:.2f}'}</b></div>
+        <div class='ow-game-metric'><span>{home} RUNS</span><b>{'—' if hr is None else f'{hr:.2f}'}</b></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if isinstance(upside, pd.DataFrame) and not upside.empty:
+        st.markdown(f"<div class='ow-game-team-preview'><div class='ow-game-team-panel'><div class='ow-game-team-title'>{away} BEST BATTERS</div>{_ow_games_team_top_html(upside, away)}</div><div class='ow-game-team-panel'><div class='ow-game-team-title'>{home} BEST BATTERS</div>{_ow_games_team_top_html(upside, home)}</div></div>", unsafe_allow_html=True)
+    else:
+        st.warning(f"No posted HRR/HR rows matched {away} @ {home}. Full-parser rows seen: {debug.get('rows', debug.get('selected_game_rows', '—'))}.")
+
+    view = st.radio("Game board", ["BEST OVERALL", "H+R+RBI", "HOME RUNS", "FANTASY"], horizontal=True, key=_v3_unique_widget_key("ow_games_market_view_v3"))
+    team_view = st.radio("Show", ["BOTH TEAMS", away, home], horizontal=True, key=_v3_unique_widget_key("ow_games_team_view_v3"))
+
+    if view == "BEST OVERALL":
+        board = upside.copy() if isinstance(upside, pd.DataFrame) else pd.DataFrame()
+    elif view == "H+R+RBI":
+        board, _ = _ow_game_selected_market_v3(selected_key, away, home, "HRR")
+    elif view == "HOME RUNS":
+        board, _ = _ow_game_selected_market_v3(selected_key, away, home, "HR")
+    else:
+        fs = st.session_state.get("ow_bfs_df")
+        board = _ow_games_fs_cards_df(fs) if isinstance(fs, pd.DataFrame) else pd.DataFrame()
+        board = _ow_games_player_rows_for_matchup(board, away, home)
+        if board.empty:
+            st.info("Fantasy board is not built for this slate yet. Open Batter Fantasy once to build/restore it.")
+
+    if isinstance(board, pd.DataFrame) and not board.empty and team_view != "BOTH TEAMS":
+        board = board[board["Team"].map(_ow_team_abbr).eq(team_view)].copy() if "Team" in board.columns else board
+    if not isinstance(board, pd.DataFrame) or board.empty:
+        st.info(f"No active {view} plays are available for {away} @ {home} right now.")
+        return
+
+    sort_cols = [c for c in ["Likely Score", "Best Win/Hit %", "Win Probability %", "Model Win Probability %", "HR Probability %", "Confidence"] if c in board.columns]
+    if sort_cols:
+        for c in sort_cols:
+            board[c] = pd.to_numeric(board[c], errors="coerce")
+        board = board.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    st.markdown(f"#### {view} — {team_view}")
+    _ow_render_player_card_rows(board, f"{away} @ {home} · {view}", max_rows=len(board), key=f"games_v3_{selected_key}_{view}_{team_view}")
+
+
+# Keep the repaired MLB-official grader active regardless of whether full-game
+# projections are opened. The grading system is intentionally independent of
+# the fast/main vs on-demand/game projection split.
 _ow_auto_grade_batter_mlb_official_v2()
+
 
 _ow_persist_rich_postgame_if_ready()
 
