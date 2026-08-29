@@ -42523,6 +42523,584 @@ def _ow_render_data_health_audit_v4():
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.caption("Core live paths: MLB schedule/lineups/boxscores, current Savant, live pitch-type Statcast, bullpen workload, park factors, weather, and sportsbook totals when configured.")
 
+
+# ============================================================
+# UNDERDOG FULL-BOARD COMPLETENESS + MLB OFFICIAL GRADING V2
+# 2026-08-29
+# Data/integration repair only:
+# - union-scans current Underdog batter HRR/HR feeds instead of trusting one shape
+# - does NOT reject numeric sport_id values as non-MLB
+# - resolves nested over_under / appearance_stat / appearance / player relationships
+# - MLB player/current-team/game IDs are recovered before projection building
+# - grading recovers missing IDs and grades from MLB official final box scores
+# - DNP / zero-PA final players are VOID, not unresolved forever
+# Projection formulas themselves are not changed.
+# ============================================================
+OW_UD_FULL_BOARD_FIX_VERSION = "OW_UD_FULL_BOARD_COMPLETENESS_V2_2026_08_29"
+OW_MLB_BATTER_GRADING_FIX_VERSION = "OW_MLB_OFFICIAL_BATTER_GRADING_V2_2026_08_29"
+# A full MLB slate can exceed 120 HRR/HR lines. Do not truncate later games.
+OW_FINAL_MAX_PROJECTED_LINES = 500
+
+_ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix = _ow_fetch_ud_batter_hrr_hr_lines
+_ow_build_hrr_rows_from_ud_before_full_board_fix = _ow_build_hrr_rows_from_ud
+_ow_build_hr_rows_from_ud_before_full_board_fix = _ow_build_hr_rows_from_ud
+_ow_save_batter_snapshots_before_official_grade_fix = _ow_save_batter_snapshots
+
+
+def _ow_ud_rel_id(obj, *keys):
+    if not isinstance(obj, dict):
+        return None
+    sources = [obj]
+    attrs = obj.get("attributes")
+    if isinstance(attrs, dict):
+        sources.append(attrs)
+    for src in sources:
+        for key in keys:
+            v = src.get(key)
+            if isinstance(v, dict):
+                v = v.get("id")
+            if v not in (None, ""):
+                return str(v)
+    rels = obj.get("relationships")
+    if isinstance(rels, dict):
+        for key in keys:
+            rel = rels.get(key) or rels.get(str(key).replace("_", "-"))
+            if not isinstance(rel, dict):
+                continue
+            data = rel.get("data")
+            if isinstance(data, dict) and data.get("id") not in (None, ""):
+                return str(data.get("id"))
+            if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("id") not in (None, ""):
+                return str(data[0].get("id"))
+    return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _ow_ud_live_payload_v2(url):
+    """Short-cache direct request so newly posted Underdog lines appear quickly.
+
+    This intentionally bypasses safe_get_json's broader 5-minute cache for the
+    live pick'em board only. Other app data keeps its existing caching.
+    """
+    try:
+        headers = {
+            "Origin": "https://underdogfantasy.com",
+            "Referer": "https://underdogfantasy.com/",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        r = requests.get(url, timeout=12, headers=headers)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _ow_ud_textual_non_mlb(*objs):
+    """Reject only explicit textual non-MLB sports; numeric IDs are not enough."""
+    bad = {"NBA","WNBA","NFL","NHL","NCAAF","NCAAB","SOCCER","TENNIS","GOLF","ESPORTS"}
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        attrs = _ow_ud_attrs(obj)
+        for key in ("sport", "sport_name", "league", "league_name", "sport_id"):
+            v = attrs.get(key)
+            if isinstance(v, str):
+                up = v.strip().upper()
+                if up in bad or any(token in up for token in bad if len(token) >= 4):
+                    return True
+    return False
+
+
+def _ow_ud_collection_map(payload, *names):
+    out = {}
+    if not isinstance(payload, dict):
+        return out
+    for name in names:
+        vals = payload.get(name)
+        if not isinstance(vals, list):
+            continue
+        for obj in vals:
+            if not isinstance(obj, dict):
+                continue
+            oid = obj.get("id") or _ow_ud_attrs(obj).get("id")
+            if oid not in (None, ""):
+                out[str(oid)] = obj
+    return out
+
+
+def _ow_extract_ud_direct_v2(payload):
+    """Parse current Underdog top-level collections without assuming one schema."""
+    if not isinstance(payload, dict):
+        return []
+    lines = payload.get("over_under_lines")
+    if not isinstance(lines, list):
+        # Some versions expose a generic data collection; recursive fallback handles it.
+        return []
+    over_unders = _ow_ud_collection_map(payload, "over_unders", "over_under")
+    appearances = _ow_ud_collection_map(payload, "appearances")
+    appearance_stats = _ow_ud_collection_map(payload, "appearance_stats", "appearance_stat")
+    players = _ow_ud_collection_map(payload, "players")
+    teams = _ow_ud_collection_map(payload, "teams")
+    rows = []
+
+    for line_obj in lines:
+        if not isinstance(line_obj, dict):
+            continue
+        if not _ow_ud_active(line_obj):
+            continue
+
+        ou_obj = line_obj.get("over_under") if isinstance(line_obj.get("over_under"), dict) else None
+        if not ou_obj:
+            ouid = _ow_ud_rel_id(line_obj, "over_under_id", "over_under", "over_unders")
+            ou_obj = over_unders.get(str(ouid or ""), {})
+        if not isinstance(ou_obj, dict):
+            ou_obj = {}
+
+        app_stat = ou_obj.get("appearance_stat") if isinstance(ou_obj.get("appearance_stat"), dict) else None
+        if not app_stat:
+            asid = _ow_ud_rel_id(ou_obj, "appearance_stat_id", "appearance_stat", "appearance_stats") or _ow_ud_rel_id(line_obj, "appearance_stat_id", "appearance_stat")
+            app_stat = appearance_stats.get(str(asid or ""), {})
+        if not isinstance(app_stat, dict):
+            app_stat = {}
+
+        app_id = (
+            _ow_ud_rel_id(app_stat, "appearance_id", "appearance", "appearances")
+            or _ow_ud_rel_id(ou_obj, "appearance_id", "appearance", "appearances")
+            or _ow_ud_rel_id(line_obj, "appearance_id", "appearance", "appearances")
+        )
+        app_obj = appearances.get(str(app_id or ""), {})
+        if not isinstance(app_obj, dict):
+            app_obj = {}
+
+        player_id = (
+            _ow_ud_rel_id(app_obj, "player_id", "player", "players")
+            or _ow_ud_rel_id(app_stat, "player_id", "player", "players")
+            or _ow_ud_rel_id(ou_obj, "player_id", "player", "players")
+            or _ow_ud_rel_id(line_obj, "player_id", "player", "players")
+        )
+        player_obj = players.get(str(player_id or ""), {})
+        if not isinstance(player_obj, dict):
+            player_obj = {}
+
+        if _ow_ud_textual_non_mlb(line_obj, ou_obj, app_stat, app_obj, player_obj):
+            continue
+
+        option_parts = []
+        for opt in (line_obj.get("options") or []):
+            if isinstance(opt, dict):
+                option_parts.append(_ow_ud_blob(opt))
+                try:
+                    option_parts.append(json.dumps(opt, default=str)[:800])
+                except Exception:
+                    pass
+        blob = " | ".join(x for x in [
+            _ow_ud_blob(line_obj, ou_obj, app_stat, app_obj, player_obj),
+            " | ".join(option_parts),
+        ] if x)
+        # Last-resort structured JSON snippet catches renamed display-stat fields.
+        if _ow_ud_market(blob) is None:
+            try:
+                blob = blob + " | " + json.dumps({
+                    "line": line_obj, "over_under": ou_obj, "appearance_stat": app_stat,
+                    "appearance": app_obj, "player": player_obj,
+                }, default=str)[:5000]
+            except Exception:
+                pass
+        market = _ow_ud_market(blob)
+        if market not in {"HRR", "HR"}:
+            continue
+        line = _ow_ud_line_value(line_obj, ou_obj, app_stat)
+        if line is None or not _ow_ud_market_line_ok(market, line):
+            continue
+        player = _ow_ud_player_name(player_obj, app_obj, app_stat, ou_obj, line_obj)
+        if not player:
+            continue
+
+        team_id = _ow_ud_rel_id(app_obj, "team_id", "team", "teams") or _ow_ud_rel_id(player_obj, "team_id", "team", "teams")
+        team_obj = teams.get(str(team_id or ""), {})
+        team_blob = _ow_ud_attrs(team_obj) if isinstance(team_obj, dict) else {}
+        team_text = team_blob.get("abbr") or team_blob.get("abbreviation") or team_blob.get("name") or ""
+        rows.append({
+            "Source": "Underdog",
+            "Player": player,
+            "Market": "HRR" if market == "HRR" else "Home Runs",
+            "Market Label": _ow_ud_market_label(market),
+            "Line": float(line),
+            "Evidence": blob[:500],
+            "Line ID": str(line_obj.get("id") or ""),
+            "UD Appearance ID": str(app_id or ""),
+            "UD Player ID": str(player_id or ""),
+            "UD Team": team_text,
+            "UD Parser": OW_UD_FULL_BOARD_FIX_VERSION,
+        })
+    return rows
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _ow_fetch_ud_batter_hrr_hr_lines():
+    """Union current direct + legacy parsers so posted MLB batter lines are not dropped."""
+    all_rows = []
+    endpoint_debug = []
+    # Scan several live versions because Underdog can transition schemas gradually.
+    for url in list(UNDERDOG_URLS)[:5]:
+        payload = _ow_ud_live_payload_v2(url)
+        if not payload:
+            endpoint_debug.append({"endpoint": url, "status": "NO_RESPONSE", "rows": 0})
+            continue
+        direct = _ow_extract_ud_direct_v2(payload)
+        all_rows.extend(direct)
+        endpoint_debug.append({"endpoint": url, "status": "OK", "rows": len(direct)})
+
+    # Preserve every row the existing parser can still see.
+    legacy_rows, legacy_debug = [], {}
+    try:
+        legacy_rows, legacy_debug = _ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix()
+        all_rows.extend(list(legacy_rows or []))
+    except Exception as exc:
+        legacy_debug = {"error": str(exc)}
+
+    dedup = {}
+    for row in all_rows:
+        if not isinstance(row, dict):
+            continue
+        player = _v3_norm_name(row.get("Player"))
+        market = str(row.get("Market") or "")
+        line = _v3_safe_num(row.get("Line"), None)
+        if not player or market not in {"HRR", "Home Runs"} or line is None:
+            continue
+        key = (player, market, round(float(line), 3))
+        # Prefer a live V2 row with a concrete line id / appearance id.
+        score = int(bool(row.get("Line ID"))) + int(bool(row.get("UD Appearance ID"))) + int(row.get("UD Parser") == OW_UD_FULL_BOARD_FIX_VERSION)
+        old = dedup.get(key)
+        if old is None or score > old[0]:
+            dedup[key] = (score, dict(row))
+    out = [v[1] for v in dedup.values()]
+    debug = {
+        "parser_version": OW_UD_FULL_BOARD_FIX_VERSION,
+        "status": "OK" if out else "NO_LINES",
+        "rows": len(out),
+        "parsed_hrr": sum(1 for r in out if r.get("Market") == "HRR"),
+        "parsed_hr": sum(1 for r in out if r.get("Market") == "Home Runs"),
+        "endpoint_scan": endpoint_debug,
+        "legacy": legacy_debug,
+    }
+    try:
+        st.session_state["final_ud_batter_line_debug"] = debug
+        st.session_state["hrr_ud_debug"] = debug
+        st.session_state["hr_ud_debug"] = debug
+    except Exception:
+        pass
+    return out, debug
+
+
+def _ow_ud_enrich_rows_with_mlb(rows):
+    """Attach authoritative MLB IDs/team/opponent/game before projection building."""
+    sched = _v3_team_schedule_context_map() or {}
+    out = []
+    for raw in rows or []:
+        r = dict(raw or {})
+        player = str(r.get("Player") or "").strip()
+        if not player:
+            continue
+        pid = r.get("Player ID") or _mlb_search_player_id_by_name(player)
+        if pid:
+            r["Player ID"] = pid
+            # Canonical MLB name helps if Underdog display formatting changes.
+            try:
+                pdata = safe_get_json(f"{MLB_BASE}/people/{pid}", timeout=10) or {}
+                people = pdata.get("people") or []
+                full = (people[0] or {}).get("fullName") if people else None
+                if full:
+                    r["Player"] = full
+            except Exception:
+                pass
+            tctx = _ow_current_batter_team_context(pid)
+            tm = _ow_team_abbr(tctx.get("Current Team") or r.get("UD Team") or r.get("Team"))
+        else:
+            tm = _ow_team_abbr(r.get("UD Team") or r.get("Team"))
+        if tm not in (None, "", "—"):
+            r["Team"] = tm
+            gctx = sched.get(str(tm).upper()) or {}
+            if gctx:
+                r["Opponent"] = _ow_team_abbr(gctx.get("Opponent"))
+                r["Game PK"] = gctx.get("GamePk")
+                r["UD Matchup Source"] = "MLB_SCHEDULE"
+        out.append(r)
+    return out
+
+
+def fetch_underdog_batter_prop_rows():
+    rows, debug = _ow_fetch_ud_batter_hrr_hr_lines()
+    hrr = _ow_ud_enrich_rows_with_mlb([r for r in rows if r.get("Market") == "HRR"])
+    try:
+        st.session_state["hrr_ud_debug"] = {**debug, "returned_hrr_rows": len(hrr)}
+    except Exception:
+        pass
+    return hrr
+
+
+def _v3_ud_hrr_rows():
+    return fetch_underdog_batter_prop_rows() or []
+
+
+def _v3_fetch_ud_home_run_rows():
+    rows, debug = _ow_fetch_ud_batter_hrr_hr_lines()
+    hr = _ow_ud_enrich_rows_with_mlb([r for r in rows if r.get("Market") == "Home Runs"])
+    try:
+        st.session_state["hr_ud_debug"] = {**debug, "returned_hr_rows": len(hr)}
+    except Exception:
+        pass
+    return hr
+
+
+def _ow_build_hrr_rows_from_ud(raw_rows):
+    # Same production formula, but feed it authoritative MLB-enriched posted rows.
+    return _ow_build_hrr_rows_from_ud_before_full_board_fix(_ow_ud_enrich_rows_with_mlb(raw_rows))
+
+
+def _ow_build_hr_rows_from_ud(raw_rows):
+    # Same production formula, but feed it authoritative MLB-enriched posted rows.
+    return _ow_build_hr_rows_from_ud_before_full_board_fix(_ow_ud_enrich_rows_with_mlb(raw_rows))
+
+
+def _ow_batter_snapshot_date_ca():
+    try:
+        return california_now().strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def _ow_recover_snapshot_player_id(pick):
+    pid = (pick or {}).get("Player ID")
+    if pid:
+        return pid
+    return _mlb_search_player_id_by_name((pick or {}).get("Player") or (pick or {}).get("UD Player"))
+
+
+def _ow_recover_snapshot_game_pk(pick):
+    """Recover a missing/stale GamePk from the snapshot date + team/opponent via MLB."""
+    p = dict(pick or {})
+    gpk = p.get("Game PK")
+    if gpk:
+        return gpk
+    dd = str(p.get("Snapshot Date") or p.get("Date") or "")[:10]
+    if not dd:
+        dd = _ow_batter_snapshot_date_ca()
+    team = _ow_team_abbr(p.get("Team") or p.get("Raw Log Team"))
+    opp = _ow_team_abbr(p.get("Opponent") or p.get("Today Opponent"))
+    try:
+        sched = get_schedule(dd) or {}
+        candidates = []
+        for d0 in sched.get("dates", []) or []:
+            for g in d0.get("games", []) or []:
+                teams = g.get("teams") or {}
+                aa = _ow_team_abbr(((teams.get("away") or {}).get("team") or {}).get("abbreviation") or ((teams.get("away") or {}).get("team") or {}).get("name"))
+                hh = _ow_team_abbr(((teams.get("home") or {}).get("team") or {}).get("abbreviation") or ((teams.get("home") or {}).get("team") or {}).get("name"))
+                if team not in {aa, hh}:
+                    continue
+                score = 1
+                if opp in {aa, hh} and opp != team:
+                    score += 5
+                candidates.append((score, g.get("gamePk")))
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+    except Exception:
+        pass
+    return None
+
+
+def _ow_mlb_final_status_official(game_pk):
+    """Use MLB official live feed first, schedule status second."""
+    try:
+        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12) or {}
+        status = (((live.get("gameData") or {}).get("status") or {}).get("abstractGameState") or "").upper()
+        detailed = (((live.get("gameData") or {}).get("status") or {}).get("detailedState") or "").upper()
+        if status == "FINAL" or "FINAL" in detailed or "COMPLETED" in detailed:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(is_game_final(game_pk))
+    except Exception:
+        return False
+
+
+def _ow_official_boxscore_presence(game_pk, player_id):
+    """Return MLB boxscore actuals plus a DNP flag for zero-PA/final nonparticipants."""
+    box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=12) or {}
+    if not box:
+        return None, False
+    found = False
+    for side in ("home", "away"):
+        players = (((box.get("teams") or {}).get(side) or {}).get("players") or {})
+        for obj in players.values():
+            if str((obj.get("person") or {}).get("id")) != str(player_id):
+                continue
+            found = True
+            actual = _ow_get_actual_batter_boxscore(game_pk, player_id)
+            pa = _v3_safe_num((actual or {}).get("Actual PA"), 0) or 0
+            return actual, bool(pa <= 0)
+    # On a final game, a saved player not present in either official team box is a DNP/void.
+    return None, bool(not found)
+
+
+def _ow_save_batter_snapshots(df, source_label="OFFICIAL"):
+    """Same snapshot contract, but lock authoritative IDs/date at save time."""
+    added = _ow_save_batter_snapshots_before_official_grade_fix(df, source_label=source_label)
+    try:
+        picks = load_json(OW_BATTER_PICK_LOG, [])
+        changed = False
+        snap_date = _ow_batter_snapshot_date_ca()
+        for p in picks:
+            if p.get("graded"):
+                continue
+            if not p.get("Snapshot Date"):
+                p["Snapshot Date"] = snap_date; changed = True
+            if not p.get("Player ID"):
+                pid = _ow_recover_snapshot_player_id(p)
+                if pid:
+                    p["Player ID"] = pid; changed = True
+            if not p.get("Game PK"):
+                gpk = _ow_recover_snapshot_game_pk(p)
+                if gpk:
+                    p["Game PK"] = gpk; changed = True
+            if changed:
+                p["Grade ID Source"] = "MLB_OFFICIAL_RECOVERY"
+        if changed:
+            save_json(OW_BATTER_PICK_LOG, picks[-20000:])
+    except Exception:
+        pass
+    return added
+
+
+def _ow_grade_batter_snapshots():
+    """Grade HRR/HR/FS snapshots from MLB official final box scores."""
+    picks = load_json(OW_BATTER_PICK_LOG, [])
+    results = load_json(OW_BATTER_RESULT_LOG, [])
+    result_ids = {r.get("pick_id") for r in results}
+    result_keys = {_ow_batter_result_key(r) for r in results}
+    graded = checked = waiting = missing = voids = recovered = 0
+    final_cache = {}
+    actual_cache = {}
+
+    for p in picks:
+        if p.get("graded"):
+            continue
+        if not p.get("Player ID"):
+            pid = _ow_recover_snapshot_player_id(p)
+            if pid:
+                p["Player ID"] = pid; recovered += 1
+        if not p.get("Game PK"):
+            gpk = _ow_recover_snapshot_game_pk(p)
+            if gpk:
+                p["Game PK"] = gpk; recovered += 1
+        game_pk = p.get("Game PK")
+        player_id = p.get("Player ID")
+        if not game_pk or not player_id:
+            missing += 1
+            p["Grade Status"] = "MISSING ID / MLB RECOVERY FAILED"
+            continue
+        checked += 1
+        if game_pk not in final_cache:
+            final_cache[game_pk] = _ow_mlb_final_status_official(game_pk)
+        if not final_cache[game_pk]:
+            waiting += 1
+            p["Grade Status"] = "WAITING MLB FINAL"
+            continue
+
+        ck = (str(game_pk), str(player_id))
+        if ck not in actual_cache:
+            actual_cache[ck] = _ow_official_boxscore_presence(game_pk, player_id)
+        actual_ctx, dnp = actual_cache[ck]
+        market = str(p.get("Market") or p.get("Best Market") or "").upper()
+
+        if dnp:
+            p["Actual"] = None
+            p["graded_result"] = "VOID"
+            p["win"] = None
+            p["graded"] = True
+            p["graded_at"] = now_iso()
+            p["Grade Status"] = "VOID / DNP · MLB OFFICIAL"
+            p["Grade Source"] = "MLB_OFFICIAL_BOX_SCORE"
+            voids += 1
+        elif not actual_ctx:
+            missing += 1
+            p["Grade Status"] = "FINAL / MLB PLAYER STATS UNRESOLVED"
+            continue
+        else:
+            p.update(actual_ctx)
+            if "FANTASY" in market or "BATTER FS" in market:
+                actual = actual_ctx.get("Actual FPTS")
+            elif "HOME RUN" in market or market == "HR":
+                actual = actual_ctx.get("Actual HR")
+            else:
+                actual = actual_ctx.get("Actual H+R+RBI")
+            p["Actual"] = actual
+            line = _v3_safe_num(p.get("Line") if p.get("Line") not in (None, "") else p.get("Best Line"), None)
+            side = _ow_batter_pick_side(p.get("Pick") or p.get("Best Pick") or p.get("Pick Side"), market)
+            if line is None or side is None or actual is None:
+                result = "NO ACTION"
+                win = None
+            elif float(actual) == float(line):
+                result = "PUSH"
+                win = None
+            else:
+                higher = side in {"OVER", "HIGHER"}
+                win = float(actual) > float(line) if higher else float(actual) < float(line)
+                result = "WIN" if win else "LOSS"
+            p["graded_result"] = result
+            p["win"] = win
+            proj = _v3_safe_num(p.get("Projection") if p.get("Projection") not in (None, "") else p.get("HR Projection"), None)
+            p["Projection Error"] = None if proj is None or actual is None else round(float(actual) - float(proj), 3)
+            p["graded"] = True
+            p["graded_at"] = now_iso()
+            p["Grade Status"] = "CLEARED / GRADED · MLB OFFICIAL"
+            p["Grade Source"] = "MLB_OFFICIAL_BOX_SCORE"
+            graded += 1
+
+        rk = _ow_batter_result_key(p)
+        if p.get("pick_id") not in result_ids and rk not in result_keys:
+            results.append(dict(p))
+            result_ids.add(p.get("pick_id")); result_keys.add(rk)
+
+    save_json(OW_BATTER_PICK_LOG, picks[-20000:])
+    ded, seen = [], set()
+    for r in results:
+        k = _ow_batter_result_key(r)
+        if k in seen:
+            continue
+        seen.add(k); ded.append(r)
+    save_json(OW_BATTER_RESULT_LOG, ded[-20000:])
+    return {
+        "graded": graded, "checked": checked, "waiting_final": waiting,
+        "missing": missing, "voids": voids, "recovered_ids": recovered,
+        "saved": len(picks), "results": len(ded),
+        "source": "MLB_OFFICIAL_BOX_SCORE",
+        "version": OW_MLB_BATTER_GRADING_FIX_VERSION,
+    }
+
+
+def _ow_auto_grade_batter_mlb_official_v2():
+    """Re-check pending saved batter snapshots at most once every five minutes/session."""
+    try:
+        now_ts = datetime.now().timestamp()
+        last = float(st.session_state.get("ow_mlb_batter_grade_last_ts") or 0)
+        if now_ts - last < 300:
+            return
+        st.session_state["ow_mlb_batter_grade_last_ts"] = now_ts
+        info = _ow_grade_batter_snapshots()
+        st.session_state["ow_mlb_batter_grade_last_info"] = info
+    except Exception:
+        pass
+
+
+# Keep the Games tab driven by the newly complete posted-line board.
+# No UI redesign here; the existing matchup-first concept remains unchanged.
+_ow_auto_grade_batter_mlb_official_v2()
+
 _ow_persist_rich_postgame_if_ready()
 
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
