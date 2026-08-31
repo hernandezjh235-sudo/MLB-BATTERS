@@ -24,7 +24,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 CLEAN UD LEARNING BUILD"
+APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 · PERSISTENT LAZY AUDIT V6"
 
 # =========================
 # V3 TEST PATCH — 40% SUPPRESSION + IP ACCURACY TEST
@@ -44,20 +44,53 @@ except Exception:
     pytz = None
 
 # =========================
-# STORAGE
+# STORAGE — V6 PERSISTENCE SAFE
 # =========================
 DRIVE_DIR = "/content/drive/MyDrive/mlb_engine"
 LOCAL_DIR = "mlb_engine"
 
-try:
-    from google.colab import drive
-    if not os.path.exists("/content/drive/MyDrive"):
-        drive.mount("/content/drive", force_remount=False)
-    os.makedirs(DRIVE_DIR, exist_ok=True)
-    STORAGE_DIR = DRIVE_DIR
-except Exception:
-    os.makedirs(LOCAL_DIR, exist_ok=True)
-    STORAGE_DIR = LOCAL_DIR
+def _ow_pick_storage_dir_v6():
+    """Choose durable storage first; fall back to local only when no durable mount exists.
+
+    Priority:
+      1) MLB_ENGINE_STORAGE_DIR (explicit custom persistent path)
+      2) RAILWAY_VOLUME_MOUNT_PATH/mlb_engine
+      3) common Railway/user volume root /data/mlb_engine when /data exists
+      4) Google Drive in Colab
+      5) local mlb_engine (ephemeral on Railway; UI/audit will warn)
+    """
+    explicit = str(os.getenv("MLB_ENGINE_STORAGE_DIR") or "").strip()
+    if explicit:
+        p = os.path.abspath(explicit)
+        os.makedirs(p, exist_ok=True)
+        return p, "CUSTOM_PERSISTENT", True
+
+    railway_mount = str(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+    if railway_mount:
+        p = os.path.join(railway_mount, "mlb_engine")
+        os.makedirs(p, exist_ok=True)
+        return p, "RAILWAY_VOLUME", True
+
+    # Railway volumes are often mounted at /data even when no helper env var is defined.
+    # Only use it when the root already exists; never create /data and pretend persistence exists.
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        p = "/data/mlb_engine"
+        os.makedirs(p, exist_ok=True)
+        return p, "DATA_VOLUME_CANDIDATE", False
+
+    try:
+        from google.colab import drive
+        if not os.path.exists("/content/drive/MyDrive"):
+            drive.mount("/content/drive", force_remount=False)
+        os.makedirs(DRIVE_DIR, exist_ok=True)
+        return DRIVE_DIR, "GOOGLE_DRIVE", True
+    except Exception:
+        os.makedirs(LOCAL_DIR, exist_ok=True)
+        return LOCAL_DIR, "LOCAL_EPHEMERAL", False
+
+STORAGE_DIR, STORAGE_MODE, STORAGE_PERSISTENCE_CONFIRMED = _ow_pick_storage_dir_v6()
+OW_STORAGE_BACKUP_DIR = os.path.join(STORAGE_DIR, "_backups")
+os.makedirs(OW_STORAGE_BACKUP_DIR, exist_ok=True)
 
 PICK_LOG = os.path.join(STORAGE_DIR, "auto_pick_log.json")
 RESULT_LOG = os.path.join(STORAGE_DIR, "auto_result_log.json")
@@ -78,13 +111,10 @@ MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
-    "https://api.underdogfantasy.com/beta/v7/over_under_lines",
+    # Production endpoints verified by the live audit. Keep dead v7/v2/v1 out of the hot path.
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v3/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v2/over_under_lines",
-    "https://api.underdogfantasy.com/v1/over_under_lines",
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
@@ -394,22 +424,86 @@ def safe_int(x, default=None):
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def load_json(path, default):
+def _ow_json_backup_paths_v6(path):
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
+        name = os.path.basename(path)
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+        last_good = os.path.join(OW_STORAGE_BACKUP_DIR, stem + ".last_good.json")
+        day = california_now().strftime("%Y-%m-%d") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d")
+        daily = os.path.join(OW_STORAGE_BACKUP_DIR, f"{day}__{stem}")
+        return last_good, daily
+    except Exception:
+        return None, None
+
+def load_json(path, default):
+    """Read primary JSON, then recover from last-good backup if primary is missing/corrupt."""
+    candidates = [path]
+    lg, daily = _ow_json_backup_paths_v6(path) if "OW_STORAGE_BACKUP_DIR" in globals() else (None, None)
+    if lg:
+        candidates.append(lg)
+    if daily:
+        candidates.append(daily)
+    # One-time migration helper when a persistent root was newly configured in the same deployment.
+    try:
+        legacy = os.path.join(LOCAL_DIR, os.path.basename(path))
+        if os.path.abspath(legacy) != os.path.abspath(path):
+            candidates.append(legacy)
     except Exception:
         pass
+    for candidate in candidates:
+        try:
+            if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                # Recover the primary from backup when durable storage is available.
+                if candidate != path and path:
+                    try:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        tmp = path + ".recover.tmp"
+                        with open(tmp, "w", encoding="utf-8") as wf:
+                            json.dump(obj, wf, indent=2, allow_nan=False, default=str)
+                        os.replace(tmp, path)
+                    except Exception:
+                        pass
+                return obj
+        except Exception:
+            continue
     return default
 
 def save_json(path, data):
+    """Atomic JSON writer with last-good + daily recovery copies. Returns True/False."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+        safe_data = data
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(safe_data, f, indent=2, allow_nan=False, default=str)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+        # Mirror every successful write into a durable last-good and one daily copy.
+        lg, daily = _ow_json_backup_paths_v6(path)
+        for bp in (lg, daily):
+            if not bp:
+                continue
+            try:
+                btmp = bp + ".tmp"
+                with open(btmp, "w", encoding="utf-8") as bf:
+                    json.dump(safe_data, bf, indent=2, allow_nan=False, default=str)
+                os.replace(btmp, bp)
+            except Exception:
+                pass
+        return True
+    except Exception as exc:
+        try:
+            if "st" in globals():
+                st.session_state["ow_last_storage_write_error_v6"] = str(exc)
+        except Exception:
+            pass
+        return False
 
 def log_source_request(source, status, message=""):
     rows = load_json(REQUEST_LOG_FILE, [])
@@ -28516,6 +28610,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 player = _ow_ud_player_name(player_obj) or _ow_ud_player_name(line_obj, ou_obj)
                 if not player:
                     continue
+                ud_start, ud_date = _ow_ud_event_datetime_v6(app_obj, ou_obj, app_stat, line_obj) if "_ow_ud_event_datetime_v6" in globals() else ("", "")
                 rows.append({
                     "Source": "Underdog",
                     "Player": player,
@@ -28524,6 +28619,8 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                     "Line": float(line),
                     "Evidence": blob[:350],
                     "Line ID": str(line_obj.get("id", "")),
+                    "UD Start Time": ud_start,
+                    "UD Game Date": ud_date,
                 })
 
         objects = _ow_ud_collect(payload)
@@ -28562,6 +28659,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             player = _ow_ud_player_name(player_obj, app_obj, ou_obj, line_obj)
             if not player:
                 continue
+            ud_start, ud_date = _ow_ud_event_datetime_v6(app_obj, ou_obj, line_obj) if "_ow_ud_event_datetime_v6" in globals() else ("", "")
             rows.append({
                 "Source": "Underdog",
                 "Player": player,
@@ -28570,6 +28668,8 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 "Line": float(line),
                 "Evidence": blob[:350],
                 "Line ID": str(line_obj.get("id", "")),
+                "UD Start Time": ud_start,
+                "UD Game Date": ud_date,
             })
 
         # Flattened fallback: useful when title, player, and line are all on one object.
@@ -28593,6 +28693,7 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                 )
                 player = _ow_clean_ud_player(match.group(1)) if match else ""
             if player:
+                ud_start, ud_date = _ow_ud_event_datetime_v6(obj) if "_ow_ud_event_datetime_v6" in globals() else ("", "")
                 rows.append({
                     "Source": "Underdog",
                     "Player": player,
@@ -28601,6 +28702,8 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
                     "Line": float(line),
                     "Evidence": "flattened fallback: " + blob[:320],
                     "Line ID": str(obj.get("id", "")),
+                    "UD Start Time": ud_start,
+                    "UD Game Date": ud_date,
                 })
         continue
 
@@ -34304,6 +34407,10 @@ def _ow_build_hrr_rows_from_ud(raw_rows):
             "UD Player": player,
             "Player ID": prof.get("player_id"),
             "Game PK": _ow_today_game_pk_for_team(team, opp),
+            "UD Game Date": raw.get("UD Game Date"),
+            "UD Start Time": raw.get("UD Start Time"),
+            "UD Team": raw.get("UD Team"),
+            "UD Line ID": raw.get("Line ID"),
             "Team": team,
             "Raw Log Team": _ow_team_abbr(raw_team),
             "Team Source": current_team_ctx.get("Current Team Source"),
@@ -34960,6 +35067,10 @@ def _ow_build_hr_rows_from_ud(raw_rows):
             "UD Player": player,
             "Player ID": prof.get("player_id"),
             "Game PK": _ow_today_game_pk_for_team(team, opp),
+            "UD Game Date": raw.get("UD Game Date"),
+            "UD Start Time": raw.get("UD Start Time"),
+            "UD Team": raw.get("UD Team"),
+            "UD Line ID": raw.get("Line ID"),
             "Team": team,
             "Raw Log Team": _ow_team_abbr(raw_team),
             "Team Source": current_team_ctx.get("Current Team Source"),
@@ -38806,20 +38917,12 @@ def _ow_bfs_json_safe(value):
 
 
 def _ow_bfs_atomic_save_json(path, payload):
-    """Write Fantasy state atomically and report failures instead of hiding them."""
-    tmp_path = f"{path}.tmp"
+    """Fantasy persistence uses the same V6 atomic + recovery-backed storage writer."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(_ow_bfs_json_safe(payload), handle, indent=2, allow_nan=False)
-        os.replace(tmp_path, path)
-        return True, ""
+        safe_payload = _ow_bfs_json_safe(payload)
+        ok = save_json(path, safe_payload)
+        return (True, "") if ok else (False, str(st.session_state.get("ow_last_storage_write_error_v6") or "save_json failed"))
     except Exception as exc:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
         return False, str(exc)
 
 
@@ -42630,6 +42733,25 @@ def _ow_ud_collection_map(payload, *names):
     return out
 
 
+def _ow_ud_event_datetime_v6(*objs):
+    """Best-effort event/start datetime extraction from Underdog relationship objects."""
+    keys = (
+        "scheduled_at", "scheduledAt", "start_time", "startTime", "starts_at", "startsAt",
+        "game_date", "gameDate", "event_time", "eventTime", "date", "scheduled_time"
+    )
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for src in (obj, obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}):
+            for key in keys:
+                val = src.get(key) if isinstance(src, dict) else None
+                if val not in (None, ""):
+                    s = str(val)
+                    m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
+                    return s, (m.group(1) if m else "")
+    return "", ""
+
+
 def _ow_extract_ud_direct_v2(payload):
     """Parse current Underdog top-level collections without assuming one schema."""
     if not isinstance(payload, dict):
@@ -42722,6 +42844,7 @@ def _ow_extract_ud_direct_v2(payload):
         team_obj = teams.get(str(team_id or ""), {})
         team_blob = _ow_ud_attrs(team_obj) if isinstance(team_obj, dict) else {}
         team_text = team_blob.get("abbr") or team_blob.get("abbreviation") or team_blob.get("name") or ""
+        ud_start, ud_date = _ow_ud_event_datetime_v6(app_obj, ou_obj, app_stat, line_obj)
         rows.append({
             "Source": "Underdog",
             "Player": player,
@@ -42733,6 +42856,8 @@ def _ow_extract_ud_direct_v2(payload):
             "UD Appearance ID": str(app_id or ""),
             "UD Player ID": str(player_id or ""),
             "UD Team": team_text,
+            "UD Start Time": ud_start,
+            "UD Game Date": ud_date,
             "UD Parser": OW_UD_FULL_BOARD_FIX_VERSION,
         })
     return rows
@@ -42743,15 +42868,20 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
     """Union current direct + legacy parsers so posted MLB batter lines are not dropped."""
     all_rows = []
     endpoint_debug = []
-    # Scan several live versions because Underdog can transition schemas gradually.
-    for url in list(UNDERDOG_URLS)[:5]:
+    # Hot path: first healthy current endpoint wins. v5/v4 are fallbacks only.
+    # This avoids repeatedly parsing the same 35k+ object payload across versions.
+    for url in list(UNDERDOG_URLS):
         payload = _ow_ud_live_payload_v2(url)
         if not payload:
             endpoint_debug.append({"endpoint": url, "status": "NO_RESPONSE", "rows": 0})
             continue
         direct = _ow_extract_ud_direct_v2(payload)
-        all_rows.extend(direct)
         endpoint_debug.append({"endpoint": url, "status": "OK", "rows": len(direct)})
+        if direct:
+            all_rows.extend(direct)
+            # A normal full MLB HRR+HR board is far above 40 rows; stop once healthy.
+            if len(direct) >= 40:
+                break
 
     # Preserve every row the existing parser can still see.
     legacy_rows, legacy_debug = [], {}
@@ -43856,8 +43986,18 @@ def _ow_filter_live_batter_rows_to_official_schedule_v5(df):
         cands = pair_map.get(pair, []) if pair else []
         if not cands and team not in (None, "", "—") and len(team_map.get(team, [])) == 1 and opp in (None, "", "—"):
             cands = team_map.get(team, [])
+        # If Underdog exposes its event date, it must agree with an MLB-selected date.
+        # This blocks tomorrow lines from leaking into a late-night Today board.
+        ud_date = _ow_guard_date_text(r.get("UD Game Date") or r.get("UD Start Time"))
+        if ud_date and cands:
+            dated = [g for g in cands if g.get("date") == ud_date]
+            if dated:
+                cands = dated
+            else:
+                rejected.append({"Player": r.get("Player"), "Team": team, "Opponent": opp, "Market": r.get("Market"), "Line": r.get("Line"), "Reason": "UD_DATE_NOT_IN_SELECTED_MLB_DATES", "UD Game Date": ud_date})
+                continue
         if not cands:
-            rejected.append({"Player": r.get("Player"), "Team": team, "Opponent": opp, "Market": r.get("Market"), "Line": r.get("Line")})
+            rejected.append({"Player": r.get("Player"), "Team": team, "Opponent": opp, "Market": r.get("Market"), "Line": r.get("Line"), "Reason": "TEAM_OPP_NOT_ON_SELECTED_MLB_SCHEDULE", "UD Game Date": ud_date})
             continue
         chosen = None
         existing_pk = r.get("Game PK")
@@ -43877,6 +44017,7 @@ def _ow_filter_live_batter_rows_to_official_schedule_v5(df):
         r["Opponent Routing Date"] = chosen.get("date")
         r["Opponent"] = chosen.get("home") if team == chosen.get("away") else chosen.get("away")
         r["Schedule Guard"] = "MLB_OFFICIAL_OK"
+        r["Schedule Guard Date Match"] = "UD+MLB" if ud_date else "MLB_ONLY"
         kept.append(r)
     audit = {"input": len(df), "kept": len(kept), "filtered": len(rejected), "status": "MLB_OFFICIAL", "filtered_sample": rejected[:20]}
     try:
@@ -43884,6 +44025,15 @@ def _ow_filter_live_batter_rows_to_official_schedule_v5(df):
     except Exception:
         pass
     return pd.DataFrame(kept) if kept else pd.DataFrame(columns=df.columns), audit
+
+
+def _ow_record_schedule_guard_v6(label, audit):
+    try:
+        store = dict(st.session_state.get("ow_schedule_guard_by_tab_v6") or {})
+        store[str(label)] = {**dict(audit or {}), "recorded_at": now_iso()}
+        st.session_state["ow_schedule_guard_by_tab_v6"] = store
+    except Exception:
+        pass
 
 
 # Wrap only outputs. Projection math underneath remains exactly the same.
@@ -43894,6 +44044,7 @@ _ow_schedule_guard_upside_base_v5 = build_v3_batter_upside_board_final
 def build_v3_batter_research_table(market="HRR"):
     df, meta = _ow_schedule_guard_research_base_v5(market)
     df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    _ow_record_schedule_guard_v6("HRR" if str(market).upper() == "HRR" else str(market).upper(), guard)
     meta = dict(meta or {})
     meta["schedule_guard_v5"] = guard
     meta["schedule_guard_version"] = OW_SCHEDULE_GUARD_VERSION
@@ -43903,6 +44054,7 @@ def build_v3_batter_research_table(market="HRR"):
 def build_v3_home_run_table():
     df, meta = _ow_schedule_guard_hr_base_v5()
     df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    _ow_record_schedule_guard_v6("HOME_RUNS", guard)
     meta = dict(meta or {})
     meta["schedule_guard_v5"] = guard
     meta["schedule_guard_version"] = OW_SCHEDULE_GUARD_VERSION
@@ -43911,7 +44063,8 @@ def build_v3_home_run_table():
 
 def build_v3_batter_upside_board_final():
     df = _ow_schedule_guard_upside_base_v5()
-    df, _ = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    _ow_record_schedule_guard_v6("BATTER_UPSIDE", guard)
     return df
 
 
@@ -43920,6 +44073,7 @@ _ow_save_batter_snapshots_pre_schedule_guard_v5 = _ow_save_batter_snapshots
 
 def _ow_save_batter_snapshots(df, source_label="OFFICIAL"):
     clean, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    _ow_record_schedule_guard_v6("OFFICIAL_SNAPSHOT_SAVE", guard)
     try:
         st.session_state["ow_last_batter_save_schedule_guard_v5"] = guard
     except Exception:
@@ -43956,6 +44110,7 @@ _ow_bfs_save_full_board_snapshot_pre_schedule_guard_v5 = _ow_bfs_save_full_board
 
 def _ow_bfs_save_full_board_snapshot(df):
     clean, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    _ow_record_schedule_guard_v6("BATTER_FANTASY_SAVE", guard)
     added = _ow_bfs_save_full_board_snapshot_pre_schedule_guard_v5(clean)
     try:
         hist = load_json(OW_BATTER_FS_BOARD_LOG, [])
@@ -44176,6 +44331,140 @@ def _ow_bfs_grade_full_board_snapshots():
 
 
 # -------------------------
+# V6 STORAGE + PROJECTION AUDIT HELPERS
+# -------------------------
+OW_FULL_LIVE_AUDIT_VERSION = "OW_MLB_FULL_LIVE_AUDIT_V2_2026_08_30"
+OW_INFRA_REPAIR_VERSION = "OW_MLB_INFRA_LAZY_PERSIST_V6_2026_08_30"
+
+
+def _ow_storage_health_v6():
+    pick_rows = load_json(OW_BATTER_PICK_LOG, []) if "OW_BATTER_PICK_LOG" in globals() else []
+    result_rows = load_json(OW_BATTER_RESULT_LOG, []) if "OW_BATTER_RESULT_LOG" in globals() else []
+    fs_rows = load_json(OW_BATTER_FS_BOARD_LOG, []) if "OW_BATTER_FS_BOARD_LOG" in globals() else []
+    writable = False
+    probe_error = ""
+    try:
+        probe = os.path.join(STORAGE_DIR, ".ow_write_probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write(now_iso())
+        os.remove(probe)
+        writable = True
+    except Exception as exc:
+        probe_error = str(exc)
+    return {
+        "storage_dir": str(STORAGE_DIR),
+        "storage_mode": str(globals().get("STORAGE_MODE") or "UNKNOWN"),
+        "persistence_confirmed": bool(globals().get("STORAGE_PERSISTENCE_CONFIRMED", False)),
+        "writable": writable,
+        "write_probe_error": probe_error,
+        "railway_volume_mount_env": str(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ""),
+        "custom_storage_env": str(os.getenv("MLB_ENGINE_STORAGE_DIR") or ""),
+        "saved_batter_snapshots": len(pick_rows) if isinstance(pick_rows, list) else 0,
+        "graded_batter_results": len(result_rows) if isinstance(result_rows, list) else 0,
+        "batter_fantasy_history_rows": len(fs_rows) if isinstance(fs_rows, list) else 0,
+        "last_write_error": (st.session_state.get("ow_last_storage_write_error_v6") if "st" in globals() else None),
+        "backup_dir": str(globals().get("OW_STORAGE_BACKUP_DIR") or ""),
+    }
+
+
+def _ow_projection_field_coverage_v6(board_name, df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return [{"Board": board_name, "Field": "__BOARD__", "Rows": 0, "Present": 0, "Missing": 0, "Coverage %": 0.0}]
+    aliases = {
+        "Player": ["Player", "UD Player"],
+        "Player ID": ["Player ID"],
+        "Team": ["Team", "Raw Log Team"],
+        "Opponent": ["Opponent", "Today Opponent"],
+        "Game PK": ["Game PK"],
+        "Official Game Date": ["Official Game Date", "Opponent Routing Date", "Game Date"],
+        "Line": ["Line", "Best Line"],
+        "Projection": ["Projection", "Best Projection", "HR Projection"],
+        "Win Probability": ["Win Probability %", "Best Win/Hit %", "Model Win Probability %", "HR Probability %"],
+        "Edge": ["Edge", "Best Edge"],
+        "Projected PA": ["Projected PA", "Expected PA", "PA"],
+        "Lineup Slot": ["Lineup Slot", "Batting Order", "Batting Slot"],
+        "Opp Pitcher": ["Opp Pitcher", "Pitcher", "Probable Pitcher"],
+        "Pitcher Hand": ["Pitcher Hand", "Opp Probable Pitcher Hand"],
+        "Skill": ["Skill Score", "SKILL", "Skill"],
+        "Matchup": ["Matchup Score", "MATCH", "Match Score"],
+        "Contact": ["Contact Score", "CONTACT", "Contact"],
+        "L3": ["L3", "Last 3", "L3 Clear %", "Recent L3"],
+        "L5": ["L5", "Last 5", "L5 Clear %", "Recent L5"],
+        "Team Runs": ["Team Runs V3", "Team Implied Runs", "Projected Team Runs"],
+        "Game Score": ["Game V3 Score", "High Scoring Game Score", "Game Environment Score", "Game Score"],
+        "Blowout": ["Blowout V3 Score", "Blowout Risk Score", "Blowout Run Score"],
+        "FS Cross": ["Cross FS", "FS Cross", "FS Cross Check", "BFS Cross"],
+        "Data Readiness": ["READY%", "Data Readiness", "Data %", "Data Score"],
+    }
+    rows=[]
+    n=len(df)
+    for label, candidates in aliases.items():
+        col=next((c for c in candidates if c in df.columns), None)
+        if not col:
+            rows.append({"Board": board_name, "Field": label, "Column": "MISSING_COLUMN", "Rows": n, "Present": 0, "Missing": n, "Coverage %": 0.0})
+            continue
+        s=df[col]
+        present = int((~s.isna() & ~s.astype(str).str.strip().isin(["", "—", "None", "nan"])).sum())
+        rows.append({"Board": board_name, "Field": label, "Column": col, "Rows": n, "Present": present, "Missing": n-present, "Coverage %": round(100.0*present/max(1,n),1)})
+    return rows
+
+
+def _ow_schedule_integrity_rows_v6(board_name, df):
+    out=[]
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return out
+    schedule_cache={}
+    for _, rr in df.iterrows():
+        r=rr.to_dict()
+        dd=_ow_guard_date_text(r.get("Official Game Date") or r.get("Opponent Routing Date") or r.get("Game Date"))
+        team=_ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
+        opp=_ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
+        gpk=r.get("Game PK")
+        if dd not in schedule_cache:
+            schedule_cache[dd]=_ow_guard_schedule_records(dd) if dd else []
+        games=schedule_cache.get(dd) or []
+        pair=tuple(sorted([team,opp])) if team not in (None,"","—") and opp not in (None,"","—") else ()
+        pair_ok=any(g.get("pair")==pair for g in games) if pair else False
+        pk_ok=any(str(g.get("game_pk"))==str(gpk) for g in games) if gpk else False
+        if not (pair_ok and pk_ok):
+            out.append({
+                "Board": board_name, "Player": r.get("Player"), "Team": team, "Opponent": opp,
+                "Game PK": gpk, "Official Game Date": dd, "Pair On MLB Schedule": pair_ok,
+                "GamePk On Date": pk_ok, "Market": r.get("Market") or r.get("Best Market"), "Line": r.get("Line") or r.get("Best Line"),
+            })
+    return out
+
+
+def _ow_capture_current_projection_boards_v6():
+    """Heavy diagnostic only. Called when user explicitly builds the audit ZIP."""
+    boards={}
+    errors={}
+    builders=[
+        ("HRR", lambda: build_v3_batter_research_table("HRR")),
+        ("HOME_RUNS", build_v3_home_run_table),
+        ("BATTER_UPSIDE", build_v3_batter_upside_board_final),
+    ]
+    for name, fn in builders:
+        try:
+            got=fn()
+            df=got[0] if isinstance(got, tuple) else got
+            boards[name]=df.copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
+        except Exception as exc:
+            boards[name]=pd.DataFrame(); errors[name]=str(exc)
+    try:
+        fs=st.session_state.get("ow_bfs_df")
+        boards["BATTER_FANTASY_SESSION"]=fs.copy() if isinstance(fs,pd.DataFrame) else pd.DataFrame()
+    except Exception as exc:
+        errors["BATTER_FANTASY_SESSION"]=str(exc)
+    try:
+        gc=st.session_state.get("ow_game_upside_cache_v3") or {}
+        gdf=gc.get("df") if isinstance(gc,dict) else None
+        boards["OPEN_GAME_CACHE"]=gdf.copy() if isinstance(gdf,pd.DataFrame) else pd.DataFrame()
+    except Exception as exc:
+        errors["OPEN_GAME_CACHE"]=str(exc)
+    return boards, errors
+
+# -------------------------
 # FULL LIVE AUDIT PACKAGE
 # -------------------------
 def _ow_audit_safe_records(obj, limit=None):
@@ -44214,21 +44503,25 @@ def _ow_audit_csv_bytes(records):
 
 
 def _ow_build_full_live_audit_zip_v5():
+    """V6 full audit: infrastructure + source health + actual current projection boards."""
     import zipfile
     now_ca = california_now() if "california_now" in globals() else datetime.now()
+    storage_health = _ow_storage_health_v6()
     summary = {
         "audit_version": OW_FULL_LIVE_AUDIT_VERSION,
+        "infra_repair_version": OW_INFRA_REPAIR_VERSION,
         "app_version": APP_VERSION,
         "generated_at": str(now_ca),
         "day_mode": str(globals().get("day_mode") or ""),
         "selected_dates": list(globals().get("dates") or []),
-        "storage_dir": str(STORAGE_DIR),
-        "railway_volume_mount_present": bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH")),
+        "storage": storage_health,
         "odds_api_key_present": bool(get_secret("ODDS_API_KEY", "")) if "get_secret" in globals() else False,
-        "schedule_guard": st.session_state.get("ow_schedule_guard_last_v5") if "st" in globals() else None,
+        "schedule_guard_by_tab": st.session_state.get("ow_schedule_guard_by_tab_v6") if "st" in globals() else None,
         "last_grade_info": st.session_state.get("ow_mlb_batter_grade_last_info") if "st" in globals() else None,
         "hrr_ud_debug": st.session_state.get("hrr_ud_debug") if "st" in globals() else None,
         "hr_ud_debug": st.session_state.get("hr_ud_debug") if "st" in globals() else None,
+        "game_match_debug": st.session_state.get("ow_game_match_debug_v4") if "st" in globals() else None,
+        "navigation_mode": "LAZY_SINGLE_PAGE",
     }
     schedules = {}
     for dd in list(globals().get("dates") or []):
@@ -44243,7 +44536,7 @@ def _ow_build_full_live_audit_zip_v5():
     reqlog = load_json(REQUEST_LOG_FILE, []) if os.path.exists(REQUEST_LOG_FILE) else []
 
     diag = []
-    for p in picks:
+    for p in picks if isinstance(picks, list) else []:
         if p.get("graded"): continue
         ctx = _ow_resolve_snapshot_game_context_v5(p)
         meta = ctx.get("meta") or {}
@@ -44257,7 +44550,7 @@ def _ow_build_full_live_audit_zip_v5():
             "Current Grade Status": p.get("Grade Status"),
         })
 
-    # Pull all current Underdog HRR/HR lines only when the user explicitly builds the audit.
+    # Complete current lines are explicit-audit-only. Normal projection pages stay on the fast path.
     ud_rows, ud_debug = [], {}
     try:
         parser = globals().get("_ow_games_full_ud_parser_v3") or globals().get("_ow_fetch_ud_batter_hrr_hr_lines")
@@ -44284,11 +44577,31 @@ def _ow_build_full_live_audit_zip_v5():
 
     files = []
     try:
-        for pth in sorted(Path(STORAGE_DIR).glob("*")):
+        for pth in sorted(Path(STORAGE_DIR).glob("**/*")):
+            if "_backups" in pth.parts and pth.is_file() and len(files) > 500:
+                continue
             try:
-                files.append({"name": pth.name, "size": pth.stat().st_size, "mtime": datetime.fromtimestamp(pth.stat().st_mtime).isoformat(), "is_file": pth.is_file()})
+                files.append({"name": str(pth.relative_to(STORAGE_DIR)), "size": pth.stat().st_size, "mtime": datetime.fromtimestamp(pth.stat().st_mtime).isoformat(), "is_file": pth.is_file()})
             except Exception: pass
     except Exception: pass
+
+    # Most important V6 addition: the actual boards/features we need to diagnose winners/misses.
+    boards, board_errors = _ow_capture_current_projection_boards_v6()
+    coverage=[]; integrity=[]
+    for name, df in boards.items():
+        coverage.extend(_ow_projection_field_coverage_v6(name, df))
+        integrity.extend(_ow_schedule_integrity_rows_v6(name, df))
+    summary["projection_board_rows"] = {k: (len(v) if isinstance(v,pd.DataFrame) else 0) for k,v in boards.items()}
+    summary["projection_board_errors"] = board_errors
+    summary["schedule_integrity_issue_rows"] = len(integrity)
+
+    source_config = {
+        "underdog_hot_path_endpoints": list(UNDERDOG_URLS),
+        "prizepicks_url": PRIZEPICKS_URL,
+        "note": "PrizePicks is not called by lazy batter pages unless a legacy pitcher workflow is explicitly selected.",
+        "main_projection_cap": globals().get("OW_FINAL_MAX_PROJECTED_LINES"),
+        "game_on_demand_refresh_seconds": globals().get("OW_GAME_FULL_REFRESH_SECONDS"),
+    }
 
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
@@ -44304,12 +44617,101 @@ def _ow_build_full_live_audit_zip_v5():
         z.writestr("09_savant_source_health.json", json.dumps(savant_health, indent=2, default=str))
         z.writestr("10_request_log.csv", _ow_audit_csv_bytes(_ow_audit_safe_records(reqlog[-3000:])))
         z.writestr("11_storage_inventory.csv", _ow_audit_csv_bytes(files))
+        z.writestr("12_storage_health.json", json.dumps(storage_health, indent=2, default=str))
+        z.writestr("13_schedule_guard_by_tab.json", json.dumps(st.session_state.get("ow_schedule_guard_by_tab_v6") or {}, indent=2, default=str))
+        z.writestr("14_projection_field_coverage.csv", _ow_audit_csv_bytes(coverage))
+        z.writestr("15_projection_schedule_integrity_issues.csv", _ow_audit_csv_bytes(integrity))
+        z.writestr("16_data_source_configuration.json", json.dumps(source_config, indent=2, default=str))
+        for name, df in boards.items():
+            safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", name.lower())
+            z.writestr(f"20_projection_board_{safe_name}.csv", _ow_audit_csv_bytes(_ow_audit_safe_records(df)))
     return bio.getvalue(), summary
 
+
+# -------------------------
+# V6 GRADING RECOVERY IMPORT
+# -------------------------
+def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
+    """Recover a previously exported HRR/HR board into the official grading log.
+
+    This is intentionally manual and date-explicit: imported rows are immutable copies of
+    the CSV values, then MLB IDs/GamePk are attached for grading. It never reprojects them.
+    """
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception as exc:
+        return {"added": 0, "rows": 0, "error": f"CSV read failed: {exc}"}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"added": 0, "rows": 0, "error": "CSV is empty"}
+    dd = _ow_guard_date_text(snapshot_date)
+    if not dd:
+        return {"added": 0, "rows": len(df), "error": "Choose the official slate date"}
+    picks = load_json(OW_BATTER_PICK_LOG, [])
+    if not isinstance(picks, list):
+        picks = []
+    existing = {_ow_batter_result_key(x) for x in picks if isinstance(x, dict)}
+    added = 0; skipped = 0; unresolved = 0
+    schedule = _ow_guard_schedule_records(dd)
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        player = str(row.get("Player") or row.get("UD Player") or "").strip()
+        market = str(row.get("Market") or row.get("Best Market") or "").strip()
+        line = _v3_safe_num(row.get("Line") if row.get("Line") not in (None, "") else row.get("Best Line"), None)
+        pick = row.get("Pick") or row.get("Best Pick") or row.get("Model Side")
+        side = _ow_batter_pick_side(pick, market)
+        if not player or line is None or not side:
+            skipped += 1
+            continue
+        team = _ow_team_abbr(row.get("Team") or row.get("Raw Log Team"))
+        opp = _ow_team_abbr(row.get("Opponent") or row.get("Today Opponent"))
+        pid = row.get("Player ID")
+        if not pid:
+            try: pid = _mlb_search_player_id_by_name(player)
+            except Exception: pid = None
+        pair = tuple(sorted([team, opp])) if team not in (None,"","—") and opp not in (None,"","—") else ()
+        cands = [g for g in schedule if pair and g.get("pair") == pair]
+        game_pk = cands[0].get("game_pk") if cands else None
+        official_date = cands[0].get("date") if cands else dd
+        snap = dict(row)
+        snap.update({
+            "Player": player,
+            "Market": market,
+            "Line": float(line),
+            "Pick": pick,
+            "Pick Side": side,
+            "Snapshot Date": dd,
+            "Official Game Date": official_date,
+            "Player ID": pid,
+            "Game PK": game_pk,
+            "snapshot_type": "BATTER_BEFORE_GAME_RECOVERY_IMPORT",
+            "snapshot_source": "RECOVERY_CSV",
+            "official_snapshot_saved_at": now_iso(),
+            "graded": False,
+            "Grade Status": "RECOVERED CSV / WAITING MLB GRADE",
+            "Grade Source": "PENDING_MLB_OFFICIAL",
+            "Projection Version": row.get("Projection Version") or OW_FINAL_LINE_PROJECTION_VERSION,
+            "Schedule Guard Version": OW_SCHEDULE_GUARD_VERSION,
+            "Schedule Guard Reason": "RECOVERY_IMPORT_EXACT_PAIR" if game_pk else "RECOVERY_IMPORT_NEEDS_SCHEDULE_RESOLUTION",
+        })
+        snap["pick_id"] = _ow_batter_pick_id(snap)
+        rk = _ow_batter_result_key(snap)
+        if rk in existing:
+            skipped += 1
+            continue
+        if not pid or not game_pk:
+            unresolved += 1
+        picks.append(snap); existing.add(rk); added += 1
+    ok = save_json(OW_BATTER_PICK_LOG, picks[-20000:])
+    return {"added": added, "rows": len(df), "skipped": skipped, "unresolved": unresolved, "saved": bool(ok), "snapshot_date": dd}
 
 # Sidebar control modeled after the diagnostic toggle in the user's NFL app.
 with st.sidebar:
     st.divider()
+    _ow_storage_sidebar_health_v6 = _ow_storage_health_v6()
+    if not _ow_storage_sidebar_health_v6.get("persistence_confirmed"):
+        st.warning("⚠️ Grading storage is LOCAL/EPHEMERAL. Add a Railway volume and set MLB_ENGINE_STORAGE_DIR (recommended) or RAILWAY_VOLUME_MOUNT_PATH so saved official boards survive deploys.")
+    else:
+        st.caption(f"💾 Persistent grading storage: {_ow_storage_sidebar_health_v6.get('storage_mode')} · {_ow_storage_sidebar_health_v6.get('storage_dir')}")
     with st.expander("🧪 FULL LIVE AUDIT DOWNLOAD", expanded=False):
         st.caption("OFF by default. Diagnostic export only — it does not change projection formulas and does not run automatically.")
         audit_enabled_v5 = st.toggle("Enable audit download", value=False, key="ow_enable_full_live_audit_v5")
@@ -44332,7 +44734,23 @@ with st.sidebar:
                     key="ow_download_full_live_audit_v5", use_container_width=True,
                 )
                 meta = st.session_state.get("ow_full_live_audit_meta_v5") or {}
-                st.caption(f"Includes schedule routes, grading diagnostics, saved snapshots/results, Underdog intake, Savant source health, request log, and storage inventory. Grade source: MLB official.")
+                st.caption("Includes current HRR/HR/Upside projection boards + feature coverage, per-tab schedule guards, grading diagnostics, saved snapshots/results, Underdog intake, Savant health, request log, and persistence health. Grade source: MLB official.")
+
+
+with st.sidebar:
+    with st.expander("🛟 GRADING RECOVERY", expanded=False):
+        st.caption("Use only if a previous deploy erased saved snapshots. Upload the original exported HRR/HR CSV; the app imports its frozen line/pick/projection values and grades them from MLB official box scores.")
+        _ow_recovery_file_v6 = st.file_uploader("Recovery projection CSV", type=["csv"], key="ow_recovery_csv_v6")
+        _ow_recovery_date_v6 = st.date_input("Official slate date", value=(california_now() - timedelta(days=1)).date(), key="ow_recovery_date_v6")
+        if _ow_recovery_file_v6 is not None and st.button("Import recovery board + grade finals", key="ow_recovery_import_v6", use_container_width=True):
+            with st.spinner("Recovering frozen projection rows and matching MLB official games…"):
+                info = _ow_import_batter_snapshot_csv_v6(_ow_recovery_file_v6.getvalue(), str(_ow_recovery_date_v6))
+                if info.get("error"):
+                    st.error(info.get("error"))
+                else:
+                    grade_info = _ow_grade_batter_snapshots()
+                    st.success(f"Recovered {info.get('added',0)} rows ({info.get('skipped',0)} duplicates/skips). MLB grader: {grade_info.get('graded',0)} graded, {grade_info.get('voids',0)} void, {grade_info.get('waiting_final',0)} waiting.")
+                    st.session_state["ow_mlb_batter_grade_last_info"] = grade_info
 
 
 # Keep the repaired MLB-official grader active regardless of whether full-game
@@ -44346,43 +44764,43 @@ _ow_persist_rich_postgame_if_ready()
 # Clean V3 batter-only tab layout. Batter Fantasy restored as a new isolated Underdog event-model tab; pitcher/research/ML tabs remain hidden.
 _ow_bfs_restore_saved_board_to_session()
 
-tab_top, tab_games, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
-    "🔥 BATTER UPSIDE",
-    "⚾ GAMES",
-    "1️⃣ H+R+RBI",
-    "2️⃣ HOME RUNS",
-    "3️⃣ BATTER FANTASY",
-    "🧠 BATTER LEARNING",
-    "✅ OFFICIAL PLAYS",
-    "CALIBRATION AUDIT",
-    "⚙️ SETTINGS",
-])
+# V6 TRUE-LAZY NAVIGATION
+# Streamlit st.tabs executes every tab body on each rerun. A horizontal radio styled like
+# tabs keeps the same workflow while running ONLY the selected page's projection builder.
+_OW_NAV_PAGES_V6 = [
+    "🔥 BATTER UPSIDE", "⚾ GAMES", "1️⃣ H+R+RBI", "2️⃣ HOME RUNS", "3️⃣ BATTER FANTASY",
+    "🧠 BATTER LEARNING", "✅ OFFICIAL PLAYS", "CALIBRATION AUDIT", "⚙️ SETTINGS",
+]
+st.markdown("""
+<style>
+div[data-testid="stRadio"] > div[role="radiogroup"]{gap:.28rem;flex-wrap:wrap!important;background:#070b12;border:1px solid #222c3d;border-radius:12px;padding:5px}
+div[data-testid="stRadio"] > div[role="radiogroup"] label{background:#101725;border:1px solid #263247;border-radius:9px;padding:5px 9px;margin:0;font-weight:800}
+div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked){border-color:#f6c43c;box-shadow:0 0 0 1px rgba(246,196,60,.25) inset;background:#171b25}
+@media(max-width:700px){div[data-testid="stRadio"] > div[role="radiogroup"] label{padding:4px 7px;font-size:11px}}
+</style>
+""", unsafe_allow_html=True)
+_ow_active_page_v6 = st.radio(
+    "MLB Batter Navigation", _OW_NAV_PAGES_V6, horizontal=True,
+    key="ow_lazy_main_page_v6", label_visibility="collapsed"
+)
+st.session_state["ow_lazy_main_page_last_v6"] = _ow_active_page_v6
 
-with tab_top:
+if _ow_active_page_v6 == "🔥 BATTER UPSIDE":
     render_v3_top_batter_plays_board()
-
-with tab_games:
+elif _ow_active_page_v6 == "⚾ GAMES":
     render_v3_games_tab()
-
-with tab_hrr:
+elif _ow_active_page_v6 == "1️⃣ H+R+RBI":
     render_v3_batter_research_tab("HRR")
-
-with tab_hr:
+elif _ow_active_page_v6 == "2️⃣ HOME RUNS":
     render_v3_home_run_tab()
-
-with tab_bfs:
+elif _ow_active_page_v6 == "3️⃣ BATTER FANTASY":
     render_v3_batter_fantasy_tab()
-
-with tab_learning:
+elif _ow_active_page_v6 == "🧠 BATTER LEARNING":
     render_v3_batter_learning_lab_tab()
-
-with tab_official:
+elif _ow_active_page_v6 == "✅ OFFICIAL PLAYS":
     render_v3_batter_official_plays_tab()
-
-
-with tab_calibration:
+elif _ow_active_page_v6 == "CALIBRATION AUDIT":
     render_calibration_audit_tab()
-
-with tab_settings:
+else:
     render_v3_settings_tab()
     _ow_render_data_health_audit_v4()
