@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 · DEPLOY READY BATTER SPLITS V8"
+APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 · FINAL KEEP HRR SPLIT CORRECTED V9"
 
 # =========================
 # V3 TEST PATCH — 40% SUPPRESSION + IP ACCURACY TEST
@@ -30022,18 +30022,26 @@ def _ow_batter_split_factor(player_id, pitcher_hand, market):
         if market == "HR":
             split_rate = _ow_stat_num(split_stat, "homeRuns") / split_pa
             season_rate = _ow_stat_num(season_stat, "homeRuns") / season_pa
+            split_basis = "HR/PA"
         else:
+            # MLB statSplits vs R/L does not provide a usable Runs split in this feed
+            # (audit showed Runs=0 for every populated hitter split). Comparing
+            # split H+0+RBI against season H+R+RBI creates a one-way suppression bias.
+            #
+            # Keep the SAME ratio/exponent/caps, but compare a like-for-like
+            # handedness-sensitive basis that MLB actually supplies on both sides:
+            # Hits + RBI per PA. Runs remain modeled elsewhere by team/game/OBP context.
             split_rate = (
-                _ow_stat_num(split_stat, "hits") + _ow_stat_num(split_stat, "runs") + _ow_stat_num(split_stat, "rbi")
+                _ow_stat_num(split_stat, "hits") + _ow_stat_num(split_stat, "rbi")
             ) / split_pa
             season_rate = (
-                _ow_stat_num(season_stat, "hits") + _ow_stat_num(season_stat, "runs") + _ow_stat_num(season_stat, "rbi")
+                _ow_stat_num(season_stat, "hits") + _ow_stat_num(season_stat, "rbi")
             ) / season_pa
+            split_basis = "H+RBI/PA"
         if season_rate <= 0:
             return 1.0, "Split neutral"
-        # V8: formula intentionally unchanged from V7.
         factor = clamp((split_rate / season_rate) ** 0.35, 0.88, 1.14)
-        return float(factor), f"Split vs {pitcher_hand}HP {factor:.3f} · {split_source}"
+        return float(factor), f"Split vs {pitcher_hand}HP {factor:.3f} · {split_basis} · {split_source}"
     except Exception:
         return 1.0, "Split unavailable"
 
@@ -30587,6 +30595,9 @@ def _ow_batter_key_matchup_stats_context(player_id, pitcher_hand):
                 "OPS": ops,
                 "wRC": _ow_batter_wrc_proxy_from_ops(avg, obp, slg, ops),
                 "HRR_PA": (h + r + rbi) / pa if pa else None,
+                # Comparable vs-hand basis. MLB hitter statSplits supplies H/RBI but
+                # the Runs field is not usable for vr/vl in the audited feed.
+                "HRBI_PA": (h + rbi) / pa if pa else None,
                 "HR_PA": hr / pa if pa else None,
             }
 
@@ -30598,16 +30609,18 @@ def _ow_batter_key_matchup_stats_context(player_id, pitcher_hand):
         split_pa = _v3_safe_num(sp.get("PA"), 0) or 0
         season_hrr_pa = _v3_safe_num(s.get("HRR_PA"), None)
         split_hrr_pa = _v3_safe_num(sp.get("HRR_PA"), None)
+        season_hrbi_pa = _v3_safe_num(s.get("HRBI_PA"), None)
+        split_hrbi_pa = _v3_safe_num(sp.get("HRBI_PA"), None)
         season_hr_pa = _v3_safe_num(s.get("HR_PA"), None)
         split_hr_pa = _v3_safe_num(sp.get("HR_PA"), None)
         split_wrc = _v3_safe_num(sp.get("wRC"), None)
         season_wrc = _v3_safe_num(s.get("wRC"), None)
         split_avg = _v3_safe_num(sp.get("AVG"), None)
         if split_pa >= 35:
-            if season_hrr_pa and split_hrr_pa is not None:
-                f = clamp((split_hrr_pa / max(season_hrr_pa, 0.001)) ** 0.18, 0.965, 1.040)
+            if season_hrbi_pa and split_hrbi_pa is not None:
+                f = clamp((split_hrbi_pa / max(season_hrbi_pa, 0.001)) ** 0.18, 0.965, 1.040)
                 hrr_factor *= f
-                notes.append(f"vs {hand}HP HRR/PA x{f:.3f}")
+                notes.append(f"vs {hand}HP H+RBI/PA x{f:.3f}")
             if season_hr_pa and split_hr_pa is not None:
                 f = clamp((split_hr_pa / max(season_hr_pa, 0.001)) ** 0.15, 0.925, 1.075)
                 hr_factor *= f
@@ -43151,13 +43164,25 @@ def _ow_fetch_ud_batter_hrr_hr_lines():
             if len(direct) >= 40:
                 break
 
-    # Preserve every row the existing parser can still see.
+    # Legacy parser is now a fallback only. The V8 audit showed v6 already returning
+    # the complete 200 HRR + 200 HR board, while the legacy v4 parser redundantly
+    # flattened ~14k objects again. Skip that work when direct intake is healthy.
     legacy_rows, legacy_debug = [], {}
-    try:
-        legacy_rows, legacy_debug = _ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix()
-        all_rows.extend(list(legacy_rows or []))
-    except Exception as exc:
-        legacy_debug = {"error": str(exc)}
+    direct_hrr = sum(1 for r in all_rows if isinstance(r, dict) and str(r.get("Market")) == "HRR")
+    direct_hr = sum(1 for r in all_rows if isinstance(r, dict) and str(r.get("Market")) == "Home Runs")
+    direct_complete = direct_hrr >= 40 and direct_hr >= 40
+    if direct_complete:
+        legacy_debug = {
+            "status": "SKIPPED_DIRECT_COMPLETE",
+            "direct_hrr": direct_hrr,
+            "direct_hr": direct_hr,
+        }
+    else:
+        try:
+            legacy_rows, legacy_debug = _ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix()
+            all_rows.extend(list(legacy_rows or []))
+        except Exception as exc:
+            legacy_debug = {"error": str(exc)}
 
     dedup = {}
     for row in all_rows:
@@ -44601,7 +44626,7 @@ def _ow_bfs_grade_full_board_snapshots():
 # -------------------------
 # V6 STORAGE + PROJECTION AUDIT HELPERS
 # -------------------------
-OW_FULL_LIVE_AUDIT_VERSION = "OW_MLB_FULL_LIVE_AUDIT_V4_BATTER_SPLITS_2026_08_31"
+OW_FULL_LIVE_AUDIT_VERSION = "OW_MLB_FULL_LIVE_AUDIT_V5_HRR_SPLIT_BALANCE_2026_08_31"
 OW_INFRA_REPAIR_VERSION = "OW_MLB_INFRA_INSTANT_CACHE_PERSIST_V7_2026_08_31"
 
 
@@ -44783,6 +44808,36 @@ def _ow_projection_feature_health_v7(board_name, df):
         "Batter vs pitcher-hand split", split_count, sev,
         "Uses official/current split data; neutral only when a real split is unavailable or too small." + source_note
     ))
+
+    # Balance sanity check: a healthy league-wide handedness factor should contain
+    # both positive and negative adjustments. A one-way board usually means the
+    # numerator/denominator are not comparable (the V8 Runs=0 issue).
+    factor_col = "Split Factor" if "Split Factor" in df.columns else None
+    if factor_col:
+        fac = pd.to_numeric(df[factor_col], errors="coerce").dropna()
+        active_fac = fac[(fac < 0.9995) | (fac > 1.0005)]
+        above = int((fac > 1.0005).sum())
+        below = int((fac < 0.9995).sum())
+        balance_sev = "ALERT" if len(active_fac) >= 20 and (above == 0 or below == 0) else "OK"
+        out.append({
+            "Board": board_name, "Feature": "Batter split direction balance",
+            "Rows": n, "Available": int(len(fac)), "Missing": int(max(0, n-len(fac))),
+            "Coverage %": round(100.0*len(fac)/max(1,n),1),
+            "Severity": balance_sev,
+            "Note": f"Below 1.00: {below}; Above 1.00: {above}. Healthy boards should normally contain both directions."
+        })
+
+    if "Split R" in df.columns:
+        sr = pd.to_numeric(df["Split R"], errors="coerce")
+        populated = int(sr.notna().sum())
+        nonzero = int((sr.fillna(0) != 0).sum())
+        out.append({
+            "Board": board_name, "Feature": "MLB split Runs field",
+            "Rows": n, "Available": populated, "Missing": int(max(0,n-populated)),
+            "Coverage %": round(100.0*populated/max(1,n),1),
+            "Severity": "INFO",
+            "Note": f"Non-zero split Runs rows: {nonzero}. V9 HRR handedness factors intentionally use H+RBI/PA because MLB vr/vl Runs is not usable in the audited feed."
+        })
 
     lineup_count = 0
     if "Lineup Confirmed" in df.columns:
