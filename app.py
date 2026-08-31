@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 · FINAL KEEP HRR SPLIT CORRECTED V9"
+APP_VERSION = "ONE WAY PICKZ — BATTER PROJECTIONS V3 · FINAL KEEP VALIDATED V10"
 
 # =========================
 # V3 TEST PATCH — 40% SUPPRESSION + IP ACCURACY TEST
@@ -32670,7 +32670,9 @@ def _ow_profile_context_with_fallback(profile_ctx, key_stats_ctx, savant_ctx=Non
 
         hr_pa = _v3_safe_num(out.get("Profile hr_pa"), None)
         if hr_pa is None and season_hr_pct is not None:
-            hr_pa = season_hr_pct / 100.0 if season_hr_pct > 1 else season_hr_pct
+            # Season HR% in key_stats_ctx is stored in DISPLAY percentage points.
+            # 0.8 means 0.8%, therefore it must be 0.008 as a probability.
+            hr_pa = season_hr_pct / 100.0
         if hr_pa is None and season_pa and season_hr is not None:
             hr_pa = season_hr / max(season_pa, 1)
         if hr_pa is None:
@@ -33741,12 +33743,15 @@ def _ow_hrr_moneyball_component_context(projected_pa, key_stats_ctx, profile_ctx
         bb_pct = _v3_safe_num(k.get("Split BB%"), None)
         if bb_pct is None:
             bb_pct = _v3_safe_num(k.get("Season BB%"), None)
-        if bb_pct is not None and bb_pct > 1:
+        if bb_pct is not None:
+            # Key matchup BB% fields are display percentage points.
             bb_pct /= 100.0
         hr_pct = _v3_safe_num(k.get("Split HR%"), None)
         if hr_pct is None:
             hr_pct = _v3_safe_num(k.get("Season HR%"), None)
-        if hr_pct is not None and hr_pct > 1:
+        if hr_pct is not None:
+            # Key matchup HR% fields are display percentage points.
+            # This fixes the 0.8% -> 80% bug discovered by the V9 audit.
             hr_pct /= 100.0
         ab_pa = _v3_safe_num(k.get("Split AB/PA"), None)
         if ab_pa is None:
@@ -33901,12 +33906,14 @@ def _ow_pa_outcome_simulation_context(
         if avg is None:
             avg = _v3_safe_num(key.get("Split AVG"), None) or _v3_safe_num(key.get("Season AVG"), None) or _v3_safe_num(prof.get("Profile BA"), None) or 0.245
         bb_pct = _v3_safe_num(comp.get("Component BB%"), None)
-        if bb_pct is not None and bb_pct > 1:
+        if bb_pct is not None:
+            # Component BB% is exported/displayed in percentage points.
             bb_pct /= 100.0
         if bb_pct is None:
             bb_pct = 0.082
         hr_pct = _v3_safe_num(comp.get("Component HR%"), None)
-        if hr_pct is not None and hr_pct > 1:
+        if hr_pct is not None:
+            # Component HR% is exported/displayed in percentage points.
             hr_pct /= 100.0
         if hr_pct is None:
             hr_pct = _v3_safe_num(prof.get("Profile hr_pa"), None)
@@ -43531,7 +43538,8 @@ def _ow_auto_grade_batter_mlb_official_v2():
 # - Do not alter HRR / HR / FS projection formulas.
 # ============================================================
 OW_FAST_MAIN_ONDEMAND_GAMES_VERSION = "OW_FAST_MAIN_ONDEMAND_GAMES_V3_2026_08_29"
-OW_MAIN_FAST_MAX_PROJECTED_LINES = 120
+OW_MAIN_VISIBLE_TARGET_V10 = 120
+OW_MAIN_FAST_MAX_PROJECTED_LINES = 132
 OW_GAME_FULL_REFRESH_SECONDS = 90
 
 # Save the complete parser/enricher before restoring the faster slate path.
@@ -43558,12 +43566,19 @@ def _ow_game_override_rows_v3():
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _ow_fast_main_ud_rows_v3():
-    """Use the pre-completeness parser for fast slate-level boards."""
+    """Fast slate intake using the current v6-first parser.
+
+    V9 audit proved v6 returned a complete 200 HRR + 200 HR board while the old
+    fast path still reparsed the large legacy v4 payload (~14k objects). Use v6
+    first here too; projection count remains separately capped below.
+    """
     try:
-        rows, debug = _ow_fetch_ud_batter_hrr_hr_lines_before_full_board_fix()
-        return list(rows or []), dict(debug or {})
+        rows, debug = _ow_games_full_ud_parser_v3()
+        debug = dict(debug or {})
+        debug["mode"] = "FAST_MAIN_V6_FIRST"
+        return list(rows or []), debug
     except Exception as exc:
-        return [], {"status": "ERROR", "error": str(exc), "mode": "FAST_MAIN"}
+        return [], {"status": "ERROR", "error": str(exc), "mode": "FAST_MAIN_V6_FIRST"}
 
 
 def fetch_underdog_batter_prop_rows():
@@ -44337,6 +44352,11 @@ _ow_schedule_guard_upside_base_v5 = build_v3_batter_upside_board_final
 def build_v3_batter_research_table(market="HRR"):
     df, meta = _ow_schedule_guard_research_base_v5(market)
     df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    if isinstance(df, pd.DataFrame) and len(df) > OW_MAIN_VISIBLE_TARGET_V10:
+        df = df.head(OW_MAIN_VISIBLE_TARGET_V10).copy()
+    guard = dict(guard or {})
+    guard["visible_after_guard"] = len(df) if isinstance(df, pd.DataFrame) else 0
+    guard["visible_target"] = OW_MAIN_VISIBLE_TARGET_V10
     _ow_record_schedule_guard_v6("HRR" if str(market).upper() == "HRR" else str(market).upper(), guard)
     meta = dict(meta or {})
     meta["schedule_guard_v5"] = guard
@@ -44347,6 +44367,11 @@ def build_v3_batter_research_table(market="HRR"):
 def build_v3_home_run_table():
     df, meta = _ow_schedule_guard_hr_base_v5()
     df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    if isinstance(df, pd.DataFrame) and len(df) > OW_MAIN_VISIBLE_TARGET_V10:
+        df = df.head(OW_MAIN_VISIBLE_TARGET_V10).copy()
+    guard = dict(guard or {})
+    guard["visible_after_guard"] = len(df) if isinstance(df, pd.DataFrame) else 0
+    guard["visible_target"] = OW_MAIN_VISIBLE_TARGET_V10
     _ow_record_schedule_guard_v6("HOME_RUNS", guard)
     meta = dict(meta or {})
     meta["schedule_guard_v5"] = guard
@@ -44357,6 +44382,11 @@ def build_v3_home_run_table():
 def build_v3_batter_upside_board_final():
     df = _ow_schedule_guard_upside_base_v5()
     df, guard = _ow_filter_live_batter_rows_to_official_schedule_v5(df)
+    if isinstance(df, pd.DataFrame) and len(df) > OW_MAIN_VISIBLE_TARGET_V10:
+        df = df.head(OW_MAIN_VISIBLE_TARGET_V10).copy()
+    guard = dict(guard or {})
+    guard["visible_after_guard"] = len(df) if isinstance(df, pd.DataFrame) else 0
+    guard["visible_target"] = OW_MAIN_VISIBLE_TARGET_V10
     _ow_record_schedule_guard_v6("BATTER_UPSIDE", guard)
     return df
 
@@ -44626,7 +44656,7 @@ def _ow_bfs_grade_full_board_snapshots():
 # -------------------------
 # V6 STORAGE + PROJECTION AUDIT HELPERS
 # -------------------------
-OW_FULL_LIVE_AUDIT_VERSION = "OW_MLB_FULL_LIVE_AUDIT_V5_HRR_SPLIT_BALANCE_2026_08_31"
+OW_FULL_LIVE_AUDIT_VERSION = "OW_MLB_FULL_LIVE_AUDIT_V6_COMPONENT_PERCENT_SANITY_2026_08_31"
 OW_INFRA_REPAIR_VERSION = "OW_MLB_INFRA_INSTANT_CACHE_PERSIST_V7_2026_08_31"
 
 
@@ -44852,6 +44882,34 @@ def _ow_projection_feature_health_v7(board_name, df):
         ss = df["Team Implied Runs Source"].fillna("").astype(str)
         market_runs = int((~ss.str.contains("PROXY|MISSING", case=False, regex=True)).sum())
     out.append(row("Non-proxy team-run market source", market_runs, "INFO", "0% is expected when no Odds API key is configured."))
+
+    # V10 unit sanity: component percentage columns are display percentages.
+    if "Component HR%" in df.columns:
+        s_hr = pd.to_numeric(df["Component HR%"], errors="coerce")
+        bad_hr = int((s_hr > 20.0).sum())
+        out.append({
+            "Board": board_name,
+            "Feature": "Component HR% unit sanity",
+            "Rows": n,
+            "Available": int(s_hr.notna().sum()),
+            "Missing": int(s_hr.isna().sum()),
+            "Coverage %": round(100.0 * s_hr.notna().sum() / max(1, n), 1),
+            "Severity": "ALERT" if bad_hr else "OK",
+            "Note": f"Rows above 20% HR probability: {bad_hr}. Any nonzero count requires unit/source review."
+        })
+    if "Component BB%" in df.columns:
+        s_bb = pd.to_numeric(df["Component BB%"], errors="coerce")
+        bad_bb = int((s_bb > 30.0).sum())
+        out.append({
+            "Board": board_name,
+            "Feature": "Component BB% unit sanity",
+            "Rows": n,
+            "Available": int(s_bb.notna().sum()),
+            "Missing": int(s_bb.isna().sum()),
+            "Coverage %": round(100.0 * s_bb.notna().sum() / max(1, n), 1),
+            "Severity": "ALERT" if bad_bb else "OK",
+            "Note": f"Rows above 30% BB probability: {bad_bb}. Any nonzero count requires unit/source review."
+        })
     return out
 
 
@@ -44993,6 +45051,7 @@ def _ow_build_full_live_audit_zip_v5():
         "prizepicks_url": PRIZEPICKS_URL,
         "note": "PrizePicks is not called by lazy batter pages unless a legacy pitcher workflow is explicitly selected.",
         "main_projection_cap": globals().get("OW_FINAL_MAX_PROJECTED_LINES"),
+        "main_visible_target": globals().get("OW_MAIN_VISIBLE_TARGET_V10", 120),
         "game_on_demand_refresh_seconds": globals().get("OW_GAME_FULL_REFRESH_SECONDS"),
     }
 
