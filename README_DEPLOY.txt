@@ -24,6 +24,15 @@ Historical integration:
 Railway start command:
 streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
 
+Member platform saved-board sync:
+- MEMBER_BOARD_INGEST_URL=https://YOUR-MEMBER-SITE/api/batter/ingest
+- MEMBER_BOARD_SYNC_TOKEN=the same strong secret configured on the member site
+- MEMBER_SITE_BYPASS_TOKEN=private Sites service token (needed while the site is owner-only)
+- SHARPAPI_KEY=your rotated SharpAPI credential (never commit API keys to GitHub)
+
+The sync reads completed session boards and saved official/result logs only. It does
+not recalculate projections, change formulas, save official plays, or grade results.
+
 
 STREAMLIT CLOUD FIX
 -------------------

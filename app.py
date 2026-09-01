@@ -266,10 +266,10 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-# SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
+# SharpAPI is optional and loaded from the deployment secret store only.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
 ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
-SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
+SHARPAPI_KEY = get_secret("SHARPAPI_KEY", "")
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
 MANUAL_MARKET_ODDS_TEXT = ""
@@ -45717,3 +45717,25 @@ with tab_calibration:
 with tab_settings:
     render_v3_settings_tab()
     _ow_render_data_health_audit_v4()
+
+
+# MEMBER PLATFORM EXPORT (integration-only)
+# Publish only boards that the existing engines already calculated and froze. This
+# downstream adapter cannot invoke a builder, refresh a feed, save a pick, or grade a row.
+try:
+    from member_board_sync import sync_streamlit_member_boards
+
+    st.session_state["ow_member_board_sync_status"] = sync_streamlit_member_boards(
+        st,
+        storage_dir=globals().get("STORAGE_DIR"),
+        pick_log=globals().get("OW_BATTER_PICK_LOG"),
+        result_log=globals().get("OW_BATTER_RESULT_LOG"),
+        source_version=globals().get("APP_VERSION", "MLB_BATTERS"),
+    )
+except Exception as _ow_member_sync_error:
+    st.session_state["ow_member_board_sync_status"] = {
+        "ok": False,
+        "configured": bool(os.environ.get("MEMBER_BOARD_INGEST_URL")),
+        "status": "ISOLATED_SYNC_ERROR",
+        "error": type(_ow_member_sync_error).__name__,
+    }
