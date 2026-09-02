@@ -47,6 +47,23 @@ class MemberBoardSyncTests(unittest.TestCase):
                 "Best Line": "1.5",
                 "Best Projection": 2.14,
                 "Best Win/Hit %": "63.2%",
+                "Likely Score": 76,
+                "Sync Score": "74%",
+                "Matchup": "NYY vs BOS",
+                "Matchup Score": 68,
+                "Lineup Slot": 2,
+                "Last 3": "2/3",
+                "Last 5": "4/5",
+                "Team Runs V3": 5.23,
+                "Game V3 Score": 71,
+                "Blowout Risk Score": 43,
+                "Pitcher ERA": 4.91,
+                "Pitcher WHIP": 1.32,
+                "Pitcher Split BAA": ".281",
+                "Pitcher Split K%": "18.7%",
+                "HR Stadium Score V3": 69,
+                "Weather Wind MPH": 12,
+                "HR Wind Pull Label V3": "OUT_TO_PULL",
                 "Risk Flags": "LINEUP NOT CONFIRMED | WEATHER",
                 "private_model_weight": 9.99,
             },
@@ -58,6 +75,16 @@ class MemberBoardSyncTests(unittest.TestCase):
         self.assertEqual(item["player"], "Juan Soto")
         self.assertEqual(item["line"], 1.5)
         self.assertEqual(item["winProbability"], 63.2)
+        self.assertEqual(item["likelyScore"], 76)
+        self.assertEqual(item["syncScore"], 74)
+        self.assertEqual(item["matchupText"], "NYY vs BOS")
+        self.assertEqual(item["matchup"], 68)
+        self.assertEqual(item["lineupSlot"], 2)
+        self.assertEqual(item["last3"], "2/3")
+        self.assertEqual(item["teamRuns"], 5.23)
+        self.assertEqual(item["pitcherEra"], 4.91)
+        self.assertEqual(item["pitcherKPercent"], 18.7)
+        self.assertEqual(item["windLabel"], "OUT_TO_PULL")
         self.assertNotIn("private_model_weight", item)
         self.assertEqual(item["flags"], ["LINEUP NOT CONFIRMED", "WEATHER"])
 
