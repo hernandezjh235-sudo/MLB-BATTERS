@@ -45159,8 +45159,59 @@ def _ow_build_full_live_audit_zip_v5():
 
 
 # -------------------------
-# V6 GRADING RECOVERY IMPORT
+# V6/V18 GRADING RECOVERY IMPORT
 # -------------------------
+OW_PROJECTION_CSV_GRADER_VERSION_V18 = "OW_EXPORTED_PROJECTION_CSV_GRADER_V18_2026_09_03"
+
+def _ow_csv_value_present_v18(value):
+    try:
+        if value is None:
+            return False
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return False
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    txt = str(value).strip()
+    return txt not in {"", "—", "None", "nan", "NaN", "N/A"}
+
+def _ow_first_csv_value_v18(row, *keys):
+    r = row or {}
+    for key in keys:
+        value = r.get(key)
+        if _ow_csv_value_present_v18(value):
+            return value
+    return None
+
+def _ow_csv_id_text_v18(value):
+    if not _ow_csv_value_present_v18(value):
+        return None
+    try:
+        f = float(value)
+        if math.isfinite(f) and abs(f - int(f)) < 0.000001:
+            return str(int(f))
+    except Exception:
+        pass
+    txt = str(value).strip()
+    if txt.endswith(".0") and txt[:-2].isdigit():
+        return txt[:-2]
+    return txt
+
+def _ow_render_grade_feedback_v18(info, empty_hint="Save a pregame snapshot first, or use the exported projection CSV grader."):
+    info = info if isinstance(info, dict) else {}
+    status = str(info.get("status") or "").upper()
+    if status == "ERROR":
+        st.error(info.get("error") or "Grading error")
+    elif status == "NO_FROZEN_SNAPSHOTS" or (not int(info.get("saved", info.get("rows", 0)) or 0) and not int(info.get("graded", 0) or 0)):
+        st.warning(f"No frozen snapshots were found to grade. {empty_hint}")
+    elif int(info.get("graded", 0) or 0) == 0 and int(info.get("waiting_final", 0) or 0) > 0:
+        st.info(f"No rows graded yet. {info.get('waiting_final',0)} row(s) are still waiting on MLB final box scores.")
+    elif int(info.get("graded", 0) or 0) == 0 and int(info.get("missing", 0) or 0) > 0:
+        st.warning(f"No rows graded. {info.get('missing',0)} row(s) are missing MLB player/game identity; try the exported projection CSV grader with the official slate date.")
+    else:
+        st.success(f"MLB official grading: {info.get('graded',0)} graded · {info.get('waiting_final',0)} waiting · {info.get('voids',0)} void · {info.get('missing',0)} unresolved.")
+
 def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
     """Recover a previously exported HRR/HR board into the official grading log.
 
@@ -45184,24 +45235,26 @@ def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
     schedule = _ow_guard_schedule_records(dd)
     for _, rr in df.iterrows():
         row = rr.to_dict()
-        player = str(row.get("Player") or row.get("UD Player") or "").strip()
-        market = str(row.get("Market") or row.get("Best Market") or "").strip()
-        line = _v3_safe_num(row.get("Line") if row.get("Line") not in (None, "") else row.get("Best Line"), None)
-        pick = row.get("Pick") or row.get("Best Pick") or row.get("Model Side")
+        player = str(_ow_first_csv_value_v18(row, "Player", "UD Player") or "").strip()
+        market = str(_ow_first_csv_value_v18(row, "Market", "Best Market") or "").strip()
+        line = _v3_safe_num(_ow_first_csv_value_v18(row, "Line", "Best Line", "HRR Line", "HR Line"), None)
+        pick = _ow_first_csv_value_v18(row, "Pick", "Best Pick", "Model Side", "HRR Pick", "HR Pick")
         side = _ow_batter_pick_side(pick, market)
         if not player or line is None or not side:
             skipped += 1
             continue
-        team = _ow_team_abbr(row.get("Team") or row.get("Raw Log Team"))
-        opp = _ow_team_abbr(row.get("Opponent") or row.get("Today Opponent"))
-        pid = row.get("Player ID")
+        team = _ow_team_abbr(_ow_first_csv_value_v18(row, "Team", "Raw Log Team"))
+        opp = _ow_team_abbr(_ow_first_csv_value_v18(row, "Opponent", "Today Opponent"))
+        pid = _ow_csv_id_text_v18(_ow_first_csv_value_v18(row, "Player ID"))
         if not pid:
             try: pid = _mlb_search_player_id_by_name(player)
             except Exception: pid = None
         pair = tuple(sorted([team, opp])) if team not in (None,"","—") and opp not in (None,"","—") else ()
         cands = [g for g in schedule if pair and g.get("pair") == pair]
-        game_pk = cands[0].get("game_pk") if cands else None
-        official_date = cands[0].get("date") if cands else dd
+        csv_game_pk = _ow_csv_id_text_v18(_ow_first_csv_value_v18(row, "Game PK", "GamePk", "gamePk", "game_pk"))
+        csv_date = _ow_guard_date_text(_ow_first_csv_value_v18(row, "Official Game Date", "Opponent Routing Date", "Game Date", "Date"))
+        game_pk = cands[0].get("game_pk") if cands else csv_game_pk
+        official_date = cands[0].get("date") if cands else (csv_date or dd)
         snap = dict(row)
         snap.update({
             "Player": player,
@@ -45221,7 +45274,8 @@ def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
             "Grade Source": "PENDING_MLB_OFFICIAL",
             "Projection Version": row.get("Projection Version") or OW_FINAL_LINE_PROJECTION_VERSION,
             "Schedule Guard Version": OW_SCHEDULE_GUARD_VERSION,
-            "Schedule Guard Reason": "RECOVERY_IMPORT_EXACT_PAIR" if game_pk else "RECOVERY_IMPORT_NEEDS_SCHEDULE_RESOLUTION",
+            "Schedule Guard Reason": "RECOVERY_IMPORT_EXACT_PAIR" if cands else "RECOVERY_IMPORT_CSV_GAMEPK" if game_pk else "RECOVERY_IMPORT_NEEDS_SCHEDULE_RESOLUTION",
+            "Recovery Import Version": OW_PROJECTION_CSV_GRADER_VERSION_V18,
         })
         snap["pick_id"] = _ow_batter_pick_id(snap)
         rk = _ow_batter_result_key(snap)
@@ -45269,7 +45323,7 @@ with st.sidebar:
 
 with st.sidebar:
     with st.expander("🛟 GRADING RECOVERY", expanded=False):
-        st.caption("Use only if a previous deploy erased saved snapshots. Upload the original exported HRR/HR CSV; the app imports its frozen line/pick/projection values and grades them from MLB official box scores.")
+        st.caption("Use this if the normal grade button shows zero saved rows, or if a previous deploy erased saved snapshots. Upload exported HRR, Home Run, or Batter Upside CSVs; the app imports their frozen line/pick/projection values and grades finals from MLB official box scores.")
         _ow_recovery_file_v6 = st.file_uploader("Recovery projection CSV", type=["csv"], key="ow_recovery_csv_v6")
         _ow_recovery_date_v6 = st.date_input("Official slate date", value=(california_now() - timedelta(days=1)).date(), key="ow_recovery_date_v6")
         if _ow_recovery_file_v6 is not None and st.button("Import recovery board + grade finals", key="ow_recovery_import_v6", use_container_width=True):
@@ -45281,6 +45335,27 @@ with st.sidebar:
                     grade_info = _ow_grade_batter_snapshots()
                     st.success(f"Recovered {info.get('added',0)} rows ({info.get('skipped',0)} duplicates/skips). MLB grader: {grade_info.get('graded',0)} graded, {grade_info.get('voids',0)} void, {grade_info.get('waiting_final',0)} waiting.")
                     st.session_state["ow_mlb_batter_grade_last_info"] = grade_info
+        _ow_recovery_files_v18 = st.file_uploader("Grade exported projection CSVs", type=["csv"], accept_multiple_files=True, key="ow_recovery_csvs_v18")
+        _ow_recovery_date_v18 = st.date_input("Projection CSV slate date", value=california_now().date(), key="ow_recovery_date_v18")
+        if _ow_recovery_files_v18 and st.button("Import exported CSVs + grade", key="ow_recovery_import_csvs_v18", use_container_width=True, type="primary"):
+            totals = {"files": 0, "rows": 0, "added": 0, "skipped": 0, "unresolved": 0, "errors": []}
+            with st.spinner("Importing exported projection CSVs into the frozen grader…"):
+                for f in _ow_recovery_files_v18:
+                    info = _ow_import_batter_snapshot_csv_v6(f.getvalue(), str(_ow_recovery_date_v18))
+                    totals["files"] += 1
+                    totals["rows"] += int(info.get("rows", 0) or 0)
+                    totals["added"] += int(info.get("added", 0) or 0)
+                    totals["skipped"] += int(info.get("skipped", 0) or 0)
+                    totals["unresolved"] += int(info.get("unresolved", 0) or 0)
+                    if info.get("error"):
+                        totals["errors"].append({"file": getattr(f, "name", "projection.csv"), "error": info.get("error")})
+                if totals["errors"]:
+                    st.error(f"CSV import hit {len(totals['errors'])} error(s).")
+                    st.json(totals["errors"])
+                grade_info = _ow_grade_batter_snapshots()
+                st.caption(f"CSV recovery imported {totals['added']} new rows from {totals['files']} file(s); skipped {totals['skipped']} duplicates/unsupported rows; unresolved identity rows {totals['unresolved']}.")
+                _ow_render_grade_feedback_v18(grade_info)
+                st.session_state["ow_mlb_batter_grade_last_info"] = grade_info
 
 
 
@@ -46483,8 +46558,7 @@ def _ow_render_pregame_shadow_finder_v15():
         st.success(f"Frozen for later MLB grading: {added_players} player rows and {added_games} game rows.")
     if s2.button("✅ Grade saved Shadow Finder plays", key="ow_shadow_grade_v15", use_container_width=True):
         info = _ow_grade_batter_snapshots()
-        if info.get("status") == "ERROR": st.error(info.get("error") or "Grading error")
-        else: st.success(f"MLB official grading: {info.get('graded',0)} graded · {info.get('waiting_final',0)} waiting · {info.get('voids',0)} void · {info.get('missing',0)} unresolved.")
+        _ow_render_grade_feedback_v18(info)
 
     history = _ow_shadow_result_history_v15()
     if not history.empty:
@@ -46726,8 +46800,7 @@ def render_v3_top_batter_plays_board():
         st.success(f"Saved {added} Batter Upside shadow rows before the games.")
     if s2.button("✅ Grade Batter Upside shadow snapshot", key="ow_upside_shadow_grade_v17", use_container_width=True):
         info = _ow_grade_batter_snapshots()
-        if info.get("status") == "ERROR": st.error(info.get("error") or "Grading error")
-        else: st.success(f"MLB official grading: {info.get('graded',0)} graded · {info.get('waiting_final',0)} waiting · {info.get('voids',0)} void · {info.get('missing',0)} unresolved.")
+        _ow_render_grade_feedback_v18(info)
     hist = load_json(OW_BATTER_RESULT_LOG, [])
     hist = [r for r in hist if isinstance(r,dict) and str(r.get("snapshot_source") or "").upper() == "BATTER_UPSIDE_SHADOW_V17"] if isinstance(hist,list) else []
     if hist:
