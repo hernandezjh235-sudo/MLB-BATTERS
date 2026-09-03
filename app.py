@@ -46500,11 +46500,13 @@ def _ow_render_pregame_shadow_finder_v15():
 
 
 # ============================================================
-# BATTER UPSIDE SHADOW OVERLAY V16 — 2026-09-03
+# BATTER UPSIDE SHADOW OVERLAY V17 — 2026-09-03
 # Adds environment context and a separate rank; base projections/scores remain intact.
+# V17 guardrail: shadow can support eligible rows, but pass/thin rows cannot jump
+# clean official/opportunity rows.
 # ============================================================
-OW_BATTER_UPSIDE_SHADOW_VERSION_V16 = "OW_BATTER_UPSIDE_SHADOW_OVERLAY_V16_2026_09_03"
-_ow_build_batter_upside_before_shadow_v16 = build_v3_batter_upside_board_final
+OW_BATTER_UPSIDE_SHADOW_VERSION_V17 = "OW_BATTER_UPSIDE_SHADOW_OVERLAY_V17_2026_09_03"
+_ow_build_batter_upside_before_shadow_v17 = build_v3_batter_upside_board_final
 
 
 def _ow_shadow_player_map_v16(df):
@@ -46520,9 +46522,73 @@ def _ow_shadow_player_map_v16(df):
     return out
 
 
+def _ow_upside_base_score_v17(row):
+    """Read the existing 0-100 upside score without treating binary flags as 100%."""
+    r = row or {}
+    for key in ["Upside Score", "Top Play Score", "Overall Rating", "Sync Score"]:
+        val = _v3_safe_num(r.get(key), None)
+        if val is None:
+            continue
+        if abs(val) <= 1:
+            continue
+        return float(clamp(val, 0, 100))
+    for key in ["Best Win/Hit %", "Win Probability %", "Over Probability %", "HR Probability %", "Model Win Probability %"]:
+        val = _v3_safe_num(r.get(key), None)
+        if val is None:
+            continue
+        if abs(val) <= 1:
+            val *= 100.0
+        return float(clamp(val, 0, 100))
+    likely = _v3_safe_num(r.get("Likely Score"), None)
+    if likely is not None and abs(likely) > 1:
+        return float(clamp(likely, 0, 100))
+    return 50.0
+
+
+def _ow_upside_shadow_playability_v17(row):
+    r = row or {}
+    text = " | ".join(str(r.get(k) or "") for k in [
+        "Official Play Filter", "Opportunity Tier", "Daily Data Label",
+        "Daily Data Warnings", "No-Bet Risk Flags", "Data Flags",
+        "Lineup Status", "Lineup Source",
+    ]).upper()
+    filt = str(r.get("Official Play Filter") or "").upper()
+    tier = str(r.get("Opportunity Tier") or "").upper()
+    penalty = 0.0
+    if "OFFICIAL HRR LEAN" in filt or "OFFICIAL HR V2 WATCH" in filt or "STRONG HR V2 SPRINKLE" in filt:
+        label, bucket, weight = "OFFICIAL", 4, 0.24
+    elif "H+R+RBI OPPORTUNITY" in filt or "HR OPPORTUNITY" in filt:
+        label, bucket, weight = "OPPORTUNITY", 3, 0.18
+        penalty += 2.0
+    elif "OPPORTUNITY / VERIFY LINEUP" in filt or "VERIFY LINEUP" in filt:
+        label, bucket, weight = "VERIFY LINEUP", 2, 0.12
+        penalty += 6.0
+    elif "PASS" in filt or "THIN" in filt or "VERIFY DAILY DATA" in filt or "RESEARCH" in filt:
+        label, bucket, weight = "RESEARCH / THIN", 1, 0.05
+        penalty += 14.0
+    elif "A / OFFICIAL" in tier:
+        label, bucket, weight = "OFFICIAL", 4, 0.24
+    elif "B / OPPORTUNITY" in tier:
+        label, bucket, weight = "OPPORTUNITY", 3, 0.18
+        penalty += 2.0
+    elif any(x in tier for x in ["PASS", "RISKY", "RESEARCH", "D /"]):
+        label, bucket, weight = "RESEARCH / THIN", 1, 0.05
+        penalty += 14.0
+    else:
+        label, bucket, weight = "WATCH", 2, 0.10
+        penalty += 5.0
+    if "LINEUP NOT CONFIRMED" in text and bucket > 2:
+        label, bucket, weight = "VERIFY LINEUP", 2, min(weight, 0.12)
+        penalty += 5.0
+    if any(x in text for x in ["VERY THIN", "THIN_DATA", "DAILY DATA THIN"]):
+        label, bucket, weight = "RESEARCH / THIN", 1, min(weight, 0.05)
+        penalty = max(penalty, 14.0)
+    return label, int(bucket), float(weight), float(penalty)
+
+
 def build_v3_batter_upside_board_final():
     """Enrich Batter Upside with a reversible, display-only shadow rank."""
-    base = _ow_build_batter_upside_before_shadow_v16()
+    base = _ow_build_batter_upside_before_shadow_v17()
     if not isinstance(base, pd.DataFrame) or base.empty:
         return base
     # Preserve the order and score that existed before this overlay.
@@ -46543,7 +46609,7 @@ def build_v3_batter_upside_board_final():
         key = (player, team)
         hp, rp, tp = hr_map.get(key) or {}, hrr_map.get(key) or {}, team_map.get(team) or {}
         market = str(r.get("Best Market") or r.get("Market") or "").upper()
-        base_score = _ow_shadow_num_v15(r, ["Likely Score", "Upside Score", "Top Play Score", "Best Win/Hit %", "Overall Rating"], 50, pct=True)
+        base_score = _ow_upside_base_score_v17(r)
         hr_score = _ow_shadow_num_v15(hp, ["Shadow Score"], None)
         hrr_score = _ow_shadow_num_v15(rp, ["Shadow Score"], None)
         if "HOME RUN" in market or market == "HR":
@@ -46565,26 +46631,36 @@ def build_v3_batter_upside_board_final():
         if player_shadow is None:
             player_shadow = 0.32*explosion + 0.24*chain + 0.18*hr_env + 0.14*collapse + 0.12*cascade
             source = "TEAM ENVIRONMENT SHADOW"
-        # Rank overlay only: 75% proven existing score, 25% new shadow context.
-        adjusted = float(clamp(0.75*base_score + 0.25*player_shadow, 3, 97))
+        playability, sort_bucket, shadow_weight, play_penalty = _ow_upside_shadow_playability_v17(r)
         if suppression >= 68:
-            tag = "🧊 SUPPRESSION WARNING"
+            play_penalty += 6.0
+        # Rank overlay only: weighted existing score plus bounded shadow context.
+        # Projection values and protected market formulas are not changed.
+        adjusted = float(clamp((1.0-shadow_weight)*base_score + shadow_weight*player_shadow - play_penalty, 3, 97))
+        if playability == "RESEARCH / THIN":
+            tag = "RESEARCH ONLY / THIN DATA"
+        elif suppression >= 68:
+            tag = "SUPPRESSION WARNING"
         elif hr_env >= 72 and ("HOME RUN" in market or market == "HR"):
-            tag = "💣 HR ENVIRONMENT BOOST"
+            tag = "HR ENVIRONMENT BOOST"
         elif chain >= 72 and ("H+R+RBI" in market or "HRR" in market):
-            tag = "🔗 HRR CHAIN BOOST"
+            tag = "HRR CHAIN BOOST"
         elif explosion >= 72:
-            tag = "💥 TEAM EXPLOSION"
+            tag = "TEAM EXPLOSION"
         elif cascade >= 69:
-            tag = "⚠️ BULLPEN CASCADE"
-        elif adjusted >= 68:
-            tag = "📈 SHADOW SUPPORT"
+            tag = "BULLPEN CASCADE"
+        elif adjusted >= 62:
+            tag = "SHADOW SUPPORT"
         else:
-            tag = "➖ NEUTRAL SHADOW"
+            tag = "NEUTRAL SHADOW"
         r.update({
             "Base Upside Score": round(base_score, 1),
             "Player Shadow Score": round(player_shadow, 1),
             "Shadow Adjusted Score": round(adjusted, 1),
+            "Shadow Playability": playability,
+            "Shadow Sort Bucket": sort_bucket,
+            "Shadow Weight": round(shadow_weight, 2),
+            "Shadow Guardrail Penalty": round(play_penalty, 1),
             "Shadow Source": source,
             "Upside Shadow Tag": tag,
             "Team Explosion %": round(explosion, 1),
@@ -46594,43 +46670,43 @@ def build_v3_batter_upside_board_final():
             "Bullpen Cascade %": round(cascade, 1),
             "Suppression Risk %": round(suppression, 1),
             "Shadow Confidence": tp.get("Shadow Confidence") or "LIMITED",
-            "Batter Upside Shadow Version": OW_BATTER_UPSIDE_SHADOW_VERSION_V16,
+            "Batter Upside Shadow Version": OW_BATTER_UPSIDE_SHADOW_VERSION_V17,
             "Projection Impact": "NONE",
         })
         rows.append(r)
-    out = pd.DataFrame(rows).sort_values(["Shadow Adjusted Score", "Base Upside Score"], ascending=False, na_position="last").reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["Shadow Sort Bucket", "Shadow Adjusted Score", "Base Upside Score"], ascending=False, na_position="last").reset_index(drop=True)
     out["Shadow Rank"] = np.arange(1, len(out) + 1)
     out["Shadow Rank Change"] = pd.to_numeric(out["Base Upside Rank"], errors="coerce") - pd.to_numeric(out["Shadow Rank"], errors="coerce")
     return out
 
 
-_ow_render_batter_upside_before_shadow_v16 = render_v3_top_batter_plays_board
+_ow_render_batter_upside_before_shadow_v17 = render_v3_top_batter_plays_board
 
 
 def render_v3_top_batter_plays_board():
     """Keep the existing cards, then expose the exact shadow overlay used to reorder them."""
-    _ow_render_batter_upside_before_shadow_v16()
+    _ow_render_batter_upside_before_shadow_v17()
     df = build_v3_batter_upside_board_final()
     if not isinstance(df, pd.DataFrame) or df.empty or "Shadow Adjusted Score" not in df.columns:
         return
     st.divider()
-    st.markdown("### 🔭 Batter Upside Shadow Overlay")
-    st.caption("Original projections and scores are preserved. Shadow Adjusted Score changes ordering only and is shown beside the base rank for auditability.")
+    st.markdown("### 🔭 Batter Upside Shadow Overlay V17")
+    st.caption("Original projections and scores are preserved. V17 ranks official/opportunity rows before verify-only and research-thin rows, then applies bounded shadow support.")
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Shadow Ranked", len(df))
-    c2.metric("Explosion Boosts", int(df["Upside Shadow Tag"].astype(str).str.contains("EXPLOSION", na=False).sum()))
-    c3.metric("HRR/HR Boosts", int(df["Upside Shadow Tag"].astype(str).str.contains("HRR|HR ENVIRONMENT", regex=True, na=False).sum()))
+    c2.metric("Official/Opportunity", int(df.get("Shadow Playability", pd.Series(dtype=str)).astype(str).str.contains("OFFICIAL|OPPORTUNITY", regex=True, na=False).sum()))
+    c3.metric("Verify/Research", int(df.get("Shadow Playability", pd.Series(dtype=str)).astype(str).str.contains("VERIFY|RESEARCH", regex=True, na=False).sum()))
     c4.metric("Suppression Warnings", int(df["Upside Shadow Tag"].astype(str).str.contains("SUPPRESSION", na=False).sum()))
     cols = [c for c in [
         "Shadow Rank","Base Upside Rank","Shadow Rank Change","Player","Team","Opponent","Best Market","Best Pick","Best Line",
-        "Best Projection","Best Win/Hit %","Base Upside Score","Player Shadow Score","Shadow Adjusted Score","Upside Shadow Tag",
+        "Best Projection","Best Win/Hit %","Official Play Filter","Shadow Playability","Base Upside Score","Player Shadow Score","Shadow Adjusted Score","Upside Shadow Tag",
         "Team Explosion %","HRR Lineup Chain %","HR Environment %","Starter Collapse %","Bullpen Cascade %","Suppression Risk %",
-        "Projected PA","Lineup Slot","Opp Pitcher","Pitcher Hand","Shadow Confidence"
+        "Projected PA","Lineup Slot","Opp Pitcher","Pitcher Hand","Shadow Confidence","Shadow Guardrail Penalty"
     ] if c in df.columns]
     st.dataframe(df[cols].head(60), use_container_width=True, hide_index=True)
     names = df["Player"].dropna().astype(str).tolist() if "Player" in df.columns else []
     if names:
-        selected = st.selectbox("Open Shadow Upside details", names, key=_v3_unique_widget_key("ow_upside_shadow_select_v16"))
+        selected = st.selectbox("Open Shadow Upside details", names, key=_v3_unique_widget_key("ow_upside_shadow_select_v17"))
         rr = df[df["Player"].astype(str).eq(selected)].iloc[0].to_dict()
         with st.expander(f"{selected} — Shadow Upside Context", expanded=True):
             a,b,c,d,e = st.columns(5)
@@ -46643,26 +46719,26 @@ def render_v3_top_batter_plays_board():
             x.metric("Starter Collapse", rr.get("Starter Collapse %","—"))
             y.metric("Bullpen Cascade", rr.get("Bullpen Cascade %","—"))
             z.metric("Suppression", rr.get("Suppression Risk %","—"))
-            st.info(f"{rr.get('Upside Shadow Tag','—')} · Source: {rr.get('Shadow Source','—')} · Base projection remains {rr.get('Best Projection', rr.get('Projection','—'))}.")
+            st.info(f"{rr.get('Upside Shadow Tag','—')} | {rr.get('Shadow Playability','—')} | Source: {rr.get('Shadow Source','—')} | Base projection remains {rr.get('Best Projection', rr.get('Projection','—'))}.")
     s1,s2 = st.columns(2)
-    if s1.button("💾 Save Batter Upside shadow snapshot", key="ow_upside_shadow_save_v16", use_container_width=True, type="primary"):
-        added = _ow_save_batter_snapshots(df.head(60), source_label="BATTER_UPSIDE_SHADOW_V16")
+    if s1.button("💾 Save Batter Upside shadow snapshot", key="ow_upside_shadow_save_v17", use_container_width=True, type="primary"):
+        added = _ow_save_batter_snapshots(df.head(60), source_label="BATTER_UPSIDE_SHADOW_V17")
         st.success(f"Saved {added} Batter Upside shadow rows before the games.")
-    if s2.button("✅ Grade Batter Upside shadow snapshot", key="ow_upside_shadow_grade_v16", use_container_width=True):
+    if s2.button("✅ Grade Batter Upside shadow snapshot", key="ow_upside_shadow_grade_v17", use_container_width=True):
         info = _ow_grade_batter_snapshots()
         if info.get("status") == "ERROR": st.error(info.get("error") or "Grading error")
         else: st.success(f"MLB official grading: {info.get('graded',0)} graded · {info.get('waiting_final',0)} waiting · {info.get('voids',0)} void · {info.get('missing',0)} unresolved.")
     hist = load_json(OW_BATTER_RESULT_LOG, [])
-    hist = [r for r in hist if isinstance(r,dict) and str(r.get("snapshot_source") or "").upper() == "BATTER_UPSIDE_SHADOW_V16"] if isinstance(hist,list) else []
+    hist = [r for r in hist if isinstance(r,dict) and str(r.get("snapshot_source") or "").upper() == "BATTER_UPSIDE_SHADOW_V17"] if isinstance(hist,list) else []
     if hist:
         hd = pd.DataFrame(hist)
         rc = "graded_result" if "graded_result" in hd.columns else "Result"
         wins = int(hd[rc].astype(str).str.upper().eq("WIN").sum()); losses = int(hd[rc].astype(str).str.upper().eq("LOSS").sum())
         st.markdown("#### Batter Upside shadow graded history")
         st.caption(f"Record {wins}-{losses} · {'—' if wins+losses==0 else f'{wins/(wins+losses)*100:.1f}%'}")
-        hcols = [c for c in ["Snapshot Date","Player","Team","Opponent","Best Market","Best Pick","Best Line","Best Projection","Base Upside Rank","Shadow Rank","Shadow Rank Change","Shadow Adjusted Score","Upside Shadow Tag","Actual","graded_result","Grade Status"] if c in hd.columns]
+        hcols = [c for c in ["Snapshot Date","Player","Team","Opponent","Best Market","Best Pick","Best Line","Best Projection","Official Play Filter","Shadow Playability","Base Upside Rank","Shadow Rank","Shadow Rank Change","Shadow Adjusted Score","Upside Shadow Tag","Actual","graded_result","Grade Status"] if c in hd.columns]
         st.dataframe(hd[hcols].tail(200), use_container_width=True, hide_index=True)
-    st.info(f"{OW_BATTER_UPSIDE_SHADOW_VERSION_V16} · 75% base score / 25% shadow context · projection impact NONE")
+    st.info(f"{OW_BATTER_UPSIDE_SHADOW_VERSION_V17} · playability-gated shadow context · projection impact NONE")
 
 # Keep the repaired MLB-official grader active regardless of whether full-game
 # projections are opened. The grading system is intentionally independent of
