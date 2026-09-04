@@ -11478,7 +11478,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         return
 
     d = df.copy()
-    sort_cols = [c for c in ["Likely Score", "Overall Rating", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
+    sort_cols = [c for c in ["V19 Rank Bucket", "V19 Gate Score", "Likely Score", "Overall Rating", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
     if sort_cols:
         for c in sort_cols:
             try:
@@ -11660,6 +11660,10 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         .owv4-logo{width:30px;height:30px;flex:0 0 30px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:#0e1724;border:1px solid rgba(126,166,222,.28);font-size:9px;font-weight:900}.owv4-logo img{width:26px!important;height:26px!important;object-fit:contain!important;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))}
         .owv4-name-wrap{min-width:0;flex:1}.owv4-name{font-size:14px;font-weight:900;line-height:1.02;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-meta{font-size:7.5px;color:#b7c0cf;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .owv4-topbox{background:rgba(7,13,22,.66);border:1px solid rgba(70,91,119,.32);border-radius:11px;padding:6px 5px;text-align:center;display:flex;flex-direction:column;justify-content:center;min-width:0}.owv4-topbox span{font-size:6.5px;letter-spacing:.4px;color:#8f9aac;font-weight:800}.owv4-topbox b{font-size:12px;line-height:1.1;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-market b{color:#f25bd9}.owv4-line b{color:#fff4ce}.owv4-likely b{color:#68efa7}.owv4-best{font-size:7px;color:#f6c43c!important;margin-top:2px!important}
+        .owv4-v19{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:6px;align-items:center;margin-top:7px;padding:6px 7px;border:1px solid rgba(91,231,166,.42);border-radius:10px;background:linear-gradient(90deg,rgba(25,124,87,.20),rgba(23,38,59,.66));box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+        .owv4-v19.bad{border-color:rgba(255,98,120,.62);background:linear-gradient(90deg,rgba(135,26,48,.27),rgba(23,38,59,.66))}
+        .owv4-v19.watch{border-color:rgba(247,201,72,.58);background:linear-gradient(90deg,rgba(148,106,22,.22),rgba(23,38,59,.66))}
+        .owv4-v19 span{display:block;font-size:6.1px;letter-spacing:.45px;color:#9fb0c4;font-weight:900}.owv4-v19 b{display:block;font-size:10px;color:#eef6ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}.owv4-v19 small{display:block;font-size:6.2px;color:#b8c4d4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}.owv4-v19-score{text-align:right}.owv4-v19-score b{font-size:13px;color:#64eea7}
         .owv4-scores{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:7px}.owv4-score{background:rgba(9,16,26,.68);border:1px solid rgba(63,81,108,.35);border-radius:9px;padding:5px 6px;min-width:0}.owv4-score-head{display:flex;justify-content:space-between;gap:5px;align-items:center;font-size:7px;font-weight:900}.owv4-score-head span{color:var(--accent)}.owv4-score-head b{font-size:10px;color:#edf1f7}.owv4-track{height:5px;background:#1c2939;border-radius:99px;overflow:hidden;margin-top:4px}.owv4-track i{display:block;height:100%;background:var(--accent);border-radius:99px;box-shadow:0 0 8px color-mix(in srgb,var(--accent) 35%,transparent)}
         .owv4-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:5px;margin-top:6px}.owv4-metric{background:rgba(10,18,29,.80);border:1px solid #253349;border-radius:9px;padding:5px;min-height:42px}.owv4-metric span{display:block;font-size:6px;color:#8fa0b4;font-weight:850;letter-spacing:.25px}.owv4-metric b{display:block;font-size:11px;font-weight:900;margin-top:2px;line-height:1}.owv4-metric small{display:block;font-size:6.2px;color:#9eabba;margin-top:3px;line-height:1.03;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .owv4-intel{display:grid;grid-template-columns:1.08fr .92fr;gap:6px;margin-top:6px}.owv4-panel{background:linear-gradient(145deg,rgba(8,17,28,.90),rgba(10,20,31,.76));border:1px solid rgba(48,83,122,.48);border-radius:10px;padding:6px;min-width:0}.owv4-panel-title{font-size:6.5px;font-weight:900;color:#aa73ff;letter-spacing:.35px;margin-bottom:4px}.owv4-pitch-main{display:flex;align-items:center;gap:6px}.owv4-opp-logo{width:24px;height:24px;flex:0 0 24px;display:flex;align-items:center;justify-content:center}.owv4-opp-logo img{width:22px!important;height:22px!important;object-fit:contain!important}.owv4-pitch-name{font-size:9px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-hand{font-size:6px;color:#c493ff;background:rgba(92,49,136,.28);padding:2px 4px;border-radius:5px;margin-left:3px}.owv4-pitch-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:3px;margin-top:5px}.owv4-pstat{text-align:center}.owv4-pstat span,.owv4-wx span{display:block;font-size:5.5px;color:#8090a4;font-weight:800}.owv4-pstat b,.owv4-wx b{display:block;font-size:8px;color:#f1f4fa;margin-top:1px}.owv4-profile{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:5px;padding-top:4px;border-top:1px solid rgba(64,82,106,.28)}.owv4-profile strong{font-size:7px;color:#ff778b}.owv4-prof-track{height:4px;flex:1;max-width:70px;background:#2a1b28;border-radius:99px;overflow:hidden}.owv4-prof-track i{display:block;height:100%;background:linear-gradient(90deg,#ff4466,#ff9b48);border-radius:99px}
@@ -11669,6 +11673,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         @media(max-width:700px){
           .owv4-list{gap:6px;margin-top:5px}.owv4-card{padding:6px;border-radius:13px}
           .owv4-top{grid-template-columns:minmax(0,1.38fr) repeat(3,minmax(54px,.55fr));gap:4px}.owv4-player{padding:4px 5px;gap:5px;border-radius:8px}.owv4-rank{width:22px;height:22px;flex-basis:22px;font-size:7px;border-radius:6px}.owv4-logo{width:23px;height:23px;flex-basis:23px;border-radius:7px}.owv4-logo img{width:20px!important;height:20px!important}.owv4-name{font-size:10px}.owv4-meta{font-size:5.7px;margin-top:2px}.owv4-topbox{padding:3px 2px;border-radius:8px}.owv4-topbox span{font-size:5px}.owv4-topbox b{font-size:8px}.owv4-best{font-size:5.2px!important}
+          .owv4-v19{grid-template-columns:minmax(0,1fr) 48px;gap:4px;margin-top:4px;padding:3px 4px;border-radius:7px}.owv4-v19 span{font-size:4.8px}.owv4-v19 b{font-size:7.1px}.owv4-v19 small{font-size:4.8px}.owv4-v19-score b{font-size:8px}
           .owv4-scores{gap:4px;margin-top:4px}.owv4-score{padding:3px 4px;border-radius:7px}.owv4-score-head{font-size:5.5px}.owv4-score-head b{font-size:7px}.owv4-track{height:3px;margin-top:2px}
           .owv4-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:4px}.owv4-metric{padding:3px 4px;min-height:29px;border-radius:7px}.owv4-metric span{font-size:4.8px}.owv4-metric b{font-size:8px;margin-top:1px}.owv4-metric small{font-size:4.9px;margin-top:1px}
           .owv4-intel{grid-template-columns:1.04fr .96fr;gap:4px;margin-top:4px}.owv4-panel{padding:4px;border-radius:8px}.owv4-panel-title{font-size:5.2px;margin-bottom:2px}.owv4-pitch-main{gap:4px}.owv4-opp-logo{width:18px;height:18px;flex-basis:18px}.owv4-opp-logo img{width:17px!important;height:17px!important}.owv4-pitch-name{font-size:6.5px}.owv4-hand{font-size:4.8px;padding:1px 3px}.owv4-pitch-stats{gap:1px;margin-top:3px}.owv4-pstat span,.owv4-wx span{font-size:4.2px}.owv4-pstat b,.owv4-wx b{font-size:5.8px}.owv4-profile{margin-top:3px;padding-top:2px}.owv4-profile strong{font-size:5.1px}.owv4-prof-track{height:3px;max-width:44px}
@@ -11883,6 +11888,25 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         pa_txt = _ow_fmt_slate_num(pa, 1)
         best_txt = _ow_fmt_slate_num(best_score, 1)
         likely_txt = _ow_fmt_slate_num(likely, 0)
+        v19_gate = poster_value(row, "V19 Win-Rate Gate", default="")
+        v19_route = poster_value(row, "V19 Route Guard", default="")
+        v19_shape = poster_value(row, "V19 Shape Gate", default="")
+        v19_need = poster_value(row, "V19 Needed Before Play", default="")
+        v19_score = first_num(row, ["V19 Gate Score"], None)
+        v19_gate_upper = str(v19_gate or "").upper()
+        if not v19_gate_upper or v19_gate_upper == "—":
+            v19_class = "watch"
+            v19_gate = "V19 GATE NOT BUILT"
+        elif any(x in v19_gate_upper for x in ["PASS", "RESEARCH", "FIX"]):
+            v19_class = "bad"
+        elif any(x in v19_gate_upper for x in ["VERIFY", "WATCH"]):
+            v19_class = "watch"
+        else:
+            v19_class = ""
+        v19_detail = " · ".join([x for x in [str(v19_route or "").strip(), str(v19_shape or "").strip()] if x and x != "—"])
+        if v19_need and str(v19_need).strip() not in {"", "—", "OK"}:
+            v19_detail = (v19_detail + " · " if v19_detail else "") + str(v19_need).strip()
+        v19_score_txt = "—" if v19_score is None else f"{v19_score:.0f}"
 
         cards.append(textwrap.dedent(f"""
           <div class="owv4-card">
@@ -11898,6 +11922,11 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
               <div class="owv4-topbox owv4-market"><span>MARKET</span><b>{esc(market_short)}</b></div>
               <div class="owv4-topbox owv4-line"><span>LINE</span><b>{esc(pick_txt)} {esc(line_txt)}</b></div>
               <div class="owv4-topbox owv4-likely"><span>LIKELY</span><b>{esc(likely_txt)}</b><span class="owv4-best">BEST {esc(best_txt)}</span></div>
+            </div>
+
+            <div class="owv4-v19 {esc(v19_class)}">
+              <div><span>V19 WIN-RATE GATE</span><b>{esc(v19_gate)}</b><small>{esc(v19_detail or 'tracker gate pending')}</small></div>
+              <div class="owv4-v19-score"><span>SCORE</span><b>{esc(v19_score_txt)}</b></div>
             </div>
 
             <div class="owv4-scores">
