@@ -45288,6 +45288,592 @@ def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
     ok = save_json(OW_BATTER_PICK_LOG, picks[-20000:])
     return {"added": added, "rows": len(df), "skipped": skipped, "unresolved": unresolved, "saved": bool(ok), "snapshot_date": dd}
 
+
+# -------------------------
+# V19 TRACKER-INFORMED GRADING + WIN-RATE GATES
+# -------------------------
+OW_PROJECTION_CSV_GRADER_VERSION_V19 = "OW_EXPORTED_PROJECTION_CSV_GRADER_V19_2026_09_04"
+OW_BATTER_SELECTION_GATE_VERSION_V19 = "OW_BATTER_SELECTION_GATE_V19_2026_09_04"
+OW_SEP3_TRACKED_AUDIT_VERSION_V19 = "OW_SEP3_TRACKED_BATTER_AUDIT_V19_2026_09_04"
+OW_SEP3_TRACKED_AUDIT_DATE_V19 = "2026-09-03"
+
+OW_SEP3_TRACKED_GAMES_V19 = [
+    {
+        "Date": "2026-09-03", "Game": "SF @ PIT", "Final": "PIT 5-2",
+        "Environment": "LOW-VOLUME CONTROL / SUPPRESSION", "Primary Attack": "PIT",
+        "Timing": "FULL-GAME LOW VOLUME",
+        "Batter Lesson": "A team can lead comfortably without creating a true HRR/HR feast.",
+        "MoneyLine Lesson": "Run prevention mattered more than explosion; do not overrate small leads as offense dominance.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "TOR @ CLE", "Final": "TOR 6-3",
+        "Environment": "MIDDLE-INNING TORONTO BURST", "Primary Attack": "TOR",
+        "Timing": "5TH-INNING LINEUP CHAIN",
+        "Batter Lesson": "Toronto generated a concentrated HRR/RBI chain, but this was not a full-game shootout.",
+        "MoneyLine Lesson": "One decisive scoring cluster plus late insurance can beat a neutral early read.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "CWS @ HOU", "Final": "HOU 6-2",
+        "Environment": "EARLY STARTER-COLLAPSE CONTROL", "Primary Attack": "HOU",
+        "Timing": "1ST-3RD STARTER DAMAGE",
+        "Batter Lesson": "Houston validated team HRR-chain support early, then both offenses were suppressed late.",
+        "MoneyLine Lesson": "Early favorite separation is strongest when the bullpen can freeze the game after the burst.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "BOS @ BAL", "Final": "BOS 6-5",
+        "Environment": "LATE BULLPEN CASCADE", "Primary Attack": "BOS LATE / BOTH PRESSURE",
+        "Timing": "6TH-9TH RELIEF DAMAGE",
+        "Batter Lesson": "Final score came from late lineup-chain pressure, not a starter-driven pregame explosion.",
+        "MoneyLine Lesson": "Bullpen reliability and late run prevention were the deciding MoneyLine variables.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "MIL @ CHC", "Final": "CHC 2-1",
+        "Environment": "EXTREME SUPPRESSION / FALSE HIGH-SCORE", "Primary Attack": "NEITHER",
+        "Timing": "FULL-GAME SUPPRESSION",
+        "Batter Lesson": "Projected high-score environment failed; this is the slate's cleanest false-high-score negative.",
+        "MoneyLine Lesson": "Pre-game game-total optimism needs a pitcher/leash/suppression override.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "MIA @ KC", "Final": "KC 7-3",
+        "Environment": "MODERATE TRAFFIC TO KC LATE SEPARATION", "Primary Attack": "KC",
+        "Timing": "8TH-INNING SEPARATION",
+        "Batter Lesson": "Useful HRR traffic, but Kansas City's late burst separated it from a true balanced shootout.",
+        "MoneyLine Lesson": "Late offensive depth and opponent bullpen cracks created the final margin.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "TB @ TEX", "Final": "TEX 6-0",
+        "Environment": "ONE-SIDED CONTROL / OPPONENT SUPPRESSION", "Primary Attack": "TEX",
+        "Timing": "MIDDLE-INNING BURST",
+        "Batter Lesson": "Texas team-side upside should grade up; Tampa Bay batter upside should be strongly suppressed.",
+        "MoneyLine Lesson": "One-sided run creation plus opponent silence is the cleanest favorite/side validation shape.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "ATH @ SEA", "Final": "ATH 6-4",
+        "Environment": "TWO-SIDED TRAFFIC / LEAD HOLD", "Primary Attack": "ATH",
+        "Timing": "EARLY TRAFFIC, LATE HOLD",
+        "Batter Lesson": "Early two-sided traffic mattered, but the winning side created more usable run conversion.",
+        "MoneyLine Lesson": "Lead quality plus bullpen hold should be separated from raw combined runs.",
+    },
+    {
+        "Date": "2026-09-03", "Game": "STL @ LAD", "Final": "STL 8-6",
+        "Environment": "LATE COMEBACK / EXTRA-INNING BULLPEN COLLAPSE", "Primary Attack": "STL LATE / BOTH",
+        "Timing": "8TH-10TH BULLPEN DAMAGE",
+        "Batter Lesson": "Good for late HRR/RBI cascade, but route/pitcher sanity is mandatory before using projections.",
+        "MoneyLine Lesson": "Late bullpen collapse can flip a strong favorite profile; protect ML grading from starter-only reads.",
+    },
+]
+
+OW_PITCHER_TEAM_GUARD_V19 = {
+    "TARIK SKUBAL": "DET",
+}
+
+
+def _ow_sep3_pair_key_v19(team, opp):
+    a = _ow_team_abbr(team)
+    b = _ow_team_abbr(opp)
+    if a in (None, "", "—") or b in (None, "", "—"):
+        return None
+    return tuple(sorted([a, b]))
+
+
+def _ow_sep3_truth_map_v19():
+    out = {}
+    for g in OW_SEP3_TRACKED_GAMES_V19:
+        txt = str(g.get("Game") or "")
+        teams = [x.strip() for x in txt.replace("@", " ").split() if x.strip()]
+        if len(teams) >= 2:
+            key = _ow_sep3_pair_key_v19(teams[0], teams[1])
+            if key:
+                out[key] = dict(g)
+    return out
+
+
+def _ow_v19_present(value):
+    try:
+        return _ow_csv_value_present_v18(value)
+    except Exception:
+        try:
+            if value is None or pd.isna(value):
+                return False
+        except Exception:
+            if value is None:
+                return False
+        return str(value).strip() not in {"", "—", "None", "nan", "NaN", "N/A"}
+
+
+def _ow_num_v19(row, keys, default=None, pct=False):
+    r = row or {}
+    for key in keys:
+        try:
+            if key not in r or not _ow_v19_present(r.get(key)):
+                continue
+            value = r.get(key)
+            if isinstance(value, str):
+                value = value.replace("%", "").replace(",", "").strip()
+            num = _v3_safe_num(value, None)
+            if num is None:
+                continue
+            if pct and 0 <= float(num) <= 1:
+                return float(num) * 100.0
+            return float(num)
+        except Exception:
+            continue
+    return default
+
+
+def _ow_text_blob_v19(row, keys=None):
+    r = row or {}
+    if keys is None:
+        keys = [
+            "Official Play Filter", "Opportunity Tier", "Daily Data Label", "Daily Data Warnings",
+            "No-Bet Risk Flags", "Data Flags", "Final Data Guardrail Label", "Result Gate Label",
+            "Lineup Status", "Lineup Source", "Matchup Data Status", "Pitcher Matchup Verified",
+            "Opp Pitcher", "Pitcher Confirmed", "Pitcher Contact/Leash Label", "Pitcher Contact/Leash Note",
+            "Starter Leash Label", "Team Run Environment", "Blowout Risk Label", "Blowout Note",
+            "High Scoring Game Label", "Game V3 Label", "Bullpen V3 Label", "Bullpen V3 Note",
+            "Schedule Guard", "Schedule Guard Reason", "Opponent Routing Status",
+        ]
+    parts = []
+    for key in keys:
+        try:
+            value = r.get(key)
+            if _ow_v19_present(value):
+                parts.append(str(value))
+        except Exception:
+            pass
+    return " | ".join(parts).upper()
+
+
+def _ow_csv_market_fallback_v19(row):
+    r = row or {}
+    market = _ow_first_csv_value_v18(r, "Market", "Best Market", "Market Label", "Prop Market")
+    if _ow_v19_present(market):
+        return str(market).strip()
+    txt = _ow_text_blob_v19(r, [
+        "Official Play Filter", "Opportunity Tier", "Best Market", "HRR Pick", "HR Pick",
+        "HRR Line", "HR Line", "HR Projection", "HRR Projection",
+    ])
+    if "HOME RUN" in txt or re.search(r"\bHR\b", txt):
+        return "Home Runs"
+    if "H+R+RBI" in txt or "HRR" in txt:
+        return "H+R+RBI"
+    return ""
+
+
+def _ow_row_market_v19(row):
+    r = row or {}
+    return str(
+        r.get("Market") or r.get("Best Market") or r.get("Market Label") or _ow_csv_market_fallback_v19(r) or ""
+    ).upper()
+
+
+def _ow_route_guard_for_row_v19(row, schedule=None, snapshot_date=None):
+    r = row or {}
+    issues = []
+    needs = []
+    team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
+    opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
+    pair = _ow_sep3_pair_key_v19(team, opp)
+    if team in (None, "", "—"):
+        issues.append("MISSING_TEAM")
+        needs.append("team")
+    if opp in (None, "", "—"):
+        issues.append("MISSING_OPPONENT")
+        needs.append("opponent")
+
+    pk = _ow_csv_id_text_v18(r.get("Game PK") or r.get("GamePk") or r.get("gamePk") or r.get("game_pk"))
+    if pk:
+        meta = {}
+        try:
+            if schedule:
+                meta = next((g for g in schedule if str(g.get("game_pk")) == str(pk)), {}) or {}
+            if not meta:
+                meta = _ow_guard_game_pk_meta(pk) or {}
+        except Exception:
+            meta = {}
+        mpair = meta.get("pair") if isinstance(meta, dict) else None
+        mdate = _ow_guard_date_text(meta.get("date")) if isinstance(meta, dict) else None
+        target_date = _ow_guard_date_text(snapshot_date or r.get("Official Game Date") or r.get("Opponent Routing Date") or r.get("Snapshot Date"))
+        if pair and mpair and tuple(mpair) != tuple(pair):
+            issues.append("GAMEPK_TEAM_MISMATCH")
+            needs.append("correct Game PK")
+        if target_date and mdate and str(mdate) != str(target_date):
+            issues.append("GAMEPK_DATE_MISMATCH")
+            needs.append("correct game date")
+
+    pitcher_ok = str(r.get("Pitcher Matchup Verified") or r.get("Pitcher Confirmed") or "").strip().upper()
+    if pitcher_ok in {"FALSE", "NO", "0"}:
+        issues.append("PITCHER_NOT_VERIFIED")
+        needs.append("confirmed pitcher")
+    blob = _ow_text_blob_v19(r)
+    if any(x in blob for x in ["VERIFY PITCHER", "PITCHER MISMATCH", "WRONG PITCHER", "ROUTE MISMATCH"]):
+        issues.append("PITCHER_ROUTE_WARNING")
+        needs.append("pitcher route audit")
+    opp_pitcher = str(r.get("Opp Pitcher") or r.get("Pitcher") or "").upper().strip()
+    for name, pitcher_team in OW_PITCHER_TEAM_GUARD_V19.items():
+        if name in opp_pitcher and opp and opp != pitcher_team:
+            issues.append("PITCHER_TEAM_MISMATCH")
+            needs.append(f"{name.title()} belongs to {pitcher_team}")
+
+    if not issues:
+        return "ROUTE OK", 0.0, "OK"
+    severe = any(x in issues for x in ["GAMEPK_TEAM_MISMATCH", "GAMEPK_DATE_MISMATCH", "PITCHER_TEAM_MISMATCH"])
+    penalty = 28.0 if severe else 12.0
+    label = "ROUTE/PITCHER FIX FIRST" if severe else "VERIFY ROUTE/PITCHER"
+    return label, penalty, "; ".join(dict.fromkeys(needs or issues))
+
+
+def _ow_thin_data_risk_v19(row):
+    r = row or {}
+    blob = _ow_text_blob_v19(r)
+    data_conf = _ow_num_v19(r, ["Data Confidence", "Data Coverage %", "Verification Readiness %"], None)
+    split_pa = _ow_num_v19(r, ["Split PA", "Batter Pitch PA"], None)
+    season_pa = _ow_num_v19(r, ["Season PA", "Profile PA"], None)
+    samples = _ow_num_v19(r, ["Result Gate Samples", "Batter Learning Samples", "Projection Calibration Samples"], None)
+    points = 0.0
+    reasons = []
+    if any(x in blob for x in ["VERY THIN", "THIN_DATA", "DAILY DATA THIN", "VERIFY DAILY DATA"]):
+        points += 10.0
+        reasons.append("thin daily/split data")
+    if data_conf is not None and data_conf < 70:
+        points += 6.0
+        reasons.append("data confidence under 70")
+    if split_pa is not None and split_pa < 25:
+        points += 5.0
+        reasons.append("small split PA")
+    if season_pa is not None and season_pa < 80:
+        points += 5.0
+        reasons.append("small season PA")
+    if samples is not None and samples < 3:
+        points += 3.0
+        reasons.append("no graded history")
+    if "LINEUP NOT CONFIRMED" in blob or "VERIFY LINEUP" in blob:
+        points += 5.0
+        reasons.append("lineup not confirmed")
+    if points >= 16:
+        return "VERY THIN / RESEARCH ONLY", points, "; ".join(dict.fromkeys(reasons))
+    if points >= 8:
+        return "THIN / VERIFY", points, "; ".join(dict.fromkeys(reasons))
+    return "DATA OK", points, "OK"
+
+
+def _ow_shape_gate_v19(row):
+    r = row or {}
+    blob = _ow_text_blob_v19(r)
+    market = _ow_row_market_v19(r)
+    team_runs = _ow_num_v19(r, ["Team Runs V3", "Team Implied Runs", "Projected Team Runs", "Team Run Projection"], None)
+    game_total = _ow_num_v19(r, ["Game Total V3", "Projected Game Total", "Game Total", "Projected Total"], None)
+    game_score = _ow_num_v19(r, ["Game V3 Score", "High Scoring Game Score", "High Scoring Game Score Legacy"], None)
+    team_explosion = _ow_num_v19(r, ["Team Explosion %"], None, pct=True)
+    suppression = _ow_num_v19(r, ["Suppression Risk %", "Pitcher Under Suppression Score"], None, pct=True)
+    pa = _ow_num_v19(r, ["Projected PA", "PA Projection"], None)
+    slot = _ow_num_v19(r, ["Lineup Slot", "Projected Lineup Slot"], None)
+    line = _ow_num_v19(r, ["Line", "Best Line", "HRR Line", "HR Line"], None)
+    pitcher_era = _ow_num_v19(r, ["Pitcher ERA", "Opp Pitcher ERA"], None)
+    pitcher_whip = _ow_num_v19(r, ["Pitcher WHIP", "Opp Pitcher WHIP"], None)
+    pitcher_h9 = _ow_num_v19(r, ["Pitcher H/9", "Opp Pitcher H/9", "Pitcher Recent H/9"], None)
+    pitcher_hr9 = _ow_num_v19(r, ["Pitcher HR9", "Pitcher Recent HR/9"], None)
+    pitcher_k = _ow_num_v19(r, ["Pitcher K%", "Pitcher Recent K%"], None, pct=True)
+    hr_score = _ow_num_v19(r, ["HR Score", "HR Composite Score V3", "HR Power Score V2", "HR Environment %"], None, pct=True)
+    bullpen_score = _ow_num_v19(r, ["Bullpen V3 Score"], None, pct=True)
+    bullpen_factor = _ow_num_v19(r, ["Bullpen Factor", "Bullpen/Leash Factor"], None)
+    notes = []
+    support = 0.0
+    penalty = 0.0
+
+    starter_collapse = False
+    if (pitcher_era is not None and pitcher_era >= 4.75) or (pitcher_whip is not None and pitcher_whip >= 1.35) or (pitcher_h9 is not None and pitcher_h9 >= 8.8):
+        starter_collapse = True
+    if pitcher_hr9 is not None and pitcher_hr9 >= 1.25:
+        starter_collapse = True
+    if any(x in blob for x in ["BALLS IN PLAY BOOST", "BLOWOUT STACK", "POWER-VULNERABLE", "SHORT LEASH"]):
+        starter_collapse = True
+    if starter_collapse:
+        support += 7.0
+        notes.append("starter-collapse edge")
+
+    hrr_chain = bool(pa is not None and pa >= 4.45 and (slot is None or slot <= 6) and (team_runs is None or team_runs >= 4.35))
+    if hrr_chain:
+        support += 5.0
+        notes.append("top-six PA/HRR chain")
+
+    late_cascade = False
+    if any(x in blob for x in ["BULLPEN TIRED", "TIRED", "EXHAUSTED", "B2B RELIEVERS", "SHORT LEASH"]):
+        late_cascade = True
+    if bullpen_score is not None and bullpen_score >= 68:
+        late_cascade = True
+    if bullpen_factor is not None and bullpen_factor >= 1.04:
+        late_cascade = True
+    if late_cascade:
+        support += 3.0
+        notes.append("late bullpen cascade watch")
+
+    false_high_score = False
+    strong_starter = False
+    if (pitcher_era is not None and pitcher_era <= 3.30) or (pitcher_whip is not None and pitcher_whip <= 1.12) or (pitcher_h9 is not None and pitcher_h9 <= 7.2):
+        strong_starter = True
+    if pitcher_k is not None and pitcher_k >= 27:
+        strong_starter = True
+    if any(x in blob for x in ["STRIKEOUT RISK", "UNDER FRIENDLY", "HR-SUPPRESSOR", "NORMAL LEASH", "DEEP LEASH"]):
+        strong_starter = True
+    if (game_total is not None and game_total >= 9.0) or (game_score is not None and game_score >= 58):
+        if strong_starter and not starter_collapse:
+            false_high_score = True
+    if false_high_score:
+        penalty += 10.0
+        notes.append("false high-score risk")
+
+    team_suppression = False
+    if team_runs is not None and team_runs < 4.25:
+        team_suppression = True
+    if suppression is not None and suppression >= 63:
+        team_suppression = True
+    if any(x in blob for x in ["RUN SUPPRESSED", "SUPPRESSION", "UNDER_OR_PASS", "PASS / DAILY DATA THIN"]):
+        team_suppression = True
+    if team_suppression and not hrr_chain:
+        penalty += 8.0
+        notes.append("team/offense suppression")
+
+    if ("HOME RUN" in market or market == "HR") and hr_score is not None and hr_score < 58:
+        penalty += 7.0
+        notes.append("HR power/env not strong")
+
+    if line is not None and line <= 0.5 and (pa is None or pa >= 4.1):
+        support += 2.0
+        notes.append("low line volume support")
+
+    if false_high_score:
+        label = "FALSE HIGH-SCORE WATCH"
+    elif team_suppression and penalty > support:
+        label = "SUPPRESSION DOWNGRADE"
+    elif starter_collapse and hrr_chain:
+        label = "STARTER COLLAPSE + HRR CHAIN"
+    elif starter_collapse:
+        label = "STARTER-COLLAPSE EDGE"
+    elif late_cascade and hrr_chain:
+        label = "HRR CHAIN + BULLPEN CASCADE"
+    elif hrr_chain:
+        label = "HRR CHAIN SUPPORT"
+    else:
+        label = "NEUTRAL / NEED EDGE"
+    return label, support, penalty, "; ".join(dict.fromkeys(notes or ["neutral shape"]))
+
+
+def _ow_base_score_v19(row):
+    r = row or {}
+    for key in [
+        "Shadow Adjusted Score", "Overall Rating", "Sync Score", "Upside Score",
+        "Best Win/Hit %", "Win Probability %", "Over Probability %", "HR Probability %",
+        "HR Probability", "HR Score", "Game V3 Score", "High Scoring Game Score",
+    ]:
+        value = _ow_num_v19(r, [key], None, pct=("Probability" in key and key != "HR Probability %"))
+        if value is not None:
+            if key == "HR Probability" and value <= 1:
+                value *= 100.0
+            return float(clamp(value, 0, 100))
+    return 50.0
+
+
+def _ow_official_bucket_v19(row):
+    blob = _ow_text_blob_v19(row)
+    if "OFFICIAL HRR LEAN" in blob or "OFFICIAL HR V2 WATCH" in blob or "STRONG HR V2 SPRINKLE" in blob:
+        return "OFFICIAL", 4
+    if "H+R+RBI OPPORTUNITY" in blob or "HR OPPORTUNITY" in blob or "SPRINKLE" in blob:
+        return "OPPORTUNITY", 3
+    if "VERIFY LINEUP" in blob or "OPPORTUNITY / VERIFY" in blob:
+        return "VERIFY", 2
+    if "PASS" in blob or "RESEARCH" in blob or "THIN" in blob:
+        return "RESEARCH", 1
+    return "WATCH", 2
+
+
+def _ow_apply_batter_selection_gates_v19(df, board_name=""):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    rows = []
+    for idx, rr in d.reset_index(drop=True).iterrows():
+        r = rr.to_dict()
+        official, official_bucket = _ow_official_bucket_v19(r)
+        route_label, route_penalty, route_need = _ow_route_guard_for_row_v19(r)
+        thin_label, thin_penalty, thin_need = _ow_thin_data_risk_v19(r)
+        shape_label, shape_support, shape_penalty, shape_note = _ow_shape_gate_v19(r)
+        base = _ow_base_score_v19(r)
+        gate_score = float(clamp(base + shape_support - shape_penalty - route_penalty - thin_penalty, 0, 100))
+        severe_route = route_penalty >= 25
+        severe_thin = thin_penalty >= 16
+        if severe_route:
+            gate = "PASS UNTIL ROUTE/PITCHER FIX"
+            bucket = 0
+        elif severe_thin:
+            gate = "RESEARCH ONLY - THIN DATA"
+            bucket = 1
+        elif "FALSE HIGH-SCORE" in shape_label and gate_score < 72:
+            gate = "WATCH ONLY - FALSE HIGH-SCORE RISK"
+            bucket = 2
+        elif "SUPPRESSION" in shape_label and gate_score < 66:
+            gate = "PASS/LEAN AWAY - SUPPRESSION"
+            bucket = 1
+        elif official == "OFFICIAL" and gate_score >= 64:
+            gate = "OFFICIAL - TRACKER SUPPORTED"
+            bucket = 5
+        elif official in {"OFFICIAL", "OPPORTUNITY"} and gate_score >= 58:
+            gate = "LEAN - TRACKER SUPPORTED"
+            bucket = 4
+        elif official in {"OFFICIAL", "OPPORTUNITY", "VERIFY"}:
+            gate = "VERIFY BEFORE PLAY"
+            bucket = 3
+        else:
+            gate = "WATCH / RESEARCH"
+            bucket = 2
+        needed = [x for x in [route_need if route_label != "ROUTE OK" else "", thin_need if thin_label != "DATA OK" else "", shape_note] if x and x != "OK"]
+        r.update({
+            "V19 Base Score": round(base, 1),
+            "V19 Gate Score": round(gate_score, 1),
+            "V19 Rank Bucket": int(bucket),
+            "V19 Win-Rate Gate": gate,
+            "V19 Route Guard": route_label,
+            "V19 Shape Gate": shape_label,
+            "V19 Thin Data Risk": thin_label,
+            "V19 Official Bucket": official,
+            "V19 Shape Support": round(float(shape_support), 1),
+            "V19 Shape Penalty": round(float(shape_penalty), 1),
+            "V19 Total Penalty": round(float(shape_penalty + route_penalty + thin_penalty), 1),
+            "V19 Needed Before Play": "; ".join(dict.fromkeys(needed)) or "OK",
+            "V19 Gate Version": OW_BATTER_SELECTION_GATE_VERSION_V19,
+            "Projection Impact": r.get("Projection Impact") or "NONE",
+        })
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    sort_cols = [c for c in ["V19 Rank Bucket", "V19 Gate Score", "Shadow Adjusted Score", "Overall Rating", "Sync Score"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last").reset_index(drop=True)
+    return out
+
+
+def _ow_import_batter_snapshot_csv_v6(file_bytes, snapshot_date):
+    """V19 recovery importer: accepts exported boards, preserves frozen projections, and repairs route IDs."""
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception as exc:
+        return {"added": 0, "rows": 0, "error": f"CSV read failed: {exc}"}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"added": 0, "rows": 0, "error": "CSV is empty"}
+    dd = _ow_guard_date_text(snapshot_date)
+    if not dd:
+        return {"added": 0, "rows": len(df), "error": "Choose the official slate date"}
+    picks = load_json(OW_BATTER_PICK_LOG, [])
+    if not isinstance(picks, list):
+        picks = []
+    existing = {_ow_batter_result_key(x) for x in picks if isinstance(x, dict)}
+    added = skipped = unresolved = route_warnings = 0
+    schedule = _ow_guard_schedule_records(dd)
+    by_pk = {str(g.get("game_pk")): g for g in schedule if g.get("game_pk")}
+
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        player = str(_ow_first_csv_value_v18(row, "Player", "UD Player", "Name") or "").strip()
+        market = str(_ow_csv_market_fallback_v19(row) or "").strip()
+        line = _v3_safe_num(_ow_first_csv_value_v18(row, "Line", "Best Line", "HRR Line", "HR Line", "Prop Line"), None)
+        pick = _ow_first_csv_value_v18(row, "Pick", "Best Pick", "Model Side", "HRR Pick", "HR Pick", "Side", "Selection")
+        side = _ow_batter_pick_side(pick, market)
+        if not player or not market or line is None or not side:
+            skipped += 1
+            continue
+
+        team = _ow_team_abbr(_ow_first_csv_value_v18(row, "Team", "Raw Log Team", "UD Team"))
+        opp = _ow_team_abbr(_ow_first_csv_value_v18(row, "Opponent", "Today Opponent"))
+        pid = _ow_csv_id_text_v18(_ow_first_csv_value_v18(row, "Player ID", "MLB Player ID"))
+        if not pid:
+            try:
+                pid = _mlb_search_player_id_by_name(player)
+            except Exception:
+                pid = None
+
+        pair = _ow_sep3_pair_key_v19(team, opp)
+        cands = [g for g in schedule if pair and g.get("pair") == pair]
+        csv_game_pk = _ow_csv_id_text_v18(_ow_first_csv_value_v18(row, "Game PK", "GamePk", "gamePk", "game_pk"))
+        csv_date = _ow_guard_date_text(_ow_first_csv_value_v18(row, "Official Game Date", "Opponent Routing Date", "Game Date", "Date"))
+        csv_meta = by_pk.get(str(csv_game_pk)) if csv_game_pk else {}
+        if csv_game_pk and not csv_meta:
+            try:
+                csv_meta = _ow_guard_game_pk_meta(csv_game_pk) or {}
+            except Exception:
+                csv_meta = {}
+        csv_pair_ok = bool(csv_game_pk and (not pair or not csv_meta or csv_meta.get("pair") == pair))
+        csv_date_ok = bool(csv_game_pk and (not csv_meta or not csv_meta.get("date") or str(_ow_guard_date_text(csv_meta.get("date"))) == str(dd)))
+        chosen = None
+        reason = ""
+        if csv_game_pk and csv_pair_ok and csv_date_ok:
+            chosen = csv_meta or {"game_pk": csv_game_pk, "date": csv_date or dd}
+            reason = "RECOVERY_IMPORT_CSV_GAMEPK_VERIFIED"
+        elif cands:
+            chosen = None
+            if pid and len(cands) > 1:
+                present = [g for g in cands if _ow_guard_player_present_in_game(g.get("game_pk"), pid)]
+                if len(present) == 1:
+                    chosen = present[0]
+            chosen = chosen or cands[0]
+            reason = "RECOVERY_IMPORT_EXACT_PAIR_REPAIRED_GAMEPK"
+        elif csv_game_pk:
+            chosen = csv_meta or {"game_pk": csv_game_pk, "date": csv_date or dd}
+            reason = "RECOVERY_IMPORT_CSV_GAMEPK_UNVERIFIED"
+        else:
+            chosen = {}
+            reason = "RECOVERY_IMPORT_NEEDS_SCHEDULE_RESOLUTION"
+
+        if chosen and chosen.get("away") and chosen.get("home") and team not in (None, "", "—"):
+            opp = chosen.get("home") if team == chosen.get("away") else chosen.get("away")
+        snap = dict(row)
+        snap.update({
+            "Player": player,
+            "Market": market,
+            "Line": float(line),
+            "Pick": pick,
+            "Pick Side": side,
+            "Team": team,
+            "Opponent": opp,
+            "Snapshot Date": dd,
+            "Official Game Date": (chosen or {}).get("date") or csv_date or dd,
+            "Player ID": pid,
+            "Game PK": (chosen or {}).get("game_pk") or csv_game_pk,
+            "CSV Game PK": csv_game_pk,
+            "CSV Game PK Trusted": bool(csv_game_pk and csv_pair_ok and csv_date_ok),
+            "snapshot_type": "BATTER_BEFORE_GAME_RECOVERY_IMPORT",
+            "snapshot_source": "RECOVERY_CSV",
+            "official_snapshot_saved_at": now_iso(),
+            "graded": False,
+            "Grade Status": "RECOVERED CSV / WAITING MLB GRADE",
+            "Grade Source": "PENDING_MLB_OFFICIAL",
+            "Projection Version": row.get("Projection Version") or OW_FINAL_LINE_PROJECTION_VERSION,
+            "Schedule Guard Version": OW_SCHEDULE_GUARD_VERSION,
+            "Schedule Guard Reason": reason,
+            "Recovery Import Version": OW_PROJECTION_CSV_GRADER_VERSION_V19,
+            "V19 Gate Version": OW_BATTER_SELECTION_GATE_VERSION_V19,
+        })
+        gate_df = _ow_apply_batter_selection_gates_v19(pd.DataFrame([snap]), board_name="RECOVERY_IMPORT")
+        if isinstance(gate_df, pd.DataFrame) and not gate_df.empty:
+            snap.update(gate_df.iloc[0].to_dict())
+        if str(snap.get("V19 Route Guard") or "").upper() != "ROUTE OK":
+            route_warnings += 1
+        snap["pick_id"] = _ow_batter_pick_id(snap)
+        rk = _ow_batter_result_key(snap)
+        if rk in existing:
+            skipped += 1
+            continue
+        if not snap.get("Player ID") or not snap.get("Game PK"):
+            unresolved += 1
+        picks.append(snap)
+        existing.add(rk)
+        added += 1
+
+    ok = save_json(OW_BATTER_PICK_LOG, picks[-20000:])
+    return {
+        "added": added, "rows": len(df), "skipped": skipped, "unresolved": unresolved,
+        "route_warnings": route_warnings, "saved": bool(ok), "snapshot_date": dd,
+        "version": OW_PROJECTION_CSV_GRADER_VERSION_V19,
+    }
+
 # Sidebar control modeled after the diagnostic toggle in the user's NFL app.
 with st.sidebar:
     st.divider()
@@ -46812,6 +47398,260 @@ def render_v3_top_batter_plays_board():
         hcols = [c for c in ["Snapshot Date","Player","Team","Opponent","Best Market","Best Pick","Best Line","Best Projection","Official Play Filter","Shadow Playability","Base Upside Rank","Shadow Rank","Shadow Rank Change","Shadow Adjusted Score","Upside Shadow Tag","Actual","graded_result","Grade Status"] if c in hd.columns]
         st.dataframe(hd[hcols].tail(200), use_container_width=True, hide_index=True)
     st.info(f"{OW_BATTER_UPSIDE_SHADOW_VERSION_V17} · playability-gated shadow context · projection impact NONE")
+
+
+# -------------------------
+# V19 TAB WIRING: DISPLAY-ONLY TRACKER GATES
+# -------------------------
+_ow_build_research_before_gate_v19 = build_v3_batter_research_table
+_ow_build_home_run_before_gate_v19 = build_v3_home_run_table
+_ow_build_upside_before_gate_v19 = build_v3_batter_upside_board_final
+
+
+def build_v3_batter_research_table(market="HRR"):
+    got = _ow_build_research_before_gate_v19(market)
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_batter_selection_gates_v19(df, board_name=str(market or "HRR"))
+        meta["v19_tracker_gate_version"] = OW_BATTER_SELECTION_GATE_VERSION_V19
+        meta["projection_impact"] = "NONE"
+        return df, meta
+    return _ow_apply_batter_selection_gates_v19(got, board_name=str(market or "HRR"))
+
+
+def build_v3_home_run_table():
+    got = _ow_build_home_run_before_gate_v19()
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_batter_selection_gates_v19(df, board_name="HOME_RUNS")
+        meta["v19_tracker_gate_version"] = OW_BATTER_SELECTION_GATE_VERSION_V19
+        meta["projection_impact"] = "NONE"
+        return df, meta
+    return _ow_apply_batter_selection_gates_v19(got, board_name="HOME_RUNS")
+
+
+def build_v3_batter_upside_board_final():
+    df = _ow_build_upside_before_gate_v19()
+    return _ow_apply_batter_selection_gates_v19(df, board_name="BATTER_UPSIDE")
+
+
+def _ow_v19_display_cols(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    candidates = [
+        "V19 Rank Bucket", "V19 Gate Score", "V19 Win-Rate Gate", "V19 Route Guard",
+        "V19 Shape Gate", "V19 Thin Data Risk", "V19 Needed Before Play",
+        "Player", "Team", "Opponent", "Market", "Best Market", "Pick", "Best Pick",
+        "Line", "Best Line", "Projection", "Best Projection", "HRR Projection",
+        "HR Projection", "Win Probability %", "Best Win/Hit %", "HR Probability %",
+        "Official Play Filter", "Opportunity Tier", "Shadow Adjusted Score",
+        "Team Runs V3", "Team Implied Runs", "Projected Game Total", "Game Total V3",
+        "High Scoring Game Score", "Game V3 Score", "Projected PA", "Lineup Slot",
+        "Opp Pitcher", "Pitcher Hand", "Pitcher ERA", "Pitcher WHIP", "Pitcher H/9",
+        "Pitcher HR9", "Pitcher K%", "Starter Leash Label", "Pitcher Contact/Leash Label",
+        "Bullpen V3 Label", "Suppression Risk %", "Team Explosion %", "HRR Lineup Chain %",
+        "HR Environment %", "Schedule Guard", "Game PK", "Official Game Date",
+    ]
+    return [c for c in candidates if c in df.columns]
+
+
+def _ow_render_v19_gate_table(df, title, key_suffix):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    gated = _ow_apply_batter_selection_gates_v19(df, board_name=key_suffix)
+    if not isinstance(gated, pd.DataFrame) or gated.empty or "V19 Win-Rate Gate" not in gated.columns:
+        return
+    st.markdown(f"### V19 Tracker Win-Rate Gate - {title}")
+    st.caption("Uses Sept. 3 tracking lessons for route/pitcher sanity, false-high-score filtering, suppression, starter collapse, HRR chain, and bullpen cascade. Projection formulas stay unchanged.")
+    gate_series = gated["V19 Win-Rate Gate"].astype(str)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows gated", len(gated))
+    c2.metric("Official/Lean", int(gate_series.str.contains("OFFICIAL|LEAN", regex=True, na=False).sum()))
+    c3.metric("Verify/Watch", int(gate_series.str.contains("VERIFY|WATCH", regex=True, na=False).sum()))
+    c4.metric("Pass/Research", int(gate_series.str.contains("PASS|RESEARCH", regex=True, na=False).sum()))
+    cols = _ow_v19_display_cols(gated)
+    with st.expander("V19 gated board", expanded=True):
+        if cols:
+            st.dataframe(gated[cols].head(80), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(gated.head(80), use_container_width=True, hide_index=True)
+    try:
+        blob = (gated[cols] if cols else gated).head(200).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"Download V19 gated {title} CSV",
+            data=blob,
+            file_name=f"v19_tracker_gate_{re.sub(r'[^A-Za-z0-9]+', '_', str(key_suffix).lower()).strip('_')}.csv",
+            mime="text/csv",
+            key=_v3_unique_widget_key(f"ow_v19_gate_download_{key_suffix}"),
+            use_container_width=True,
+        )
+    except Exception:
+        pass
+
+
+def _ow_current_official_candidates_v19():
+    frames = []
+    try:
+        hrr, _ = build_v3_batter_research_table("HRR")
+        if isinstance(hrr, pd.DataFrame) and not hrr.empty:
+            frames.append(hrr.copy())
+    except Exception:
+        pass
+    try:
+        hr, _ = build_v3_home_run_table()
+        if isinstance(hr, pd.DataFrame) and not hr.empty:
+            h2 = hr.copy()
+            if "Projection" not in h2.columns and "HR Projection" in h2.columns:
+                h2["Projection"] = h2.get("HR Projection")
+            if "Confidence" not in h2.columns and "HR Grade" in h2.columns:
+                h2["Confidence"] = h2.get("HR Grade")
+            frames.append(h2)
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    if "Official Play Filter" in df.columns:
+        keep = df["Official Play Filter"].astype(str).str.contains("OFFICIAL|SPRINKLE|OPPORTUNITY", case=False, na=False)
+        df = df[keep].copy()
+    return _ow_apply_batter_selection_gates_v19(df, board_name="OFFICIAL_PLAYS")
+
+
+def _ow_sep3_saved_pregame_audit_v19():
+    truth = _ow_sep3_truth_map_v19()
+    rows = []
+    try:
+        picks = load_json(OW_BATTER_PICK_LOG, [])
+        results = load_json(OW_BATTER_RESULT_LOG, [])
+    except Exception:
+        picks, results = [], []
+    combined = []
+    for src, vals in [("RESULT", results), ("PENDING", picks)]:
+        if isinstance(vals, list):
+            for r in vals:
+                if isinstance(r, dict):
+                    x = dict(r)
+                    x["_audit_source"] = src
+                    combined.append(x)
+    seen = set()
+    for r in combined:
+        dd = _ow_guard_date_text(r.get("Snapshot Date") or r.get("Official Game Date") or r.get("Opponent Routing Date") or r.get("Date"))
+        if dd != OW_SEP3_TRACKED_AUDIT_DATE_V19:
+            continue
+        key = _ow_batter_result_key(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
+        opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
+        g = truth.get(_ow_sep3_pair_key_v19(team, opp), {})
+        actual = r.get("Actual")
+        if actual is None:
+            actual = r.get("Actual H+R+RBI") if "HOME RUN" not in _ow_row_market_v19(r) and _ow_row_market_v19(r) != "HR" else r.get("Actual HR")
+        rows.append({
+            "Snapshot Date": dd,
+            "Player": r.get("Player") or r.get("UD Player"),
+            "Team": team,
+            "Opponent": opp,
+            "Game": g.get("Game") or f"{team} vs {opp}",
+            "Final": g.get("Final") or "",
+            "Environment": g.get("Environment") or "",
+            "Primary Attack": g.get("Primary Attack") or "",
+            "Timing": g.get("Timing") or "",
+            "Market": r.get("Market") or r.get("Best Market"),
+            "Pick": r.get("Pick") or r.get("Best Pick") or r.get("Pick Side"),
+            "Line": r.get("Line") if _ow_v19_present(r.get("Line")) else r.get("Best Line"),
+            "Projection": r.get("Projection") if _ow_v19_present(r.get("Projection")) else (r.get("Best Projection") or r.get("HRR Projection") or r.get("HR Projection")),
+            "Actual": actual,
+            "Result": r.get("graded_result") or r.get("Result") or r.get("Grade Status"),
+            "V19 Gate": r.get("V19 Win-Rate Gate"),
+            "V19 Route Guard": r.get("V19 Route Guard"),
+            "V19 Shape Gate": r.get("V19 Shape Gate"),
+            "Source": r.get("snapshot_source") or r.get("_audit_source"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _ow_render_sep3_tracked_audit_v19():
+    st.markdown("### September 3 Tracked Audit V19")
+    st.caption("This is the tracked truth layer from Sept. 3. It is used for grading review and gate tuning only; it does not alter protected projections.")
+    games = pd.DataFrame(OW_SEP3_TRACKED_GAMES_V19)
+    st.dataframe(games, use_container_width=True, hide_index=True)
+    audit = _ow_sep3_saved_pregame_audit_v19()
+    if isinstance(audit, pd.DataFrame) and not audit.empty:
+        result_col = audit.get("Result", pd.Series(dtype=str)).astype(str).str.upper()
+        wins = int(result_col.eq("WIN").sum())
+        losses = int(result_col.eq("LOSS").sum())
+        pushes = int(result_col.eq("PUSH").sum())
+        st.caption(f"Sept. 3 recovered/saved projection rows found: {len(audit)} | Record {wins}-{losses}-{pushes}")
+        cols = [c for c in [
+            "Snapshot Date", "Player", "Team", "Opponent", "Game", "Final", "Environment",
+            "Primary Attack", "Timing", "Market", "Pick", "Line", "Projection", "Actual",
+            "Result", "V19 Gate", "V19 Route Guard", "V19 Shape Gate", "Source",
+        ] if c in audit.columns]
+        st.dataframe(audit[cols].tail(250), use_container_width=True, hide_index=True)
+    else:
+        st.info("No Sept. 3 frozen projection rows are in the grading log yet. Use the sidebar CSV recovery importer with the Sept. 3 HRR/Batter Upside exports, then grade finals.")
+    st.markdown(
+        "- V19 downgrades false high-score games like MIL-CHC when strong pitching/leash signals outweigh the total.\n"
+        "- V19 upgrades starter-collapse plus top-six PA/HRR chains, like the Houston early-burst profile.\n"
+        "- V19 separates late bullpen-cascade games from starter-driven explosions, which helps HRR and MoneyLine review.\n"
+        "- V19 hard-flags route or pitcher mismatches before a row can be trusted."
+    )
+
+
+_ow_render_research_before_gate_v19 = render_v3_batter_research_tab
+_ow_render_home_run_before_gate_v19 = render_v3_home_run_tab
+_ow_render_upside_before_gate_v19 = render_v3_top_batter_plays_board
+_ow_render_official_before_gate_v19 = render_v3_batter_official_plays_tab
+_ow_render_learning_before_gate_v19 = render_v3_batter_learning_lab_tab
+
+
+def render_v3_batter_research_tab(market="HRR"):
+    _ow_render_research_before_gate_v19(market)
+    try:
+        df, _ = build_v3_batter_research_table(market)
+        st.divider()
+        _ow_render_v19_gate_table(df, "H+R+RBI", f"hrr_{market}")
+    except Exception as exc:
+        st.caption(f"V19 tracker gate unavailable: {exc}")
+
+
+def render_v3_home_run_tab():
+    _ow_render_home_run_before_gate_v19()
+    try:
+        df, _ = build_v3_home_run_table()
+        st.divider()
+        _ow_render_v19_gate_table(df, "Home Runs", "home_runs")
+    except Exception as exc:
+        st.caption(f"V19 tracker gate unavailable: {exc}")
+
+
+def render_v3_top_batter_plays_board():
+    _ow_render_upside_before_gate_v19()
+    try:
+        df = build_v3_batter_upside_board_final()
+        st.divider()
+        _ow_render_v19_gate_table(df, "Batter Upside", "batter_upside")
+    except Exception as exc:
+        st.caption(f"V19 tracker gate unavailable: {exc}")
+
+
+def render_v3_batter_official_plays_tab():
+    _ow_render_official_before_gate_v19()
+    try:
+        df = _ow_current_official_candidates_v19()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.divider()
+            _ow_render_v19_gate_table(df, "Official Plays", "official_plays")
+    except Exception as exc:
+        st.caption(f"V19 official gate unavailable: {exc}")
+
+
+def render_v3_batter_learning_lab_tab():
+    _ow_render_learning_before_gate_v19()
+    st.divider()
+    _ow_render_sep3_tracked_audit_v19()
 
 # Keep the repaired MLB-official grader active regardless of whether full-game
 # projections are opened. The grading system is intentionally independent of
