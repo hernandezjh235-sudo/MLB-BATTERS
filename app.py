@@ -11478,7 +11478,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         return
 
     d = df.copy()
-    sort_cols = [c for c in ["Likely Score", "Overall Rating", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
+    sort_cols = [c for c in ["V19 Rank Bucket", "V19 Gate Score", "Likely Score", "Overall Rating", "Sync Score", "HR Probability %", "Win Probability %", "Best Win/Hit %", "Edge"] if c in d.columns]
     if sort_cols:
         for c in sort_cols:
             try:
@@ -11660,6 +11660,10 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         .owv4-logo{width:30px;height:30px;flex:0 0 30px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:#0e1724;border:1px solid rgba(126,166,222,.28);font-size:9px;font-weight:900}.owv4-logo img{width:26px!important;height:26px!important;object-fit:contain!important;display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))}
         .owv4-name-wrap{min-width:0;flex:1}.owv4-name{font-size:14px;font-weight:900;line-height:1.02;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-meta{font-size:7.5px;color:#b7c0cf;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .owv4-topbox{background:rgba(7,13,22,.66);border:1px solid rgba(70,91,119,.32);border-radius:11px;padding:6px 5px;text-align:center;display:flex;flex-direction:column;justify-content:center;min-width:0}.owv4-topbox span{font-size:6.5px;letter-spacing:.4px;color:#8f9aac;font-weight:800}.owv4-topbox b{font-size:12px;line-height:1.1;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-market b{color:#f25bd9}.owv4-line b{color:#fff4ce}.owv4-likely b{color:#68efa7}.owv4-best{font-size:7px;color:#f6c43c!important;margin-top:2px!important}
+        .owv4-v19{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:6px;align-items:center;margin-top:7px;padding:6px 7px;border:1px solid rgba(91,231,166,.42);border-radius:10px;background:linear-gradient(90deg,rgba(25,124,87,.20),rgba(23,38,59,.66));box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+        .owv4-v19.bad{border-color:rgba(255,98,120,.62);background:linear-gradient(90deg,rgba(135,26,48,.27),rgba(23,38,59,.66))}
+        .owv4-v19.watch{border-color:rgba(247,201,72,.58);background:linear-gradient(90deg,rgba(148,106,22,.22),rgba(23,38,59,.66))}
+        .owv4-v19 span{display:block;font-size:6.1px;letter-spacing:.45px;color:#9fb0c4;font-weight:900}.owv4-v19 b{display:block;font-size:10px;color:#eef6ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}.owv4-v19 small{display:block;font-size:6.2px;color:#b8c4d4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}.owv4-v19-score{text-align:right}.owv4-v19-score b{font-size:13px;color:#64eea7}
         .owv4-scores{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:7px}.owv4-score{background:rgba(9,16,26,.68);border:1px solid rgba(63,81,108,.35);border-radius:9px;padding:5px 6px;min-width:0}.owv4-score-head{display:flex;justify-content:space-between;gap:5px;align-items:center;font-size:7px;font-weight:900}.owv4-score-head span{color:var(--accent)}.owv4-score-head b{font-size:10px;color:#edf1f7}.owv4-track{height:5px;background:#1c2939;border-radius:99px;overflow:hidden;margin-top:4px}.owv4-track i{display:block;height:100%;background:var(--accent);border-radius:99px;box-shadow:0 0 8px color-mix(in srgb,var(--accent) 35%,transparent)}
         .owv4-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:5px;margin-top:6px}.owv4-metric{background:rgba(10,18,29,.80);border:1px solid #253349;border-radius:9px;padding:5px;min-height:42px}.owv4-metric span{display:block;font-size:6px;color:#8fa0b4;font-weight:850;letter-spacing:.25px}.owv4-metric b{display:block;font-size:11px;font-weight:900;margin-top:2px;line-height:1}.owv4-metric small{display:block;font-size:6.2px;color:#9eabba;margin-top:3px;line-height:1.03;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .owv4-intel{display:grid;grid-template-columns:1.08fr .92fr;gap:6px;margin-top:6px}.owv4-panel{background:linear-gradient(145deg,rgba(8,17,28,.90),rgba(10,20,31,.76));border:1px solid rgba(48,83,122,.48);border-radius:10px;padding:6px;min-width:0}.owv4-panel-title{font-size:6.5px;font-weight:900;color:#aa73ff;letter-spacing:.35px;margin-bottom:4px}.owv4-pitch-main{display:flex;align-items:center;gap:6px}.owv4-opp-logo{width:24px;height:24px;flex:0 0 24px;display:flex;align-items:center;justify-content:center}.owv4-opp-logo img{width:22px!important;height:22px!important;object-fit:contain!important}.owv4-pitch-name{font-size:9px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.owv4-hand{font-size:6px;color:#c493ff;background:rgba(92,49,136,.28);padding:2px 4px;border-radius:5px;margin-left:3px}.owv4-pitch-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:3px;margin-top:5px}.owv4-pstat{text-align:center}.owv4-pstat span,.owv4-wx span{display:block;font-size:5.5px;color:#8090a4;font-weight:800}.owv4-pstat b,.owv4-wx b{display:block;font-size:8px;color:#f1f4fa;margin-top:1px}.owv4-profile{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:5px;padding-top:4px;border-top:1px solid rgba(64,82,106,.28)}.owv4-profile strong{font-size:7px;color:#ff778b}.owv4-prof-track{height:4px;flex:1;max-width:70px;background:#2a1b28;border-radius:99px;overflow:hidden}.owv4-prof-track i{display:block;height:100%;background:linear-gradient(90deg,#ff4466,#ff9b48);border-radius:99px}
@@ -11669,6 +11673,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         @media(max-width:700px){
           .owv4-list{gap:6px;margin-top:5px}.owv4-card{padding:6px;border-radius:13px}
           .owv4-top{grid-template-columns:minmax(0,1.38fr) repeat(3,minmax(54px,.55fr));gap:4px}.owv4-player{padding:4px 5px;gap:5px;border-radius:8px}.owv4-rank{width:22px;height:22px;flex-basis:22px;font-size:7px;border-radius:6px}.owv4-logo{width:23px;height:23px;flex-basis:23px;border-radius:7px}.owv4-logo img{width:20px!important;height:20px!important}.owv4-name{font-size:10px}.owv4-meta{font-size:5.7px;margin-top:2px}.owv4-topbox{padding:3px 2px;border-radius:8px}.owv4-topbox span{font-size:5px}.owv4-topbox b{font-size:8px}.owv4-best{font-size:5.2px!important}
+          .owv4-v19{grid-template-columns:minmax(0,1fr) 48px;gap:4px;margin-top:4px;padding:3px 4px;border-radius:7px}.owv4-v19 span{font-size:4.8px}.owv4-v19 b{font-size:7.1px}.owv4-v19 small{font-size:4.8px}.owv4-v19-score b{font-size:8px}
           .owv4-scores{gap:4px;margin-top:4px}.owv4-score{padding:3px 4px;border-radius:7px}.owv4-score-head{font-size:5.5px}.owv4-score-head b{font-size:7px}.owv4-track{height:3px;margin-top:2px}
           .owv4-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:4px}.owv4-metric{padding:3px 4px;min-height:29px;border-radius:7px}.owv4-metric span{font-size:4.8px}.owv4-metric b{font-size:8px;margin-top:1px}.owv4-metric small{font-size:4.9px;margin-top:1px}
           .owv4-intel{grid-template-columns:1.04fr .96fr;gap:4px;margin-top:4px}.owv4-panel{padding:4px;border-radius:8px}.owv4-panel-title{font-size:5.2px;margin-bottom:2px}.owv4-pitch-main{gap:4px}.owv4-opp-logo{width:18px;height:18px;flex-basis:18px}.owv4-opp-logo img{width:17px!important;height:17px!important}.owv4-pitch-name{font-size:6.5px}.owv4-hand{font-size:4.8px;padding:1px 3px}.owv4-pitch-stats{gap:1px;margin-top:3px}.owv4-pstat span,.owv4-wx span{font-size:4.2px}.owv4-pstat b,.owv4-wx b{font-size:5.8px}.owv4-profile{margin-top:3px;padding-top:2px}.owv4-profile strong{font-size:5.1px}.owv4-prof-track{height:3px;max-width:44px}
@@ -11883,6 +11888,26 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         pa_txt = _ow_fmt_slate_num(pa, 1)
         best_txt = _ow_fmt_slate_num(best_score, 1)
         likely_txt = _ow_fmt_slate_num(likely, 0)
+        v19_gate = poster_value(row, "V19 Win-Rate Gate", default="")
+        v19_route = poster_value(row, "V19 Route Guard", default="")
+        v19_shape = poster_value(row, "V19 Shape Gate", default="")
+        v19_need = poster_value(row, "V19 Needed Before Play", default="")
+        v19_score = first_num(row, ["V19 Gate Score"], None)
+        v19_gate_upper = str(v19_gate or "").upper()
+        if not v19_gate_upper or v19_gate_upper == "—":
+            v19_class = "watch"
+            v19_gate = "V19 GATE NOT BUILT"
+        elif any(x in v19_gate_upper for x in ["PASS", "RESEARCH", "FIX"]):
+            v19_class = "bad"
+        elif any(x in v19_gate_upper for x in ["VERIFY", "WATCH"]):
+            v19_class = "watch"
+        else:
+            v19_class = ""
+        v19_detail = " · ".join([x for x in [str(v19_route or "").strip(), str(v19_shape or "").strip()] if x and x != "—"])
+        if v19_need and str(v19_need).strip() not in {"", "—", "OK"}:
+            v19_detail = (v19_detail + " · " if v19_detail else "") + str(v19_need).strip()
+        v19_score_txt = "—" if v19_score is None else f"{v19_score:.0f}"
+
         cards.append(textwrap.dedent(f"""
           <div class="owv4-card">
             <div class="owv4-top">
@@ -11897,6 +11922,11 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
               <div class="owv4-topbox owv4-market"><span>MARKET</span><b>{esc(market_short)}</b></div>
               <div class="owv4-topbox owv4-line"><span>LINE</span><b>{esc(pick_txt)} {esc(line_txt)}</b></div>
               <div class="owv4-topbox owv4-likely"><span>LIKELY</span><b>{esc(likely_txt)}</b><span class="owv4-best">BEST {esc(best_txt)}</span></div>
+            </div>
+
+            <div class="owv4-v19 {esc(v19_class)}">
+              <div><span>V19 WIN-RATE GATE</span><b>{esc(v19_gate)}</b><small>{esc(v19_detail or 'tracker gate pending')}</small></div>
+              <div class="owv4-v19-score"><span>SCORE</span><b>{esc(v19_score_txt)}</b></div>
             </div>
 
             <div class="owv4-scores">
@@ -28064,11 +28094,8 @@ def render_v3_top_batter_plays_board():
     st.caption("Only active Underdog H+R+RBI and Home Runs lines are shown. Sorted by Likely Score first across all pulled games: win/hit probability, edge, data confidence, clean risk flags, verified pitcher matchup, lineup, and PA.")
     df = build_v3_batter_upside_board_final()
     if not isinstance(df, pd.DataFrame) or df.empty:
-        df = _ow_batter_upside_projection_only_fallback_v21() if "_ow_batter_upside_projection_only_fallback_v21" in globals() else pd.DataFrame()
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            st.info("No active Underdog batter lines matched yet. Refresh after the board posts.")
-            return
-        st.warning("No active Underdog HRR/HR lines matched. Showing projection-only cards with NO REAL LINE labels; do not treat these as official plays until a posted line appears.")
+        st.info("No active Underdog batter lines matched yet. Refresh after the board posts.")
+        return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("UD Players", len(df))
     c2.metric("Top Likely", int(pd.to_numeric(df.get("Likely Score", df.get("Upside Score")), errors="coerce").max()))
@@ -47447,8 +47474,6 @@ def _ow_v19_display_cols(df):
         "Line", "Best Line", "Projection", "Best Projection", "HRR Projection",
         "HR Projection", "Win Probability %", "Best Win/Hit %", "HR Probability %",
         "Official Play Filter", "Opportunity Tier", "Shadow Adjusted Score",
-        "Expected Runs V20", "Expected Runs V20 Delta", "Expected Runs V20 Source",
-        "Expected Runs V20 Confidence", "Expected Runs V20 Note",
         "Team Runs V3", "Team Implied Runs", "Projected Game Total", "Game Total V3",
         "High Scoring Game Score", "Game V3 Score", "Projected PA", "Lineup Slot",
         "Opp Pitcher", "Pitcher Hand", "Pitcher ERA", "Pitcher WHIP", "Pitcher H/9",
@@ -47656,380 +47681,6 @@ def render_v3_batter_learning_lab_tab():
     _ow_render_learning_before_gate_v19()
     st.divider()
     _ow_render_sep3_tracked_audit_v19()
-
-
-# -------------------------
-# V20 EXPECTED RUNS DATA-AUDIT + PROXY UPGRADE
-# -------------------------
-OW_EXPECTED_RUNS_V20_VERSION = "OW_EXPECTED_RUNS_PROXY_UPGRADE_V20_2026_09_08"
-
-
-def _ow_direct_team_total_source_v20(source):
-    s = str(source or "").upper()
-    if not s or s in {"MISSING", "NONE", "NAN", "—"}:
-        return False
-    if any(x in s for x in ["MLB_2026_OFFENSE_PROXY", "PROXY_FALLBACK", "TEAM_RUN_SUM", "TEAM IMPLIED RUNS"]):
-        return False
-    return True
-
-
-def _ow_expected_run_label_v20(score):
-    try:
-        score = float(score)
-    except Exception:
-        score = 50.0
-    if score >= 82:
-        return "SLUGFEST"
-    if score >= 68:
-        return "HIGH"
-    if score >= 58:
-        return "ELEVATED"
-    if score <= 36:
-        return "LOW"
-    return "NEUTRAL"
-
-
-def _ow_expected_runs_side_v20(row, force_team=None):
-    r = dict(row or {})
-    team = _ow_team_abbr(force_team or r.get("Team") or r.get("Raw Log Team"))
-    try:
-        raw_ctx = _ow_team_context(team) if team else {}
-    except Exception:
-        raw_ctx = {}
-    try:
-        base_ctx = _ow_team_market_total_context(team, raw_ctx) if team else {}
-    except Exception:
-        base_ctx = {}
-    base_runs = _ow_num_v19(r, ["Team Runs V3", "Team Implied Runs", "Projected Team Runs"], None)
-    if base_runs is None:
-        base_runs = _ow_num_v19(base_ctx, ["Team Implied Runs"], None)
-    if base_runs is None:
-        base_runs = 4.45
-    source = str(r.get("Team Implied Runs Source") or base_ctx.get("Team Implied Runs Source") or "MISSING")
-    if _ow_direct_team_total_source_v20(source):
-        return {
-            "Expected Runs V20": round(float(base_runs), 2),
-            "Expected Runs V20 Source": source,
-            "Expected Runs V20 Base": round(float(base_runs), 2),
-            "Expected Runs V20 Base Source": source,
-            "Expected Runs V20 Adjustment": 0.0,
-            "Expected Runs V20 Confidence": "DIRECT",
-            "Expected Runs V20 Note": "Direct team total preserved",
-            "Expected Runs V20 Version": OW_EXPECTED_RUNS_V20_VERSION,
-            "_replace_team_runs": False,
-        }
-    p = r
-    if not any(_ow_num_v19(p, [k], None) is not None for k in ["Pitcher ERA", "Pitcher WHIP", "Pitcher H/9", "Pitcher BAA"]):
-        try:
-            p = {**p, **(_ow_probable_pitcher_context(team) or {})}
-        except Exception:
-            p = r
-    adj = 0.0
-    parts = []
-
-    def add_piece(name, value, center, scale, weight, lo, hi, higher=True):
-        nonlocal adj
-        try:
-            if value is None or not scale:
-                return
-            z = (float(value) - float(center)) / float(scale)
-            if not higher:
-                z = -z
-            piece = float(clamp(z * float(weight), lo, hi))
-            adj += piece
-            if abs(piece) >= 0.04:
-                parts.append(f"{name} {piece:+.2f}")
-        except Exception:
-            return
-
-    add_piece("ERA", _ow_num_v19(p, ["Pitcher ERA"], None), 4.20, 1.10, 0.26, -0.32, 0.44, True)
-    add_piece("WHIP", _ow_num_v19(p, ["Pitcher WHIP", "Pitcher Recent WHIP"], None), 1.28, 0.22, 0.24, -0.28, 0.42, True)
-    add_piece("BAA", _ow_num_v19(p, ["Pitcher Split BAA", "Pitcher BAA"], None), 0.245, 0.045, 0.18, -0.22, 0.34, True)
-    add_piece("H9", _ow_num_v19(p, ["Pitcher H/9", "Pitcher Recent H/9"], None), 8.50, 1.50, 0.17, -0.20, 0.32, True)
-    add_piece("HR9", _ow_num_v19(p, ["Pitcher HR9", "Pitcher Recent HR/9"], None), 1.15, 0.55, 0.14, -0.14, 0.28, True)
-    add_piece("K%", _ow_num_v19(p, ["Pitcher K%", "Pitcher Recent K%", "Pitcher Split K%"], None, pct=True), 23.0, 7.0, 0.18, -0.30, 0.18, False)
-    add_piece("xwOBA allowed", _ow_num_v19(p, ["Pitcher Allowed xwOBA"], None), 0.320, 0.045, 0.18, -0.22, 0.34, True)
-    add_piece("xSLG allowed", _ow_num_v19(p, ["Pitcher Allowed xSLG", "Pitcher Split SLG"], None), 0.420, 0.085, 0.16, -0.18, 0.30, True)
-    add_piece("HardHit allowed", _ow_num_v19(p, ["Pitcher Allowed HardHit%"], None, pct=True), 39.0, 9.0, 0.10, -0.10, 0.18, True)
-    add_piece("Barrel allowed", _ow_num_v19(p, ["Pitcher Allowed Barrel%"], None, pct=True), 8.5, 5.5, 0.10, -0.10, 0.18, True)
-    add_piece("run/contact", _ow_num_v19(p, ["Pitcher Run/Contact Score", "Pitcher Contact/Leash Score"], None), 50.0, 20.0, 0.18, -0.18, 0.28, True)
-    add_piece("under suppressor", _ow_num_v19(p, ["Pitcher Under Suppression Score"], None), 50.0, 20.0, 0.14, -0.05, 0.24, False)
-    add_piece("starter exit", _ow_num_v19(p, ["Starter Early Exit Risk % V3"], None, pct=True), 50.0, 20.0, 0.12, -0.10, 0.20, True)
-    add_piece("bullpen", _ow_num_v19(p, ["Bullpen V3 Score"], None, pct=True), 50.0, 20.0, 0.11, -0.10, 0.18, True)
-    bullpen_factor = _ow_num_v19(p, ["Bullpen Factor", "Bullpen/Leash Factor"], None)
-    park = _ow_num_v19(p, ["Park Factor", "HR Stadium Factor V3"], None)
-    weather = _ow_num_v19(p, ["Weather Factor"], None)
-    if bullpen_factor is not None:
-        add_piece("bullpen factor", bullpen_factor, 1.00, 0.08, 0.12, -0.10, 0.20, True)
-    if park is not None:
-        add_piece("park", park, 1.00, 0.08, 0.12, -0.10, 0.18, True)
-    if weather is not None:
-        add_piece("weather", weather, 1.00, 0.08, 0.10, -0.08, 0.16, True)
-    blob = _ow_text_blob_v19(p)
-    if "BLOWOUT STACK" in blob or "BALLS IN PLAY BOOST" in blob:
-        adj += 0.12
-        parts.append("attack stack +0.12")
-    if "RUN SUPPRESSED" in blob or "UNDER FRIENDLY" in blob or "STRIKEOUT RISK" in blob:
-        adj -= 0.16
-        parts.append("suppression tag -0.16")
-    if "SHORT LEASH" in blob or "EARLY EXIT RISK" in blob:
-        adj += 0.10
-        parts.append("leash +0.10")
-    if "DEEP START" in blob or "NORMAL LEASH" in blob:
-        adj -= 0.06
-        parts.append("leash depth -0.06")
-    adj = float(clamp(adj, -0.90, 1.15))
-    runs = round(float(clamp(float(base_runs) + adj, 2.35, 7.75)), 2)
-    conf = "HIGH" if len(parts) >= 8 else "MEDIUM" if len(parts) >= 4 else "LOW"
-    return {
-        "Expected Runs V20": runs,
-        "Expected Runs V20 Source": "MLB_PROXY_PLUS_MATCHUP" if source != "MISSING" else "MATCHUP_PROXY",
-        "Expected Runs V20 Base": round(float(base_runs), 2),
-        "Expected Runs V20 Base Source": source,
-        "Expected Runs V20 Adjustment": round(adj, 2),
-        "Expected Runs V20 Confidence": conf,
-        "Expected Runs V20 Note": "; ".join(parts[:8]) if parts else "neutral matchup adjustment",
-        "Expected Runs V20 Version": OW_EXPECTED_RUNS_V20_VERSION,
-        "_replace_team_runs": True,
-    }
-
-
-def _ow_apply_expected_runs_v20_to_df(df):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    rows = []
-    for _, rr in df.iterrows():
-        r = rr.to_dict()
-        team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
-        opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
-        team_ctx = _ow_expected_runs_side_v20(r, force_team=team)
-        opp_ctx = {}
-        if opp:
-            try:
-                opp_pitcher = _ow_probable_pitcher_context(opp) or {}
-            except Exception:
-                opp_pitcher = {}
-            opp_ctx = _ow_expected_runs_side_v20({"Team": opp, "Opponent": team, **opp_pitcher}, force_team=opp)
-        old_team = _ow_num_v19(r, ["Team Runs V3", "Team Implied Runs"], None)
-        old_game = _ow_num_v19(r, ["Game Total V3", "Projected Game Total"], None)
-        new_team = _ow_num_v19(team_ctx, ["Expected Runs V20"], old_team)
-        new_opp = _ow_num_v19(opp_ctx, ["Expected Runs V20"], _ow_num_v19(r, ["Opponent Runs V3", "Opponent Implied Runs"], None))
-        new_total = (new_team + new_opp) if new_team is not None and new_opp is not None else old_game
-        source = str(team_ctx.get("Expected Runs V20 Source") or "")
-        if old_team is not None:
-            r["Team Implied Runs Legacy"] = old_team
-        if old_game is not None:
-            r["Game Total V3 Legacy"] = old_game
-            r["Projected Game Total Legacy"] = old_game
-        for k, v in team_ctx.items():
-            if not str(k).startswith("_"):
-                r[k] = v
-        if new_opp is not None:
-            r["Opponent Expected Runs V20"] = round(float(new_opp), 2)
-            r["Opponent Runs V3"] = round(float(new_opp), 2)
-            r["Opponent Implied Runs"] = round(float(new_opp), 2)
-        if bool(team_ctx.get("_replace_team_runs")) and new_team is not None:
-            r["Team Implied Runs"] = round(float(new_team), 2)
-            r["Team Runs V3"] = round(float(new_team), 2)
-            r["Team Implied Runs Source"] = source
-            r["Game Total V3 Source"] = source
-            r["Projected Game Total Source"] = "V20_EXPECTED_RUN_SUM"
-        if new_total is not None:
-            r["Projected Game Total"] = round(float(new_total), 2)
-            r["Game Total V3"] = round(float(new_total), 2)
-            game_score = int(round(clamp(50 + (float(new_total) - 8.6) * 13.5, 8, 96)))
-            if new_team is not None:
-                game_score = int(round(clamp(game_score + (float(new_team) - 4.45) * 2.4, 8, 96)))
-            r["High Scoring Game Score"] = game_score
-            r["Game V3 Score"] = game_score
-            r["High Scoring Game Label"] = _ow_expected_run_label_v20(game_score)
-            r["Game V3 Label"] = _ow_expected_run_label_v20(game_score)
-        if old_team is not None and new_team is not None:
-            delta_runs = float(new_team) - float(old_team)
-            r["Expected Runs V20 Delta"] = round(delta_runs, 2)
-            likely = _ow_num_v19(r, ["Likely Score"], None)
-            if likely is not None and abs(delta_runs) >= 0.05:
-                r["Likely Score Legacy"] = likely
-                r["Likely Score"] = int(round(clamp(likely + clamp(delta_runs * 4.0, -4.0, 4.0), 0, 98)))
-            shadow = _ow_num_v19(r, ["Shadow Adjusted Score"], None)
-            if shadow is not None and abs(delta_runs) >= 0.05:
-                r["Shadow Adjusted Score Legacy"] = shadow
-                r["Shadow Adjusted Score"] = round(float(clamp(shadow + clamp(delta_runs * 2.5, -3.0, 3.0), 0, 100)), 1)
-        rows.append(r)
-    return pd.DataFrame(rows)
-
-
-def _ow_expected_runs_audit_table_v20(df, board_name):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    d = df.copy()
-    src = d.get("Expected Runs V20 Source", d.get("Team Implied Runs Source", pd.Series(["MISSING"] * len(d)))).fillna("MISSING").astype(str)
-    direct = src.map(_ow_direct_team_total_source_v20)
-    return pd.DataFrame([{
-        "Board": board_name,
-        "Rows": len(d),
-        "Direct Market Team Totals": int(direct.sum()),
-        "Proxy/Upgraded Expected Runs": int((~direct).sum()),
-        "Avg Expected Runs V20": round(pd.to_numeric(d.get("Expected Runs V20", pd.Series(dtype=float)), errors="coerce").mean(), 2),
-        "Avg Expected Runs Delta": round(pd.to_numeric(d.get("Expected Runs V20 Delta", pd.Series(dtype=float)), errors="coerce").mean(), 2),
-        "Missing Team Runs": int(d.get("Team Implied Runs", pd.Series([None] * len(d))).isna().sum()) if "Team Implied Runs" in d.columns else len(d),
-        "Version": OW_EXPECTED_RUNS_V20_VERSION,
-    }])
-
-
-_ow_build_research_before_expected_runs_v20 = build_v3_batter_research_table
-_ow_build_home_run_before_expected_runs_v20 = build_v3_home_run_table
-_ow_build_upside_before_expected_runs_v20 = build_v3_batter_upside_board_final
-
-
-def build_v3_batter_research_table(market="HRR"):
-    got = _ow_build_research_before_expected_runs_v20(market)
-    if isinstance(got, tuple) and len(got) >= 2:
-        df, meta = got[0], dict(got[1] or {})
-        df = _ow_apply_expected_runs_v20_to_df(df)
-        df = _ow_apply_batter_selection_gates_v19(df, board_name=f"{market}_V20_EXPECTED_RUNS")
-        meta["expected_runs_v20"] = OW_EXPECTED_RUNS_V20_VERSION
-        meta["expected_runs_v20_note"] = "Direct team totals preserved; proxy rows upgraded with pitcher/contact/leash/bullpen/park context."
-        return df, meta
-    df = _ow_apply_expected_runs_v20_to_df(got)
-    return _ow_apply_batter_selection_gates_v19(df, board_name=f"{market}_V20_EXPECTED_RUNS")
-
-
-def build_v3_home_run_table():
-    got = _ow_build_home_run_before_expected_runs_v20()
-    if isinstance(got, tuple) and len(got) >= 2:
-        df, meta = got[0], dict(got[1] or {})
-        df = _ow_apply_expected_runs_v20_to_df(df)
-        df = _ow_apply_batter_selection_gates_v19(df, board_name="HOME_RUNS_V20_EXPECTED_RUNS")
-        meta["expected_runs_v20"] = OW_EXPECTED_RUNS_V20_VERSION
-        return df, meta
-    df = _ow_apply_expected_runs_v20_to_df(got)
-    return _ow_apply_batter_selection_gates_v19(df, board_name="HOME_RUNS_V20_EXPECTED_RUNS")
-
-
-def build_v3_batter_upside_board_final():
-    df = _ow_build_upside_before_expected_runs_v20()
-    df = _ow_apply_expected_runs_v20_to_df(df)
-    return _ow_apply_batter_selection_gates_v19(df, board_name="BATTER_UPSIDE_V20_EXPECTED_RUNS")
-
-
-_ow_render_learning_before_expected_runs_v20 = render_v3_batter_learning_lab_tab
-
-
-def render_v3_batter_learning_lab_tab():
-    _ow_render_learning_before_expected_runs_v20()
-    st.divider()
-    st.markdown("### Expected Runs Data Audit V20")
-    st.caption("Shows whether the batter boards are using direct market team totals or the upgraded MLB matchup proxy. Direct totals win whenever present.")
-    frames = []
-    try:
-        hrr, _ = build_v3_batter_research_table("HRR")
-        frames.append(_ow_expected_runs_audit_table_v20(hrr, "H+R+RBI"))
-    except Exception:
-        pass
-    try:
-        hr, _ = build_v3_home_run_table()
-        frames.append(_ow_expected_runs_audit_table_v20(hr, "Home Runs"))
-    except Exception:
-        pass
-    try:
-        up = build_v3_batter_upside_board_final()
-        frames.append(_ow_expected_runs_audit_table_v20(up, "Batter Upside"))
-    except Exception:
-        pass
-    frames = [x for x in frames if isinstance(x, pd.DataFrame) and not x.empty]
-    if frames:
-        st.dataframe(pd.concat(frames, ignore_index=True, sort=False), use_container_width=True, hide_index=True)
-    else:
-        st.info("Build/refresh a batter board to audit expected-runs coverage.")
-    st.info("Audit read: if Direct Market Team Totals is 0, the app is not pulling sportsbook team totals for that board and is using the V20 matchup proxy instead.")
-
-
-# -------------------------
-# V21 SAFE BATTER UPSIDE FALLBACK
-# -------------------------
-OW_BATTER_UPSIDE_FALLBACK_VERSION_V21 = "OW_BATTER_UPSIDE_PROJECTION_ONLY_FALLBACK_V21_2026_09_08"
-
-
-def _ow_batter_projection_fallback_source_v21(label, fn, *args):
-    if not callable(fn):
-        return pd.DataFrame()
-    try:
-        got = fn(*args)
-        df = got[0] if isinstance(got, tuple) else got
-    except Exception:
-        return pd.DataFrame()
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    d = df.copy()
-    d["_Fallback Source"] = label
-    return d
-
-
-def _ow_batter_upside_projection_only_fallback_v21():
-    """Show projection cards only when the real-line board is empty.
-
-    This does not create fake Underdog lines. It labels rows as projection-only and
-    keeps official saved plays/grading tied to real line rows.
-    """
-    frames = []
-    frames.append(_ow_batter_projection_fallback_source_v21("HRR_PROJECTION", globals().get("_v3_pre_ud_clean_build_batter_research_table"), "HRR"))
-    frames.append(_ow_batter_projection_fallback_source_v21("HR_PROJECTION", globals().get("_v3_pre_ud_clean_build_home_run_table")))
-    frames = [x for x in frames if isinstance(x, pd.DataFrame) and not x.empty]
-    if not frames:
-        return pd.DataFrame()
-
-    rows = []
-    for _, rr in pd.concat(frames, ignore_index=True, sort=False).iterrows():
-        r = rr.to_dict()
-        player = r.get("Player") or r.get("UD Player")
-        if not player:
-            continue
-        source = str(r.get("_Fallback Source") or "").upper()
-        line = r.get("Line") if _v3_is_live_ud_line(r.get("Line")) else "NO REAL LINE"
-        if "HR_" in source or source.startswith("HR_"):
-            market = "Home Runs - Projection Only" if line == "NO REAL LINE" else "Home Runs"
-            projection = r.get("HR Projection") if _ow_v19_present(r.get("HR Projection")) else r.get("Projection")
-            win_hit = r.get("HR Probability %") if _ow_v19_present(r.get("HR Probability %")) else r.get("Win Probability %")
-        else:
-            market = "H+R+RBI - Projection Only" if line == "NO REAL LINE" else "H+R+RBI"
-            projection = r.get("Projection") if _ow_v19_present(r.get("Projection")) else r.get("HRR Projection")
-            win_hit = r.get("Win Probability %") if _ow_v19_present(r.get("Win Probability %")) else r.get("Over Probability %")
-        pick = r.get("Pick") if _ow_v19_present(r.get("Pick")) and line != "NO REAL LINE" else "TRACK ONLY"
-        score = _ow_num_v19(r, ["Likely Score", "Overall Rating", "Sync Score", "HR Composite Score V3", "HR Power Score V2", "HR Probability %"], 50, pct=False)
-        out = dict(r)
-        out.update({
-            "Best Market": market,
-            "Best Pick": pick,
-            "Best Line": line,
-            "Best Projection": projection if _ow_v19_present(projection) else "—",
-            "Best Win/Hit %": win_hit if _ow_v19_present(win_hit) else "—",
-            "Likely Score": round(float(clamp(score, 0, 100)), 1),
-            "Sportsbook Market Status": "NO_ACTIVE_LINE_PROJECTION_ONLY" if line == "NO REAL LINE" else r.get("Sportsbook Market Status"),
-            "Official Play Filter": "TRACK ONLY - WAIT FOR REAL LINE" if line == "NO REAL LINE" else r.get("Official Play Filter"),
-            "No-Bet Risk Flags": str(r.get("No-Bet Risk Flags") or "").strip(),
-            "Batter Upside Fallback Version": OW_BATTER_UPSIDE_FALLBACK_VERSION_V21,
-        })
-        rows.append(out)
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    try:
-        df = _ow_apply_expected_runs_v20_to_df(df)
-    except Exception:
-        pass
-    try:
-        df = _ow_apply_batter_selection_gates_v19(df, board_name="BATTER_UPSIDE_PROJECTION_ONLY_FALLBACK")
-    except Exception:
-        pass
-    df["_dedupe"] = df.apply(lambda x: f"{_v3_final_norm_player(x.get('Player') or x.get('UD Player'))}|{x.get('Best Market')}", axis=1)
-    sort_cols = [c for c in ["Likely Score", "V19 Gate Score", "Best Win/Hit %"] if c in df.columns]
-    if sort_cols:
-        for c in sort_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
-    return df.drop_duplicates("_dedupe", keep="first").drop(columns=["_dedupe"], errors="ignore").head(60).reset_index(drop=True)
 
 # Keep the repaired MLB-official grader active regardless of whether full-game
 # projections are opened. The grading system is intentionally independent of
