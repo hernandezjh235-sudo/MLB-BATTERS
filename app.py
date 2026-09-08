@@ -47682,6 +47682,321 @@ def render_v3_batter_learning_lab_tab():
     st.divider()
     _ow_render_sep3_tracked_audit_v19()
 
+
+# -------------------------
+# V20 EXPECTED RUNS DATA-AUDIT + PROXY UPGRADE
+# -------------------------
+OW_EXPECTED_RUNS_V20_VERSION = "OW_EXPECTED_RUNS_PROXY_UPGRADE_V20_2026_09_08"
+
+
+def _ow_direct_team_total_source_v20(source):
+    s = str(source or "").upper()
+    if not s or s in {"MISSING", "NONE", "NAN", "—"}:
+        return False
+    if any(x in s for x in ["MLB_2026_OFFENSE_PROXY", "PROXY_FALLBACK", "TEAM_RUN_SUM", "TEAM IMPLIED RUNS"]):
+        return False
+    return True
+
+
+def _ow_expected_run_label_v20(score):
+    try:
+        score = float(score)
+    except Exception:
+        score = 50.0
+    if score >= 82:
+        return "SLUGFEST"
+    if score >= 68:
+        return "HIGH"
+    if score >= 58:
+        return "ELEVATED"
+    if score <= 36:
+        return "LOW"
+    return "NEUTRAL"
+
+
+def _ow_expected_runs_side_v20(row, force_team=None):
+    r = dict(row or {})
+    team = _ow_team_abbr(force_team or r.get("Team") or r.get("Raw Log Team"))
+    raw_ctx = {}
+    try:
+        raw_ctx = _ow_team_context(team) if team else {}
+    except Exception:
+        raw_ctx = {}
+    try:
+        base_ctx = _ow_team_market_total_context(team, raw_ctx) if team else {}
+    except Exception:
+        base_ctx = {}
+    row_runs = _ow_num_v19(r, ["Team Runs V3", "Team Implied Runs", "Projected Team Runs"], None)
+    base_runs = row_runs
+    if base_runs is None:
+        base_runs = _ow_num_v19(base_ctx, ["Team Implied Runs"], None)
+    if base_runs is None:
+        base_runs = 4.45
+    source = str(r.get("Team Implied Runs Source") or base_ctx.get("Team Implied Runs Source") or "MISSING")
+    direct_total = _ow_direct_team_total_source_v20(source)
+    if direct_total:
+        return {
+            "Expected Runs V20": round(float(base_runs), 2),
+            "Expected Runs V20 Source": source,
+            "Expected Runs V20 Adjustment": 0.0,
+            "Expected Runs V20 Confidence": "DIRECT",
+            "Expected Runs V20 Note": "Direct team total preserved",
+            "Expected Runs V20 Version": OW_EXPECTED_RUNS_V20_VERSION,
+            "_replace_team_runs": False,
+        }
+
+    # When no market team total exists, the old proxy is too flat. Add bounded,
+    # auditable baseball context from the actual matchup row.
+    p = r
+    if not any(_ow_num_v19(p, [k], None) is not None for k in ["Pitcher ERA", "Pitcher WHIP", "Pitcher H/9", "Pitcher BAA"]):
+        try:
+            p = {**p, **(_ow_probable_pitcher_context(team) or {})}
+        except Exception:
+            p = r
+
+    adj = 0.0
+    parts = []
+
+    def add_piece(name, value, center, scale, weight, lo, hi, higher=True):
+        nonlocal adj
+        try:
+            if value is None or not scale:
+                return
+            z = (float(value) - float(center)) / float(scale)
+            if not higher:
+                z = -z
+            piece = float(clamp(z * float(weight), lo, hi))
+            adj += piece
+            if abs(piece) >= 0.04:
+                parts.append(f"{name} {piece:+.2f}")
+        except Exception:
+            return
+
+    era = _ow_num_v19(p, ["Pitcher ERA"], None)
+    whip = _ow_num_v19(p, ["Pitcher WHIP", "Pitcher Recent WHIP"], None)
+    baa = _ow_num_v19(p, ["Pitcher Split BAA", "Pitcher BAA"], None)
+    h9 = _ow_num_v19(p, ["Pitcher H/9", "Pitcher Recent H/9"], None)
+    hr9 = _ow_num_v19(p, ["Pitcher HR9", "Pitcher Recent HR/9"], None)
+    k_pct = _ow_num_v19(p, ["Pitcher K%", "Pitcher Recent K%", "Pitcher Split K%"], None, pct=True)
+    xwoba = _ow_num_v19(p, ["Pitcher Allowed xwOBA"], None)
+    xslg = _ow_num_v19(p, ["Pitcher Allowed xSLG", "Pitcher Split SLG"], None)
+    hardhit = _ow_num_v19(p, ["Pitcher Allowed HardHit%"], None, pct=True)
+    barrel = _ow_num_v19(p, ["Pitcher Allowed Barrel%"], None, pct=True)
+    contact_score = _ow_num_v19(p, ["Pitcher Run/Contact Score", "Pitcher Contact/Leash Score"], None)
+    under_score = _ow_num_v19(p, ["Pitcher Under Suppression Score"], None)
+    starter_exit = _ow_num_v19(p, ["Starter Early Exit Risk % V3"], None, pct=True)
+    bullpen_score = _ow_num_v19(p, ["Bullpen V3 Score"], None, pct=True)
+    bullpen_factor = _ow_num_v19(p, ["Bullpen Factor", "Bullpen/Leash Factor"], None)
+    park = _ow_num_v19(p, ["Park Factor", "HR Stadium Factor V3"], None)
+    weather = _ow_num_v19(p, ["Weather Factor"], None)
+
+    add_piece("ERA", era, 4.20, 1.10, 0.26, -0.32, 0.44, True)
+    add_piece("WHIP", whip, 1.28, 0.22, 0.24, -0.28, 0.42, True)
+    add_piece("BAA", baa, 0.245, 0.045, 0.18, -0.22, 0.34, True)
+    add_piece("H9", h9, 8.50, 1.50, 0.17, -0.20, 0.32, True)
+    add_piece("HR9", hr9, 1.15, 0.55, 0.14, -0.14, 0.28, True)
+    add_piece("K%", k_pct, 23.0, 7.0, 0.18, -0.30, 0.18, False)
+    add_piece("xwOBA allowed", xwoba, 0.320, 0.045, 0.18, -0.22, 0.34, True)
+    add_piece("xSLG allowed", xslg, 0.420, 0.085, 0.16, -0.18, 0.30, True)
+    add_piece("HardHit allowed", hardhit, 39.0, 9.0, 0.10, -0.10, 0.18, True)
+    add_piece("Barrel allowed", barrel, 8.5, 5.5, 0.10, -0.10, 0.18, True)
+    add_piece("run/contact", contact_score, 50.0, 20.0, 0.18, -0.18, 0.28, True)
+    add_piece("under suppressor", under_score, 50.0, 20.0, 0.14, -0.05, 0.24, False)
+    add_piece("starter exit", starter_exit, 50.0, 20.0, 0.12, -0.10, 0.20, True)
+    add_piece("bullpen", bullpen_score, 50.0, 20.0, 0.11, -0.10, 0.18, True)
+    if bullpen_factor is not None:
+        add_piece("bullpen factor", bullpen_factor, 1.00, 0.08, 0.12, -0.10, 0.20, True)
+    if park is not None:
+        add_piece("park", park, 1.00, 0.08, 0.12, -0.10, 0.18, True)
+    if weather is not None:
+        add_piece("weather", weather, 1.00, 0.08, 0.10, -0.08, 0.16, True)
+
+    blob = _ow_text_blob_v19(p)
+    if "BLOWOUT STACK" in blob or "BALLS IN PLAY BOOST" in blob:
+        adj += 0.12
+        parts.append("attack stack +0.12")
+    if "RUN SUPPRESSED" in blob or "UNDER FRIENDLY" in blob or "STRIKEOUT RISK" in blob:
+        adj -= 0.16
+        parts.append("suppression tag -0.16")
+    if "SHORT LEASH" in blob or "EARLY EXIT RISK" in blob:
+        adj += 0.10
+        parts.append("leash +0.10")
+    if "DEEP START" in blob or "NORMAL LEASH" in blob:
+        adj -= 0.06
+        parts.append("leash depth -0.06")
+
+    adj = float(clamp(adj, -0.90, 1.15))
+    runs = round(float(clamp(float(base_runs) + adj, 2.35, 7.75)), 2)
+    factors_used = len(parts)
+    conf = "HIGH" if factors_used >= 8 else "MEDIUM" if factors_used >= 4 else "LOW"
+    return {
+        "Expected Runs V20": runs,
+        "Expected Runs V20 Source": "MLB_PROXY_PLUS_MATCHUP" if source != "MISSING" else "MATCHUP_PROXY",
+        "Expected Runs V20 Base": round(float(base_runs), 2),
+        "Expected Runs V20 Base Source": source,
+        "Expected Runs V20 Adjustment": round(adj, 2),
+        "Expected Runs V20 Confidence": conf,
+        "Expected Runs V20 Note": "; ".join(parts[:8]) if parts else "neutral matchup adjustment",
+        "Expected Runs V20 Version": OW_EXPECTED_RUNS_V20_VERSION,
+        "_replace_team_runs": True,
+    }
+
+
+def _ow_apply_expected_runs_v20_to_df(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
+        opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
+        team_ctx = _ow_expected_runs_side_v20(r, force_team=team)
+        opp_ctx = {}
+        if opp:
+            try:
+                opp_pitcher = _ow_probable_pitcher_context(opp) or {}
+            except Exception:
+                opp_pitcher = {}
+            opp_row = {"Team": opp, "Opponent": team, **opp_pitcher}
+            opp_ctx = _ow_expected_runs_side_v20(opp_row, force_team=opp)
+
+        old_team = _ow_num_v19(r, ["Team Runs V3", "Team Implied Runs"], None)
+        old_game = _ow_num_v19(r, ["Game Total V3", "Projected Game Total"], None)
+        new_team = _ow_num_v19(team_ctx, ["Expected Runs V20"], old_team)
+        new_opp = _ow_num_v19(opp_ctx, ["Expected Runs V20"], _ow_num_v19(r, ["Opponent Runs V3", "Opponent Implied Runs"], None))
+        new_total = (new_team + new_opp) if new_team is not None and new_opp is not None else old_game
+        source = str(team_ctx.get("Expected Runs V20 Source") or "")
+        replace_runs = bool(team_ctx.get("_replace_team_runs"))
+
+        if old_team is not None:
+            r["Team Implied Runs Legacy"] = old_team
+        if old_game is not None:
+            r["Game Total V3 Legacy"] = old_game
+            r["Projected Game Total Legacy"] = old_game
+
+        for k, v in team_ctx.items():
+            if not str(k).startswith("_"):
+                r[k] = v
+        if new_opp is not None:
+            r["Opponent Expected Runs V20"] = round(float(new_opp), 2)
+            r["Opponent Runs V3"] = round(float(new_opp), 2)
+            r["Opponent Implied Runs"] = round(float(new_opp), 2)
+        if replace_runs and new_team is not None:
+            r["Team Implied Runs"] = round(float(new_team), 2)
+            r["Team Runs V3"] = round(float(new_team), 2)
+            r["Team Implied Runs Source"] = source
+            r["Game Total V3 Source"] = source
+            r["Projected Game Total Source"] = "V20_EXPECTED_RUN_SUM"
+        if new_total is not None:
+            r["Projected Game Total"] = round(float(new_total), 2)
+            r["Game Total V3"] = round(float(new_total), 2)
+            game_score = int(round(clamp(50 + (float(new_total) - 8.6) * 13.5, 8, 96)))
+            if new_team is not None:
+                game_score = int(round(clamp(game_score + (float(new_team) - 4.45) * 2.4, 8, 96)))
+            r["High Scoring Game Score"] = game_score
+            r["Game V3 Score"] = game_score
+            r["High Scoring Game Label"] = _ow_expected_run_label_v20(game_score)
+            r["Game V3 Label"] = _ow_expected_run_label_v20(game_score)
+        if old_team is not None and new_team is not None:
+            delta_runs = float(new_team) - float(old_team)
+            r["Expected Runs V20 Delta"] = round(delta_runs, 2)
+            likely = _ow_num_v19(r, ["Likely Score"], None)
+            if likely is not None and abs(delta_runs) >= 0.05:
+                r["Likely Score Legacy"] = likely
+                r["Likely Score"] = int(round(clamp(likely + clamp(delta_runs * 4.0, -4.0, 4.0), 0, 98)))
+            shadow = _ow_num_v19(r, ["Shadow Adjusted Score"], None)
+            if shadow is not None and abs(delta_runs) >= 0.05:
+                r["Shadow Adjusted Score Legacy"] = shadow
+                r["Shadow Adjusted Score"] = round(float(clamp(shadow + clamp(delta_runs * 2.5, -3.0, 3.0), 0, 100)), 1)
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _ow_expected_runs_audit_table_v20(df, board_name):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    src = d.get("Expected Runs V20 Source", d.get("Team Implied Runs Source", pd.Series(["MISSING"] * len(d)))).fillna("MISSING").astype(str)
+    direct = src.map(_ow_direct_team_total_source_v20)
+    return pd.DataFrame([{
+        "Board": board_name,
+        "Rows": len(d),
+        "Direct Market Team Totals": int(direct.sum()),
+        "Proxy/Upgraded Expected Runs": int((~direct).sum()),
+        "Avg Expected Runs V20": round(pd.to_numeric(d.get("Expected Runs V20", pd.Series(dtype=float)), errors="coerce").mean(), 2),
+        "Avg Expected Runs Delta": round(pd.to_numeric(d.get("Expected Runs V20 Delta", pd.Series(dtype=float)), errors="coerce").mean(), 2),
+        "Missing Team Runs": int(d.get("Team Implied Runs", pd.Series([None] * len(d))).isna().sum()) if "Team Implied Runs" in d.columns else len(d),
+        "Version": OW_EXPECTED_RUNS_V20_VERSION,
+    }])
+
+
+_ow_build_research_before_expected_runs_v20 = build_v3_batter_research_table
+_ow_build_home_run_before_expected_runs_v20 = build_v3_home_run_table
+_ow_build_upside_before_expected_runs_v20 = build_v3_batter_upside_board_final
+
+
+def build_v3_batter_research_table(market="HRR"):
+    got = _ow_build_research_before_expected_runs_v20(market)
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_expected_runs_v20_to_df(df)
+        df = _ow_apply_batter_selection_gates_v19(df, board_name=f"{market}_V20_EXPECTED_RUNS")
+        meta["expected_runs_v20"] = OW_EXPECTED_RUNS_V20_VERSION
+        meta["expected_runs_v20_note"] = "Direct team totals preserved; proxy rows upgraded with pitcher/contact/leash/bullpen/park context."
+        return df, meta
+    df = _ow_apply_expected_runs_v20_to_df(got)
+    return _ow_apply_batter_selection_gates_v19(df, board_name=f"{market}_V20_EXPECTED_RUNS")
+
+
+def build_v3_home_run_table():
+    got = _ow_build_home_run_before_expected_runs_v20()
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_expected_runs_v20_to_df(df)
+        df = _ow_apply_batter_selection_gates_v19(df, board_name="HOME_RUNS_V20_EXPECTED_RUNS")
+        meta["expected_runs_v20"] = OW_EXPECTED_RUNS_V20_VERSION
+        return df, meta
+    df = _ow_apply_expected_runs_v20_to_df(got)
+    return _ow_apply_batter_selection_gates_v19(df, board_name="HOME_RUNS_V20_EXPECTED_RUNS")
+
+
+def build_v3_batter_upside_board_final():
+    df = _ow_build_upside_before_expected_runs_v20()
+    df = _ow_apply_expected_runs_v20_to_df(df)
+    return _ow_apply_batter_selection_gates_v19(df, board_name="BATTER_UPSIDE_V20_EXPECTED_RUNS")
+
+
+_ow_render_learning_before_expected_runs_v20 = render_v3_batter_learning_lab_tab
+
+
+def render_v3_batter_learning_lab_tab():
+    _ow_render_learning_before_expected_runs_v20()
+    st.divider()
+    st.markdown("### Expected Runs Data Audit V20")
+    st.caption("Shows whether the batter boards are using direct market team totals or the upgraded MLB matchup proxy. Direct totals win whenever present.")
+    frames = []
+    try:
+        hrr, _ = build_v3_batter_research_table("HRR")
+        frames.append(_ow_expected_runs_audit_table_v20(hrr, "H+R+RBI"))
+    except Exception:
+        pass
+    try:
+        hr, _ = build_v3_home_run_table()
+        frames.append(_ow_expected_runs_audit_table_v20(hr, "Home Runs"))
+    except Exception:
+        pass
+    try:
+        up = build_v3_batter_upside_board_final()
+        frames.append(_ow_expected_runs_audit_table_v20(up, "Batter Upside"))
+    except Exception:
+        pass
+    frames = [x for x in frames if isinstance(x, pd.DataFrame) and not x.empty]
+    if frames:
+        st.dataframe(pd.concat(frames, ignore_index=True, sort=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("Build/refresh a batter board to audit expected-runs coverage.")
+    st.info("Audit read: if Direct Market Team Totals is 0, the app is not pulling sportsbook team totals for that board and is using the V20 matchup proxy instead.")
+
 # Keep the repaired MLB-official grader active regardless of whether full-game
 # projections are opened. The grading system is intentionally independent of
 # the fast/main vs on-demand/game projection split.
