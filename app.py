@@ -48724,6 +48724,7 @@ with st.sidebar:
 # V24 AUTOMATIC BATTER LINE PROVIDER FALLBACK
 # -------------------------
 OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24 = "OW_AUTO_BATTER_LINE_PROVIDER_V24_2026_09_08"
+OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25 = "OW_PRIZEPICKS_BATTER_PUBLIC_FEED_V25_2026_09_09"
 PROPLINE_BASE = "https://api.prop-line.com/v1"
 PROPLINE_API_KEY = get_secret("PROPLINE_API_KEY", "")
 PROPLINE_BATTER_MARKETS_V24 = "batter_hits_runs_rbis,batter_home_runs"
@@ -48925,6 +48926,177 @@ def _ow_v24_dedup_provider_rows(rows):
     return [v[1] for v in best.values()]
 
 
+def _ow_v25_prizepicks_market(stat_type, blob=""):
+    text = f"{stat_type or ''} {blob or ''}".lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if "homerun" in compact or "batterhomeruns" in compact:
+        return "Home Runs"
+    if (
+        "hitsrunsrbis" in compact
+        or "h+r+rbi" in text
+        or "hrr" in compact
+        or ("hits" in text and "runs" in text and "rbi" in text)
+    ):
+        return "HRR"
+    return ""
+
+
+def _ow_v25_prizepicks_player_maps(payload):
+    players = {}
+    if not isinstance(payload, dict):
+        return players
+    for inc in payload.get("included", []) or []:
+        if not isinstance(inc, dict):
+            continue
+        inc_type = str(inc.get("type") or "").lower()
+        if inc_type not in {"new_player", "player"}:
+            continue
+        attrs = inc.get("attributes") if isinstance(inc.get("attributes"), dict) else {}
+        pid = str(inc.get("id") or attrs.get("id") or "")
+        name = attrs.get("name") or attrs.get("display_name") or attrs.get("full_name")
+        if not pid or not name:
+            continue
+        players[pid] = {
+            "name": str(name),
+            "team": attrs.get("team") or attrs.get("team_name") or attrs.get("team_abbreviation") or "",
+            "league": attrs.get("league") or attrs.get("league_name") or attrs.get("sport") or "",
+        }
+    return players
+
+
+def _ow_v25_prizepicks_rows_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    players = _ow_v25_prizepicks_player_maps(payload)
+    rows = []
+    for item in payload.get("data", []) or []:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+        blob = _ow_v24_text_blob(item, limit=1000)
+        stat_type = (
+            attrs.get("stat_type")
+            or attrs.get("stat_display_name")
+            or attrs.get("name")
+            or attrs.get("market")
+            or attrs.get("description")
+            or ""
+        )
+        market = _ow_v25_prizepicks_market(stat_type, blob)
+        if market not in {"HRR", "Home Runs"}:
+            continue
+        line = safe_float(attrs.get("line_score") or attrs.get("line") or attrs.get("projection"), None)
+        if not _ow_v24_provider_line_ok(market, line):
+            continue
+        rel = item.get("relationships") if isinstance(item.get("relationships"), dict) else {}
+        pdata = {}
+        for rel_key in ("new_player", "player"):
+            rel_obj = rel.get(rel_key)
+            if isinstance(rel_obj, dict) and isinstance(rel_obj.get("data"), dict):
+                pdata = rel_obj.get("data") or {}
+                break
+        info = players.get(str(pdata.get("id") or ""), {})
+        raw_player = (
+            info.get("name")
+            or attrs.get("player_name")
+            or attrs.get("player")
+            or attrs.get("description")
+            or attrs.get("display_name")
+            or ""
+        )
+        player = _ow_v24_clean_provider_player(raw_player)
+        if not player or len(_v3_norm_name(player).split()) < 2:
+            continue
+        team = _ow_v24_team_abbr_from_prop_line(
+            info.get("team") or attrs.get("team") or attrs.get("team_name") or attrs.get("team_abbreviation") or ""
+        )
+        league_blob = f"{info.get('league','')} {attrs.get('league','')} {attrs.get('league_name','')} {attrs.get('sport','')}".lower()
+        if league_blob.strip() and not any(x in league_blob for x in ("mlb", "baseball")):
+            continue
+        rows.append({
+            "Source": "PrizePicks",
+            "Provider": "PrizePicks",
+            "Bookmaker": "PrizePicks",
+            "Book Key": "prizepicks",
+            "Player": player,
+            "Team": team,
+            "Opponent": "",
+            "Market": market,
+            "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+            "Line": float(line),
+            "Pick": "OVER",
+            "Evidence": f"PrizePicks | {stat_type} | {player} {line}",
+            "Line ID": str(item.get("id") or f"prizepicks-{market}-{player}-{line}"),
+            "UD Parser": OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25,
+            "Line Feed Backup": "PRIZEPICKS_PUBLIC",
+            "Line Feed Backup Version": OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25,
+            "Sportsbook Market Status": "PRIZEPICKS_PUBLIC_LINE",
+            "UD Start Time": attrs.get("start_time") or attrs.get("startTime") or "",
+        })
+    return _ow_v24_dedup_provider_rows(rows)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _ow_fetch_prizepicks_batter_lines_v25():
+    debug = {
+        "version": OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25,
+        "provider": "PrizePicks",
+        "status": "NO_LINES",
+        "rows": 0,
+        "hrr": 0,
+        "hr": 0,
+        "requests": [],
+    }
+    variants = [
+        {"league_id": "2", "per_page": "250", "single_stat": "true"},
+        {"league_id": "MLB", "per_page": "250", "single_stat": "true"},
+        {"per_page": "250", "single_stat": "true"},
+        None,
+    ]
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Origin": "https://app.prizepicks.com",
+        "Referer": "https://app.prizepicks.com/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0 Safari/537.36",
+    }
+    rows = []
+    for params in variants:
+        try:
+            r = requests.get(PRIZEPICKS_URL, params=params or None, timeout=18, headers=headers)
+            req = {
+                "endpoint": PRIZEPICKS_URL,
+                "params": params or {},
+                "http_status": int(getattr(r, "status_code", 0) or 0),
+            }
+            if getattr(r, "status_code", 0) != 200:
+                req["body"] = str(getattr(r, "text", ""))[:240]
+                debug["requests"].append(req)
+                continue
+            try:
+                payload = r.json()
+            except Exception as exc:
+                req["json_error"] = str(exc)[:160]
+                debug["requests"].append(req)
+                continue
+            got = _ow_v25_prizepicks_rows_from_payload(payload)
+            req["rows"] = len(got)
+            debug["requests"].append(req)
+            rows.extend(got)
+            if rows:
+                break
+        except Exception as exc:
+            debug["requests"].append({"endpoint": PRIZEPICKS_URL, "params": params or {}, "error": str(exc)[:220]})
+    rows = _ow_v24_dedup_provider_rows(rows)
+    debug.update({
+        "status": "OK" if rows else "BLOCKED_OR_EMPTY",
+        "rows": len(rows),
+        "hrr": sum(1 for r in rows if r.get("Market") == "HRR"),
+        "hr": sum(1 for r in rows if r.get("Market") == "Home Runs"),
+        "note": "No-key PrizePicks public feed attempt. If HTTP 403 appears, their browser protection blocked server-side pulling.",
+    })
+    return rows, debug
+
+
 def _ow_v24_current_schedule_pairs():
     pairs = set()
     try:
@@ -49017,7 +49189,20 @@ def _ow_fetch_propline_batter_lines_v24():
 
 
 def _ow_auto_provider_batter_rows_v24(market=None):
-    rows, debug = _ow_fetch_propline_batter_lines_v24()
+    pp_rows, pp_debug = _ow_fetch_prizepicks_batter_lines_v25()
+    rows = pp_rows or []
+    debug = {"version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24, "providers": {"prizepicks_public": pp_debug}}
+    if not rows:
+        pl_rows, pl_debug = _ow_fetch_propline_batter_lines_v24()
+        rows = pl_rows or []
+        debug["providers"]["propline"] = pl_debug
+    debug.update({
+        "status": "OK" if rows else "NO_PROVIDER_LINES",
+        "rows": len(rows),
+        "hrr": sum(1 for r in rows if isinstance(r, dict) and r.get("Market") == "HRR"),
+        "hr": sum(1 for r in rows if isinstance(r, dict) and r.get("Market") == "Home Runs"),
+        "note": "Tried no-key PrizePicks first, then PropLine if PROPLINE_API_KEY is configured.",
+    })
     try:
         st.session_state["ow_auto_provider_batter_line_debug_v24"] = debug
     except Exception:
@@ -49123,9 +49308,10 @@ def _v3_fetch_ud_home_run_rows():
 with st.sidebar:
     with st.expander("AUTO LINE FEEDS", expanded=False):
         provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24", {})
-        st.caption("Order: Underdog first. If Underdog is blocked, PropLine can pull HRR/Home Run rows when PROPLINE_API_KEY is set.")
+        st.caption("Order: Underdog first, then no-key PrizePicks attempt, then PropLine if PROPLINE_API_KEY is set.")
         st.write({
             "Underdog direct feed": "blocked/empty only if the endpoint returns no rows",
+            "PrizePicks public feed": "auto-tried; may be blocked by browser protection",
             "PROPLINE_API_KEY": "configured" if bool(PROPLINE_API_KEY or get_secret("PROPLINE_API_KEY", "")) else "missing",
             "last_provider_scan": provider_debug if isinstance(provider_debug, dict) else {},
         })
