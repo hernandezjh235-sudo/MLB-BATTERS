@@ -36366,6 +36366,7 @@ def build_v3_batter_upside_board_final():
 def _ow_render_batter_line_feed_empty_v21(title, meta=None, debug_key="final_ud_batter_line_debug"):
     """Friendly empty state for real-line outages without dumping raw JSON."""
     meta = dict(meta or {}) if isinstance(meta, dict) else {"meta": str(meta)}
+    key_suffix = re.sub(r"[^A-Za-z0-9]+", "_", f"{title}_{debug_key}").strip("_").lower()[:60]
     try:
         debug = st.session_state.get(debug_key) or st.session_state.get("final_ud_batter_line_debug") or {}
     except Exception:
@@ -36376,31 +36377,107 @@ def _ow_render_batter_line_feed_empty_v21(title, meta=None, debug_key="final_ud_
         http_err = {}
 
     status = str(meta.get("status") or debug.get("status") or "NO_LINES")
+    try:
+        provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24") or {}
+    except Exception:
+        provider_debug = {}
     st.warning(f"No active {title} rows loaded.")
     if isinstance(http_err, dict) and http_err.get("status_code"):
+        provider_status = ""
+        if isinstance(provider_debug, dict):
+            provider_status = str(provider_debug.get("status") or "")
+        if provider_status == "DISABLED":
+            provider_note = " No automatic backup provider key is configured yet."
+        elif provider_status:
+            provider_note = f" Automatic backup provider status: {provider_status}."
+        else:
+            provider_note = ""
         st.info(
             f"Line feed check: Underdog returned HTTP {http_err.get('status_code')}. "
             "That means the app is running, but the live batter line feed is not giving HRR/HR rows right now. "
-            "Grading still needs saved real-line rows or an imported frozen snapshot."
+            "The app will now try the configured automatic provider fallback before manual backup tools."
+            f"{provider_note}"
         )
     elif status.upper() in {"NO_LINES", "NO_RESPONSE"} or int(meta.get("ud_rows", 0) or 0) == 0:
         st.info(
             "The app did not receive any active batter prop rows from the live feed. "
-            "The top board can still show pitcher/context rows, but HRR/Home Run grading needs posted batter lines or a saved CSV snapshot."
+            "The top board can still show pitcher/context rows, but HRR/Home Run grading needs posted batter lines from Underdog or a configured automatic provider."
         )
     else:
         st.info("No playable rows passed the filters yet. Check the line-feed details before changing projection math.")
 
-    with st.expander("Line feed details", expanded=False):
-        try:
-            st.json({
-                "build": meta,
-                "underdog_parser": debug if isinstance(debug, dict) else {"debug": str(debug)},
-                "last_http": http_err if isinstance(http_err, dict) else {"debug": str(http_err)},
-                "version": "OW_BATTER_LINE_FEED_EMPTY_STATE_V21_2026_09_08",
-            })
-        except Exception:
-            st.write({"build": meta, "underdog_parser": debug, "last_http": http_err})
+    if "_ow_build_uploaded_csv_boards_v22" in globals():
+        st.markdown("#### Restore Cards From Exported CSV")
+        st.caption("Use this when the live feed is blocked. Upload your HRR, Home Run, or Batter Upside export; the app will use those rows as the active board.")
+        uploads = st.file_uploader(
+            "Upload exported batter CSV",
+            type=["csv"],
+            accept_multiple_files=True,
+            key=f"ow_inline_csv_backup_upload_{key_suffix}",
+        )
+        if uploads and st.button("Use CSV as active batter board", key=f"ow_inline_csv_backup_use_{key_suffix}", use_container_width=True, type="primary"):
+            boards = _ow_build_uploaded_csv_boards_v22(uploads)
+            if boards.get("meta", {}).get("errors"):
+                st.error("One or more CSVs could not be read.")
+                st.json(boards["meta"]["errors"])
+            elif not any(isinstance(boards.get(k), pd.DataFrame) and not boards.get(k).empty for k in ["HRR", "HOME_RUNS", "BATTER_UPSIDE"]):
+                st.warning("No HRR/Home Run/Batter Upside rows were found in those CSVs.")
+            else:
+                st.session_state["ow_live_line_csv_backup_v22"] = boards
+                try:
+                    st.session_state.pop("ow_core_board_cache_v7", None)
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success(f"CSV backup loaded: HRR {len(boards.get('HRR', []))}, HR {len(boards.get('HOME_RUNS', []))}, Upside {len(boards.get('BATTER_UPSIDE', []))}.")
+                st.rerun()
+
+    if "_ow_parse_manual_batter_lines_v23" in globals():
+        st.markdown("#### Paste Today's Lines")
+        st.caption("No CSV needed. Paste lines like `Aaron Judge H+R+RBI 1.5 OVER` or `Shohei Ohtani Home Runs 0.5 OVER`.")
+        pasted = st.text_area(
+            "Paste active batter lines",
+            height=120,
+            key=f"ow_inline_manual_lines_text_{key_suffix}",
+        )
+        p1, p2 = st.columns(2)
+        if p1.button("Use pasted lines", key=f"ow_inline_manual_lines_use_{key_suffix}", use_container_width=True, type="primary"):
+            rows, errors = _ow_parse_manual_batter_lines_v23(pasted)
+            if not rows:
+                st.warning("I could not read any HRR/Home Run lines from that paste. Include player, market, and line, like `Kyle Tucker H+R+RBI 1.5 OVER`.")
+                if errors:
+                    st.caption("; ".join(errors[:6]))
+            else:
+                st.session_state["ow_manual_batter_lines_v23"] = rows
+                try:
+                    st.session_state.pop("ow_core_board_cache_v7", None)
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success(f"Pasted lines loaded: {sum(1 for r in rows if r.get('Market') == 'HRR')} HRR, {sum(1 for r in rows if r.get('Market') == 'Home Runs')} HR.")
+                st.rerun()
+        if p2.button("Clear pasted lines", key=f"ow_inline_manual_lines_clear_{key_suffix}", use_container_width=True):
+            try:
+                st.session_state.pop("ow_manual_batter_lines_v23", None)
+                st.session_state.pop("ow_core_board_cache_v7", None)
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success("Pasted lines cleared.")
+            st.rerun()
+
+    show_debug = st.toggle("Show technical line-feed details", value=False, key=f"ow_show_line_feed_debug_{key_suffix}")
+    if show_debug:
+        with st.expander("Line feed details", expanded=True):
+            try:
+                st.json({
+                    "build": meta,
+                    "underdog_parser": debug if isinstance(debug, dict) else {"debug": str(debug)},
+                    "last_http": http_err if isinstance(http_err, dict) else {"debug": str(http_err)},
+                    "version": "OW_BATTER_LINE_FEED_EMPTY_STATE_V21_2026_09_08",
+                })
+            except Exception:
+                st.write({"build": meta, "underdog_parser": debug, "last_http": http_err})
 
 
 def render_v3_batter_research_tab(market="HRR"):
@@ -48153,10 +48230,16 @@ def _ow_normalize_uploaded_line_csv_v22(df, filename="projection.csv"):
         })
 
         if kind == "HRR" or _v3_is_live_ud_line(_ow_csv_pick_value_v22(src, "HRR Line")):
-            line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HRR Line", "Prop Line")
-            projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HRR Projection", "Prior H+R+RBI Projection")
-            pick = _ow_csv_pick_value_v22(src, "Pick", "Best Pick", "HRR Pick", "Model Side", "Side")
-            win = _ow_csv_pick_value_v22(src, "Win Probability %", "Best Win/Hit %", "HRR Win Probability %", "HRR Over Probability %", "Over Probability %")
+            if kind == "HRR":
+                line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HRR Line", "Prop Line")
+                projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HRR Projection", "Prior H+R+RBI Projection")
+                pick = _ow_csv_pick_value_v22(src, "Pick", "Best Pick", "HRR Pick", "Model Side", "Side")
+                win = _ow_csv_pick_value_v22(src, "Win Probability %", "Best Win/Hit %", "HRR Win Probability %", "HRR Over Probability %", "Over Probability %")
+            else:
+                line = _ow_csv_pick_value_v22(src, "HRR Line")
+                projection = _ow_csv_pick_value_v22(src, "HRR Projection", "Projection", "Prior H+R+RBI Projection")
+                pick = _ow_csv_pick_value_v22(src, "HRR Pick")
+                win = _ow_csv_pick_value_v22(src, "HRR Win Probability %", "HRR Over Probability %")
             h = dict(base)
             h.update({
                 "Market": "H+R+RBI",
@@ -48182,10 +48265,16 @@ def _ow_normalize_uploaded_line_csv_v22(df, filename="projection.csv"):
                 rows_upside.append(h)
 
         if kind == "HR" or _v3_is_live_ud_line(_ow_csv_pick_value_v22(src, "HR Line")):
-            line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HR Line", "Prop Line")
-            projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HR Projection")
-            pick = _ow_csv_pick_value_v22(src, "Pick", "Best Pick", "HR Pick", "Model Side", "Side")
-            win = _ow_csv_pick_value_v22(src, "Win Probability %", "Best Win/Hit %", "HR Probability %", "HR Win Probability %")
+            if kind == "HR":
+                line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HR Line", "Prop Line")
+                projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HR Projection")
+                pick = _ow_csv_pick_value_v22(src, "Pick", "Best Pick", "HR Pick", "Model Side", "Side")
+                win = _ow_csv_pick_value_v22(src, "Win Probability %", "Best Win/Hit %", "HR Probability %", "HR Win Probability %")
+            else:
+                line = _ow_csv_pick_value_v22(src, "HR Line")
+                projection = _ow_csv_pick_value_v22(src, "HR Projection", "Projection")
+                pick = _ow_csv_pick_value_v22(src, "HR Pick")
+                win = _ow_csv_pick_value_v22(src, "HR Probability %", "HR Win Probability %")
             h = dict(base)
             h.update({
                 "Market": "Home Runs",
@@ -48422,6 +48511,621 @@ with st.sidebar:
         if active:
             meta = active.get("meta", {})
             st.caption(f"Active CSV backup: HRR {len(active.get('HRR', []))}, HR {len(active.get('HOME_RUNS', []))}, Upside {len(active.get('BATTER_UPSIDE', []))}. Files: {meta.get('files', 0)}.")
+
+
+# -------------------------
+# V23 MANUAL LINE PASTE BACKUP
+# -------------------------
+OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23 = "OW_MANUAL_BATTER_LINE_PASTE_V23_2026_09_08"
+
+
+def _ow_manual_line_market_v23(text):
+    s = str(text or "")
+    compact = re.sub(r"[^a-z0-9]+", "", s.lower())
+    low = s.lower()
+    if "home run" in low or "homer" in low or (re.search(r"\bhr\b", low) and "hrr" not in compact):
+        return "Home Runs"
+    if "h+r+rbi" in low or "h+r+r" in low or "hrr" in compact or "hits+runs" in compact or "hitsrunsrbis" in compact:
+        return "HRR"
+    return ""
+
+
+def _ow_manual_line_number_v23(text, market):
+    vals = []
+    for m in re.finditer(r"(?<!\d)([0-8](?:\\.5)?)(?!\\d)", str(text or "")):
+        try:
+            vals.append(float(m.group(1)))
+        except Exception:
+            pass
+    if not vals:
+        return None
+    if market == "Home Runs":
+        for v in vals:
+            if 0.5 <= v <= 2.5:
+                return v
+    for v in vals:
+        if 0.5 <= v <= 6.5:
+            return v
+    return None
+
+
+def _ow_manual_clean_player_v23(text, market, line):
+    s = str(text or "")
+    s = re.sub(r"\\([^)]*\\)", " ", s)
+    s = re.sub(r"(?i)\\b(?:over|under|higher|lower|pass|watch|lean|sprinkle|official)\\b", " ", s)
+    s = re.sub(r"(?i)\\b(?:home\\s*runs?|homeruns?|homers?|hr)\\b", " ", s)
+    s = re.sub(r"(?i)\\b(?:hits?\\s*\\+\\s*runs?\\s*\\+\\s*rbis?|h\\s*\\+\\s*r\\s*\\+\\s*rbi|h\\s*\\+\\s*r\\s*\\+\\s*r|hrr)\\b", " ", s)
+    if line is not None:
+        s = re.sub(rf"(?<!\\d){re.escape(str(line).rstrip('0').rstrip('.'))}(?:\\.0)?(?!\\d)", " ", s)
+        s = re.sub(rf"(?<!\\d){float(line):.1f}(?!\\d)", " ", s)
+    s = re.sub(r"[-|•,:;/]+", " ", s)
+    s = re.sub(r"\\b[A-Z]{2,3}\\s*(?:@|vs|v)\\s*[A-Z]{2,3}\\b", " ", s, flags=re.I)
+    s = re.sub(r"\\s+", " ", s).strip()
+    if "_ow_clean_ud_player" in globals():
+        try:
+            s = _ow_clean_ud_player(s)
+        except Exception:
+            pass
+    words = s.split()
+    while len(words) > 5:
+        words = words[:5]
+    return " ".join(words).strip()
+
+
+def _ow_parse_manual_batter_lines_v23(text):
+    rows, errors = [], []
+    for raw in str(text or "").splitlines():
+        line_text = raw.strip()
+        if not line_text:
+            continue
+        market = _ow_manual_line_market_v23(line_text)
+        if not market:
+            errors.append(f"missing market: {line_text[:80]}")
+            continue
+        line = _ow_manual_line_number_v23(line_text, market)
+        if line is None:
+            errors.append(f"missing line: {line_text[:80]}")
+            continue
+        player = _ow_manual_clean_player_v23(line_text, market, line)
+        if not player or len(_v3_norm_name(player).split()) < 2:
+            errors.append(f"missing player: {line_text[:80]}")
+            continue
+        pick = "UNDER" if re.search(r"(?i)\\b(?:under|lower)\\b", line_text) else "OVER"
+        team_match = re.search(r"\\b([A-Z]{2,3})\\s*(?:@|vs|v)\\s*([A-Z]{2,3})\\b", line_text)
+        team = _ow_team_abbr(team_match.group(1)) if team_match else ""
+        opp = _ow_team_abbr(team_match.group(2)) if team_match else ""
+        rows.append({
+            "Source": "Manual Paste",
+            "Player": player,
+            "Team": team,
+            "Opponent": opp,
+            "Market": "HRR" if market == "HRR" else "Home Runs",
+            "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+            "Line": float(line),
+            "Pick": pick,
+            "Evidence": line_text[:350],
+            "Line ID": f"manual-{abs(hash((player, market, float(line), line_text))) % 10_000_000}",
+            "UD Parser": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+            "Line Feed Backup": "MANUAL_PASTE",
+            "Line Feed Backup Version": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+        })
+    dedup = {}
+    for r in rows:
+        key = (_v3_norm_name(r.get("Player")), r.get("Market"), round(float(r.get("Line") or 0), 3))
+        dedup[key] = r
+    return list(dedup.values()), errors
+
+
+def _ow_manual_batter_line_rows_v23(market=None):
+    try:
+        rows = st.session_state.get("ow_manual_batter_lines_v23") or []
+    except Exception:
+        rows = []
+    if not isinstance(rows, list):
+        return []
+    if not market:
+        return [dict(r) for r in rows if isinstance(r, dict)]
+    want = "Home Runs" if str(market).upper() in {"HR", "HOME RUNS", "HOME_RUNS"} else "HRR"
+    return [dict(r) for r in rows if isinstance(r, dict) and str(r.get("Market")) == want]
+
+
+_ow_fetch_hrr_before_manual_lines_v23 = fetch_underdog_batter_prop_rows
+_ow_fetch_hr_before_manual_lines_v23 = _v3_fetch_ud_home_run_rows
+
+
+def fetch_underdog_batter_prop_rows():
+    manual = _ow_manual_batter_line_rows_v23("HRR")
+    if manual:
+        try:
+            st.session_state["hrr_ud_debug"] = {
+                "status": "MANUAL_PASTE_ACTIVE",
+                "mode": "MANUAL_LINE_BACKUP",
+                "returned_hrr_rows": len(manual),
+                "version": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+            }
+        except Exception:
+            pass
+        return manual
+    return _ow_fetch_hrr_before_manual_lines_v23()
+
+
+def _v3_ud_hrr_rows():
+    return fetch_underdog_batter_prop_rows() or []
+
+
+def _v3_fetch_ud_home_run_rows():
+    manual = _ow_manual_batter_line_rows_v23("Home Runs")
+    if manual:
+        try:
+            st.session_state["hr_ud_debug"] = {
+                "status": "MANUAL_PASTE_ACTIVE",
+                "mode": "MANUAL_LINE_BACKUP",
+                "returned_hr_rows": len(manual),
+                "version": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+            }
+        except Exception:
+            pass
+        return manual
+    return _ow_fetch_hr_before_manual_lines_v23()
+
+
+with st.sidebar:
+    with st.expander("✍️ PASTE LIVE BATTER LINES", expanded=False):
+        st.caption("Use this when Underdog blocks the automatic feed and you do not have a CSV. Paste current lines from the app; cards and grading use the same projection builders.")
+        _ow_manual_text_v23 = st.text_area(
+            "One line per batter",
+            placeholder="Aaron Judge H+R+RBI 1.5 OVER\nShohei Ohtani Home Runs 0.5 OVER",
+            height=120,
+            key="ow_manual_batter_line_paste_text_v23",
+        )
+        m1, m2 = st.columns(2)
+        if m1.button("Use pasted batter lines", key="ow_use_manual_batter_lines_v23", use_container_width=True, type="primary"):
+            rows, errors = _ow_parse_manual_batter_lines_v23(_ow_manual_text_v23)
+            if not rows:
+                st.warning("No usable HRR/Home Run lines found in that paste.")
+                if errors:
+                    st.caption("; ".join(errors[:6]))
+            else:
+                st.session_state["ow_manual_batter_lines_v23"] = rows
+                try:
+                    st.session_state.pop("ow_core_board_cache_v7", None)
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success(f"Loaded {len(rows)} pasted batter lines.")
+                st.rerun()
+        if m2.button("Clear pasted batter lines", key="ow_clear_manual_batter_lines_v23", use_container_width=True):
+            try:
+                st.session_state.pop("ow_manual_batter_lines_v23", None)
+                st.session_state.pop("ow_core_board_cache_v7", None)
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success("Pasted batter lines cleared.")
+            st.rerun()
+        active_manual = _ow_manual_batter_line_rows_v23()
+        if active_manual:
+            st.caption(f"Active pasted lines: {len(active_manual)} total · HRR {len(_ow_manual_batter_line_rows_v23('HRR'))} · HR {len(_ow_manual_batter_line_rows_v23('Home Runs'))}.")
+
+
+# -------------------------
+# V24 AUTOMATIC BATTER LINE PROVIDER FALLBACK
+# -------------------------
+OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24 = "OW_AUTO_BATTER_LINE_PROVIDER_V24_2026_09_08"
+PROPLINE_BASE = "https://api.prop-line.com/v1"
+PROPLINE_API_KEY = get_secret("PROPLINE_API_KEY", "")
+PROPLINE_BATTER_MARKETS_V24 = "batter_hits_runs_rbis,batter_home_runs"
+PROPLINE_BOOK_PRIORITY_V24 = {
+    "underdog": 100,
+    "prizepicks": 95,
+    "fanduel": 80,
+    "draftkings": 78,
+    "fanatics": 76,
+    "betmgm": 74,
+    "pinnacle": 72,
+    "bovada": 70,
+    "lowvig": 68,
+    "betonlineag": 66,
+    "betrivers": 64,
+}
+
+
+def _ow_v24_pick(obj, *keys):
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        if key in obj and obj.get(key) not in (None, "", "—"):
+            return obj.get(key)
+        attrs = obj.get("attributes")
+        if isinstance(attrs, dict) and key in attrs and attrs.get(key) not in (None, "", "—"):
+            return attrs.get(key)
+    return None
+
+
+def _ow_v24_text_blob(value, limit=2200):
+    parts = []
+
+    def walk(v):
+        if len(" ".join(parts)) > limit:
+            return
+        if isinstance(v, dict):
+            for child in v.values():
+                walk(child)
+        elif isinstance(v, list):
+            for child in v[:40]:
+                walk(child)
+        elif v not in (None, ""):
+            s = str(v)
+            if len(s) <= 180:
+                parts.append(s)
+
+    walk(value)
+    return " | ".join(parts)[:limit]
+
+
+def _ow_v24_market_from_key(key, blob=""):
+    text = f"{key or ''} {blob or ''}".lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if "batter_home_runs" in text or "batterhomeruns" in compact or "home_runs" in text or "homeruns" in compact:
+        return "Home Runs"
+    if "batter_hits_runs_rbis" in text or "hits_runs_rbis" in text or "hitsrunsrbis" in compact or "h+r+rbi" in text or "hrr" in compact:
+        return "HRR"
+    return ""
+
+
+def _ow_v24_clean_provider_player(value):
+    s = str(value or "").strip()
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\b[A-Z]{2,3}\b$", " ", s).strip()
+    if "_ow_clean_ud_player" in globals():
+        try:
+            s = _ow_clean_ud_player(s)
+        except Exception:
+            pass
+    s = re.sub(r"\s+", " ", s).strip(" -|:")
+    return s
+
+
+def _ow_v24_team_abbr_from_prop_line(name):
+    mapped = _ow_team_abbr(name)
+    if mapped not in (None, "", "—"):
+        return mapped
+    low = str(name or "").lower()
+    team_aliases = {
+        "arizona": "AZ", "diamondbacks": "AZ", "atlanta": "ATL", "braves": "ATL",
+        "baltimore": "BAL", "orioles": "BAL", "boston": "BOS", "red sox": "BOS",
+        "chicago cubs": "CHC", "cubs": "CHC", "chicago white sox": "CWS", "white sox": "CWS",
+        "cincinnati": "CIN", "reds": "CIN", "cleveland": "CLE", "guardians": "CLE",
+        "colorado": "COL", "rockies": "COL", "detroit": "DET", "tigers": "DET",
+        "houston": "HOU", "astros": "HOU", "kansas city": "KC", "royals": "KC",
+        "los angeles angels": "LAA", "angels": "LAA", "los angeles dodgers": "LAD", "dodgers": "LAD",
+        "miami": "MIA", "marlins": "MIA", "milwaukee": "MIL", "brewers": "MIL",
+        "minnesota": "MIN", "twins": "MIN", "new york mets": "NYM", "mets": "NYM",
+        "new york yankees": "NYY", "yankees": "NYY", "oakland": "ATH", "athletics": "ATH",
+        "philadelphia": "PHI", "phillies": "PHI", "pittsburgh": "PIT", "pirates": "PIT",
+        "san diego": "SD", "padres": "SD", "san francisco": "SF", "giants": "SF",
+        "seattle": "SEA", "mariners": "SEA", "st. louis": "STL", "saint louis": "STL", "cardinals": "STL",
+        "tampa bay": "TB", "rays": "TB", "texas": "TEX", "rangers": "TEX",
+        "toronto": "TOR", "blue jays": "TOR", "washington": "WSH", "nationals": "WSH",
+    }
+    for token, abbr in team_aliases.items():
+        if token in low:
+            return abbr
+    return ""
+
+
+def _ow_v24_provider_line_ok(market, line):
+    val = safe_float(line, None)
+    if val is None:
+        return False
+    if str(market) == "Home Runs":
+        return 0.5 <= float(val) <= 2.5
+    if str(market) == "HRR":
+        return 0.5 <= float(val) <= 6.5
+    return False
+
+
+def _ow_v24_prop_line_rows_from_event(event):
+    if not isinstance(event, dict):
+        return []
+    home = event.get("home_team") or event.get("homeTeam") or ""
+    away = event.get("away_team") or event.get("awayTeam") or ""
+    home_abbr = _ow_v24_team_abbr_from_prop_line(home)
+    away_abbr = _ow_v24_team_abbr_from_prop_line(away)
+    event_id = str(event.get("id") or event.get("event_id") or "")
+    start = str(event.get("commence_time") or event.get("start_time") or "")
+    rows = []
+    for book in event.get("bookmakers") or []:
+        if not isinstance(book, dict):
+            continue
+        book_key = str(book.get("key") or book.get("bookmaker") or "").lower()
+        book_title = str(book.get("title") or book.get("name") or book_key or "PropLine")
+        for market_obj in book.get("markets") or []:
+            if not isinstance(market_obj, dict):
+                continue
+            market_key = str(market_obj.get("key") or market_obj.get("market_key") or "")
+            market = _ow_v24_market_from_key(market_key, _ow_v24_text_blob(market_obj, limit=800))
+            if market not in {"HRR", "Home Runs"}:
+                continue
+            for outcome in market_obj.get("outcomes") or []:
+                if not isinstance(outcome, dict):
+                    continue
+                side = str(outcome.get("name") or outcome.get("side") or outcome.get("label") or "").lower()
+                if side and not any(x in side for x in ("over", "higher", "yes")):
+                    continue
+                line = _ow_v24_pick(outcome, "point", "line", "stat_value", "value", "over_under_line")
+                if not _ow_v24_provider_line_ok(market, line):
+                    continue
+                raw_player = _ow_v24_pick(outcome, "description", "player", "player_name", "participant", "name")
+                player_team = ""
+                team_match = re.search(r"\(([A-Z]{2,3})\)", str(raw_player or ""))
+                if team_match:
+                    player_team = _ow_team_abbr(team_match.group(1))
+                player = _ow_v24_clean_provider_player(raw_player)
+                if not player or len(_v3_norm_name(player).split()) < 2:
+                    continue
+                team = player_team or _ow_v24_team_abbr_from_prop_line(_ow_v24_pick(outcome, "team", "team_name", "player_team"))
+                opp = ""
+                if team and home_abbr and away_abbr:
+                    opp = away_abbr if team == home_abbr else home_abbr if team == away_abbr else ""
+                rows.append({
+                    "Source": f"PropLine:{book_title}",
+                    "Provider": "PropLine",
+                    "Bookmaker": book_title,
+                    "Book Key": book_key,
+                    "Player": player,
+                    "Team": team,
+                    "Opponent": opp,
+                    "Market": market,
+                    "Market Label": "H+R+RBI" if market == "HRR" else "Home Runs",
+                    "Line": float(safe_float(line, 0)),
+                    "Price": safe_float(_ow_v24_pick(outcome, "price", "price_american", "american_odds", "odds"), None),
+                    "Evidence": f"{away} at {home} | {book_title} | {market_key} | {player} {line}",
+                    "Line ID": str(_ow_v24_pick(outcome, "outcome_id", "book_outcome_id", "id") or f"propline-{event_id}-{book_key}-{market}-{player}-{line}"),
+                    "UD Parser": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+                    "Line Feed Backup": "AUTOMATIC_PROVIDER",
+                    "Line Feed Backup Version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+                    "PropLine Event ID": event_id,
+                    "PropLine Start Time": start,
+                    "UD Start Time": start,
+                })
+    return rows
+
+
+def _ow_v24_dedup_provider_rows(rows):
+    best = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        player = _v3_norm_name(row.get("Player"))
+        market = str(row.get("Market") or "")
+        line = safe_float(row.get("Line"), None)
+        if not player or market not in {"HRR", "Home Runs"} or line is None:
+            continue
+        book_key = str(row.get("Book Key") or "").lower()
+        score = PROPLINE_BOOK_PRIORITY_V24.get(book_key, 40)
+        score += 5 if row.get("Line ID") else 0
+        score += 3 if row.get("Team") and row.get("Opponent") else 0
+        key = (player, market)
+        old = best.get(key)
+        if old is None or score > old[0]:
+            best[key] = (score, dict(row))
+    return [v[1] for v in best.values()]
+
+
+def _ow_v24_current_schedule_pairs():
+    pairs = set()
+    try:
+        sched = _v3_team_schedule_context_map() or {}
+    except Exception:
+        sched = {}
+    if not isinstance(sched, dict):
+        return pairs
+    for team, ctx in sched.items():
+        if not isinstance(ctx, dict):
+            continue
+        tm = _ow_team_abbr(team)
+        opp = _ow_team_abbr(ctx.get("Opponent"))
+        if tm and opp and tm != "—" and opp != "—":
+            pairs.add(frozenset([str(tm).upper(), str(opp).upper()]))
+    return pairs
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _ow_fetch_propline_batter_lines_v24():
+    debug = {
+        "version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+        "provider": "PropLine",
+        "status": "DISABLED",
+        "events": 0,
+        "events_with_rows": 0,
+        "rows": 0,
+        "hrr": 0,
+        "hr": 0,
+        "requests": [],
+    }
+    key = PROPLINE_API_KEY or get_secret("PROPLINE_API_KEY", "")
+    if not key:
+        debug["note"] = "Set PROPLINE_API_KEY in secrets/env to pull automatic batter prop lines when Underdog is blocked."
+        return [], debug
+    auth_params = {"apiKey": key}
+    events = safe_get_json(f"{PROPLINE_BASE}/sports/baseball_mlb/events", params=auth_params, timeout=18)
+    debug["requests"].append({"endpoint": f"{PROPLINE_BASE}/sports/baseball_mlb/events", "status": "OK" if events else "NO_RESPONSE"})
+    if isinstance(events, dict):
+        events = events.get("data") or events.get("events") or events.get("results") or []
+    if not isinstance(events, list):
+        debug["status"] = "BAD_EVENTS_PAYLOAD"
+        return [], debug
+    rows = []
+    current_pairs = _ow_v24_current_schedule_pairs()
+    checked_events = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("id") or event.get("event_id")
+        if event_id in (None, ""):
+            continue
+        home_abbr = _ow_v24_team_abbr_from_prop_line(event.get("home_team") or event.get("homeTeam") or "")
+        away_abbr = _ow_v24_team_abbr_from_prop_line(event.get("away_team") or event.get("awayTeam") or "")
+        if current_pairs and frozenset([str(home_abbr).upper(), str(away_abbr).upper()]) not in current_pairs:
+            continue
+        checked_events += 1
+        if checked_events > 30:
+            break
+        debug["events"] += 1
+        odds = safe_get_json(
+            f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds",
+            params={**auth_params, "markets": PROPLINE_BATTER_MARKETS_V24, "includeBookIds": "true"},
+            timeout=18,
+        )
+        debug["requests"].append({
+            "endpoint": f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds",
+            "status": "OK" if odds else "NO_RESPONSE",
+        })
+        if not isinstance(odds, dict):
+            continue
+        if not odds.get("home_team") and event.get("home_team"):
+            odds["home_team"] = event.get("home_team")
+        if not odds.get("away_team") and event.get("away_team"):
+            odds["away_team"] = event.get("away_team")
+        if not odds.get("commence_time") and event.get("commence_time"):
+            odds["commence_time"] = event.get("commence_time")
+        event_rows = _ow_v24_prop_line_rows_from_event(odds)
+        if event_rows:
+            debug["events_with_rows"] += 1
+            rows.extend(event_rows)
+    rows = _ow_v24_dedup_provider_rows(rows)
+    debug.update({
+        "status": "OK" if rows else "NO_LINES",
+        "rows": len(rows),
+        "hrr": sum(1 for r in rows if r.get("Market") == "HRR"),
+        "hr": sum(1 for r in rows if r.get("Market") == "Home Runs"),
+    })
+    return rows, debug
+
+
+def _ow_auto_provider_batter_rows_v24(market=None):
+    rows, debug = _ow_fetch_propline_batter_lines_v24()
+    try:
+        st.session_state["ow_auto_provider_batter_line_debug_v24"] = debug
+    except Exception:
+        pass
+    if not rows:
+        return []
+    if market:
+        want = "Home Runs" if str(market).upper() in {"HR", "HOME RUNS", "HOME_RUNS"} else "HRR"
+        rows = [r for r in rows if isinstance(r, dict) and str(r.get("Market")) == want]
+    try:
+        rows = _ow_ud_enrich_rows_with_mlb(rows)
+    except Exception:
+        pass
+    return rows
+
+
+_ow_fetch_hrr_before_auto_provider_v24 = fetch_underdog_batter_prop_rows
+_ow_fetch_hr_before_auto_provider_v24 = _v3_fetch_ud_home_run_rows
+
+
+def fetch_underdog_batter_prop_rows():
+    rows = []
+    try:
+        rows = _ow_fetch_hrr_before_manual_lines_v23()
+    except Exception:
+        try:
+            rows = _ow_fetch_hrr_before_auto_provider_v24()
+        except Exception:
+            rows = []
+    if rows:
+        return rows
+    provider = _ow_auto_provider_batter_rows_v24("HRR")
+    if provider:
+        try:
+            st.session_state["hrr_ud_debug"] = {
+                "status": "AUTO_PROVIDER_ACTIVE",
+                "mode": "PROPLINE_PLUS_MLB_PROJECTION",
+                "returned_hrr_rows": len(provider),
+                "version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+                "provider_debug": st.session_state.get("ow_auto_provider_batter_line_debug_v24", {}),
+            }
+        except Exception:
+            pass
+        return provider
+    manual = _ow_manual_batter_line_rows_v23("HRR")
+    if manual:
+        try:
+            st.session_state["hrr_ud_debug"] = {
+                "status": "MANUAL_PASTE_ACTIVE",
+                "mode": "MANUAL_LINE_BACKUP",
+                "returned_hrr_rows": len(manual),
+                "version": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+            }
+        except Exception:
+            pass
+        return manual
+    return []
+
+
+def _v3_ud_hrr_rows():
+    return fetch_underdog_batter_prop_rows() or []
+
+
+def _v3_fetch_ud_home_run_rows():
+    rows = []
+    try:
+        rows = _ow_fetch_hr_before_manual_lines_v23()
+    except Exception:
+        try:
+            rows = _ow_fetch_hr_before_auto_provider_v24()
+        except Exception:
+            rows = []
+    if rows:
+        return rows
+    provider = _ow_auto_provider_batter_rows_v24("Home Runs")
+    if provider:
+        try:
+            st.session_state["hr_ud_debug"] = {
+                "status": "AUTO_PROVIDER_ACTIVE",
+                "mode": "PROPLINE_PLUS_MLB_PROJECTION",
+                "returned_hr_rows": len(provider),
+                "version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+                "provider_debug": st.session_state.get("ow_auto_provider_batter_line_debug_v24", {}),
+            }
+        except Exception:
+            pass
+        return provider
+    manual = _ow_manual_batter_line_rows_v23("Home Runs")
+    if manual:
+        try:
+            st.session_state["hr_ud_debug"] = {
+                "status": "MANUAL_PASTE_ACTIVE",
+                "mode": "MANUAL_LINE_BACKUP",
+                "returned_hr_rows": len(manual),
+                "version": OW_MANUAL_BATTER_LINE_PASTE_VERSION_V23,
+            }
+        except Exception:
+            pass
+        return manual
+    return []
+
+
+with st.sidebar:
+    with st.expander("AUTO LINE FEEDS", expanded=False):
+        provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24", {})
+        st.caption("Order: Underdog first. If Underdog is blocked, PropLine can pull HRR/Home Run rows when PROPLINE_API_KEY is set.")
+        st.write({
+            "Underdog direct feed": "blocked/empty only if the endpoint returns no rows",
+            "PROPLINE_API_KEY": "configured" if bool(PROPLINE_API_KEY or get_secret("PROPLINE_API_KEY", "")) else "missing",
+            "last_provider_scan": provider_debug if isinstance(provider_debug, dict) else {},
+        })
+        if st.button("Clear line-feed cache", key="ow_clear_auto_line_feed_cache_v24", use_container_width=True):
+            try:
+                st.session_state.pop("ow_core_board_cache_v7", None)
+                st.session_state.pop("ow_auto_provider_batter_line_debug_v24", None)
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success("Line-feed cache cleared. Refresh the board again.")
+            st.rerun()
 
 
 _ow_render_top_before_line_feed_empty_v21 = render_v3_top_batter_plays_board
