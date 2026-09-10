@@ -49869,11 +49869,38 @@ def _ow_v27_clamp(value, lo=0.0, hi=100.0):
     return max(float(lo), min(float(hi), x))
 
 
+def _ow_v31_safe_score_num(value, default=None):
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    if isinstance(value, str):
+        value = value.strip().replace("%", "")
+        if value in ("", "N/A", "NA", "nan", "None", "null"):
+            return default
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def _ow_v31_score_part(team, score):
+    clean = _ow_v31_safe_score_num(score, None)
+    return f"{team} {'' if clean is None else int(clean)}"
+
+
 def _ow_v27_num(row, keys, default=None, pct=False):
     try:
         val = _ow_num_v19(row, keys, default, pct=pct)
-        if val is not None:
-            return val
+        clean = _ow_v31_safe_score_num(val, None)
+        if clean is not None:
+            return clean
     except Exception:
         pass
     r = row if isinstance(row, dict) else {}
@@ -49884,7 +49911,14 @@ def _ow_v27_num(row, keys, default=None, pct=False):
             val = r.get(key)
         except Exception:
             val = None
-        if val in (None, "", "N/A", "NA", "nan", "None"):
+        if val is None:
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except Exception:
+            pass
+        if isinstance(val, str) and val.strip() in ("", "N/A", "NA", "nan", "None", "null"):
             continue
         try:
             if isinstance(val, str):
@@ -49896,6 +49930,8 @@ def _ow_v27_num(row, keys, default=None, pct=False):
                         return out if pct else out
                 val = txt
             out = float(val)
+            if not math.isfinite(out):
+                continue
             if pct and out <= 1.0:
                 out *= 100.0
             return out
@@ -50667,10 +50703,13 @@ def _ow_v27_official_slate_coverage_table(date_text=None):
         hruns = _ow_v27_num(r, ["Home Score", "Home Runs"], None)
         if ar is not None and hruns is not None:
             official_total = float(ar) + float(hruns)
+        score_text = ""
+        if ar is not None or hruns is not None:
+            score_text = f"{_ow_v31_score_part(away, ar)} - {_ow_v31_score_part(home, hruns)}"
         rows.append({
             "Official Game": r.get("Official Game"),
             "Status": r.get("Status"),
-            "Score": f"{away} {'' if ar is None else int(ar)} - {home} {'' if hruns is None else int(hruns)}" if ar is not None or hruns is not None else "",
+            "Score": score_text,
             "Official Total Runs": official_total,
             "Line Coverage": coverage,
             "Line Rows": len(subset),
