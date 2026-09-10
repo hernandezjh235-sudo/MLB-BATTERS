@@ -48725,6 +48725,7 @@ with st.sidebar:
 # -------------------------
 OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24 = "OW_AUTO_BATTER_LINE_PROVIDER_V24_2026_09_08"
 OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25 = "OW_PRIZEPICKS_BATTER_PUBLIC_FEED_V25_2026_09_09"
+OW_PROPLINE_FULL_LINE_PULL_VERSION_V26 = "OW_PROPLINE_FULL_LINE_PULL_V26_2026_09_10"
 PROPLINE_BASE = "https://api.prop-line.com/v1"
 PROPLINE_API_KEY = get_secret("PROPLINE_API_KEY", "")
 PROPLINE_BATTER_MARKETS_V24 = "batter_hits_runs_rbis,batter_home_runs"
@@ -48741,6 +48742,24 @@ PROPLINE_BOOK_PRIORITY_V24 = {
     "betonlineag": 66,
     "betrivers": 64,
 }
+
+
+def _ow_v26_int_env(name, default, lo=None, hi=None):
+    try:
+        val = int(str(os.getenv(name, default)).strip())
+    except Exception:
+        val = int(default)
+    if lo is not None:
+        val = max(int(lo), val)
+    if hi is not None:
+        val = min(int(hi), val)
+    return val
+
+
+# Pull enough PropLine events for a full MLB slate. The free tier is request-limited,
+# so this stays bounded while no longer depending on a sometimes-incomplete schedule map.
+PROPLINE_MAX_EVENTS_V26 = _ow_v26_int_env("PROPLINE_MAX_EVENTS", 120, lo=15, hi=120)
+PROPLINE_LINE_SCAN_NOTE_V26 = "ALL_MLB_EVENTS_NO_SCHEDULE_PAIR_BLOCK"
 
 
 def _ow_v24_pick(obj, *keys):
@@ -48900,6 +48919,10 @@ def _ow_v24_prop_line_rows_from_event(event):
                     "Line Feed Backup Version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
                     "PropLine Event ID": event_id,
                     "PropLine Start Time": start,
+                    "Provider Away Team": away_abbr,
+                    "Provider Home Team": home_abbr,
+                    "Provider Event Scope": event.get("ow_provider_event_scope_v26") or "PROPLINE_MLB_EVENT",
+                    "Provider Schedule Match": event.get("ow_provider_schedule_match_v26") or "",
                     "UD Start Time": start,
                 })
     return rows
@@ -49119,10 +49142,15 @@ def _ow_v24_current_schedule_pairs():
 def _ow_fetch_propline_batter_lines_v24():
     debug = {
         "version": OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24,
+        "full_line_pull_version": OW_PROPLINE_FULL_LINE_PULL_VERSION_V26,
         "provider": "PropLine",
         "status": "DISABLED",
+        "event_scan_mode": PROPLINE_LINE_SCAN_NOTE_V26,
+        "max_events": PROPLINE_MAX_EVENTS_V26,
+        "events_available": 0,
         "events": 0,
         "events_with_rows": 0,
+        "rows_before_dedup": 0,
         "rows": 0,
         "hrr": 0,
         "hr": 0,
@@ -49140,6 +49168,7 @@ def _ow_fetch_propline_batter_lines_v24():
     if not isinstance(events, list):
         debug["status"] = "BAD_EVENTS_PAYLOAD"
         return [], debug
+    debug["events_available"] = len(events)
     rows = []
     current_pairs = _ow_v24_current_schedule_pairs()
     checked_events = 0
@@ -49151,12 +49180,14 @@ def _ow_fetch_propline_batter_lines_v24():
             continue
         home_abbr = _ow_v24_team_abbr_from_prop_line(event.get("home_team") or event.get("homeTeam") or "")
         away_abbr = _ow_v24_team_abbr_from_prop_line(event.get("away_team") or event.get("awayTeam") or "")
-        if current_pairs and frozenset([str(home_abbr).upper(), str(away_abbr).upper()]) not in current_pairs:
-            continue
         checked_events += 1
-        if checked_events > 30:
+        if checked_events > PROPLINE_MAX_EVENTS_V26:
             break
         debug["events"] += 1
+        schedule_match = bool(
+            current_pairs
+            and frozenset([str(home_abbr).upper(), str(away_abbr).upper()]) in current_pairs
+        )
         odds = safe_get_json(
             f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds",
             params={**auth_params, "markets": PROPLINE_BATTER_MARKETS_V24, "includeBookIds": "true"},
@@ -49174,10 +49205,15 @@ def _ow_fetch_propline_batter_lines_v24():
             odds["away_team"] = event.get("away_team")
         if not odds.get("commence_time") and event.get("commence_time"):
             odds["commence_time"] = event.get("commence_time")
+        odds["ow_provider_event_scope_v26"] = PROPLINE_LINE_SCAN_NOTE_V26
+        odds["ow_provider_schedule_match_v26"] = "MATCHED_SELECTED_SCHEDULE" if schedule_match else "NOT_BLOCKED_BY_SCHEDULE"
         event_rows = _ow_v24_prop_line_rows_from_event(odds)
+        debug["requests"][-1]["rows"] = len(event_rows)
+        debug["requests"][-1]["event"] = f"{away_abbr}@{home_abbr}" if away_abbr or home_abbr else str(event_id)
         if event_rows:
             debug["events_with_rows"] += 1
             rows.extend(event_rows)
+    debug["rows_before_dedup"] = len(rows)
     rows = _ow_v24_dedup_provider_rows(rows)
     debug.update({
         "status": "OK" if rows else "NO_LINES",
@@ -49326,6 +49362,1361 @@ with st.sidebar:
             st.rerun()
 
 
+OW_ALL_BATTER_LINES_TRACKER_VERSION_V26 = "OW_ALL_BATTER_LINES_TRACKER_V26_2026_09_10"
+
+# The fast board used to cap projection rows for speed. With PropLine active, keep
+# a full MLB slate visible and let the dedicated all-lines tab handle the broad scan.
+OW_FINAL_MAX_PROJECTED_LINES = max(int(globals().get("OW_FINAL_MAX_PROJECTED_LINES", 0) or 0), 500)
+OW_MAIN_VISIBLE_TARGET_V10 = max(int(globals().get("OW_MAIN_VISIBLE_TARGET_V10", 0) or 0), 500)
+OW_FINAL_RESEARCH_DISPLAY_ROWS = max(int(globals().get("OW_FINAL_RESEARCH_DISPLAY_ROWS", 0) or 0), 500)
+
+
+def _ow_v26_display_market(row):
+    market = str((row or {}).get("Market") or (row or {}).get("Best Market") or "").upper()
+    if "HOME RUN" in market or market == "HR":
+        return "Home Runs"
+    if "H+R+RBI" in market or "HRR" in market:
+        return "H+R+RBI"
+    return str((row or {}).get("Market") or "Batter Line")
+
+
+def _ow_v26_game_label(row):
+    r = row or {}
+    team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team") or r.get("Provider Home Team"))
+    opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent") or r.get("Provider Away Team"))
+    if team not in (None, "", "—") and opp not in (None, "", "—"):
+        return f"{team} vs {opp}"
+    provider_home = _ow_team_abbr(r.get("Provider Home Team"))
+    provider_away = _ow_team_abbr(r.get("Provider Away Team"))
+    if provider_home not in (None, "", "—") and provider_away not in (None, "", "—"):
+        return f"{provider_away} @ {provider_home}"
+    return "Unmatched Game"
+
+
+def _ow_v26_prepare_all_line_frame(df, market_label):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["Market View"] = str(market_label)
+    if str(market_label) == "Home Runs":
+        if "Projection" not in d.columns and "HR Projection" in d.columns:
+            d["Projection"] = d["HR Projection"]
+        if "Win Probability %" not in d.columns and "HR Probability %" in d.columns:
+            d["Win Probability %"] = d["HR Probability %"]
+        if "Confidence" not in d.columns and "HR Grade" in d.columns:
+            d["Confidence"] = d["HR Grade"]
+    d["Game"] = d.apply(lambda r: _ow_v26_game_label(r.to_dict()), axis=1)
+    if "Line Source" not in d.columns:
+        d["Line Source"] = d.get("Source", pd.Series(["Live line + MLB projection"] * len(d))).astype(str)
+    return d
+
+
+def _ow_v26_all_lines_sort(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    d["_win_sort"] = pd.to_numeric(d.get("Best Win/Hit %", d.get("Win Probability %", pd.Series([0] * len(d)))), errors="coerce").fillna(0)
+    d["_hr_sort"] = pd.to_numeric(d.get("HR Probability %", pd.Series([0] * len(d))), errors="coerce").fillna(0)
+    d["_edge_sort"] = pd.to_numeric(d.get("Edge", d.get("HRR Edge", pd.Series([0] * len(d)))), errors="coerce").fillna(0).abs()
+    return d.sort_values(["Game", "_win_sort", "_hr_sort", "_edge_sort"], ascending=[True, False, False, False], na_position="last").drop(columns=["_win_sort", "_hr_sort", "_edge_sort"], errors="ignore")
+
+
+def _ow_v26_all_lines_summary(df):
+    if not isinstance(df, pd.DataFrame) or df.empty or "Game" not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for game, g in df.groupby("Game", dropna=False):
+        markets = g.get("Market View", pd.Series(dtype=str)).astype(str)
+        win = pd.to_numeric(g.get("Best Win/Hit %", g.get("Win Probability %", pd.Series(dtype=float))), errors="coerce")
+        hrp = pd.to_numeric(g.get("HR Probability %", pd.Series(dtype=float)), errors="coerce")
+        team_runs = pd.to_numeric(g.get("Expected Runs V20", g.get("Team Implied Runs", pd.Series(dtype=float))), errors="coerce")
+        top = g.sort_values(
+            ["Best Win/Hit %" if "Best Win/Hit %" in g.columns else "Win Probability %" if "Win Probability %" in g.columns else "Line"],
+            ascending=False,
+            na_position="last",
+        ).head(1)
+        rows.append({
+            "Game": game,
+            "Total Lines": len(g),
+            "H+R+RBI Lines": int(markets.eq("H+R+RBI").sum()),
+            "HR Lines": int(markets.eq("Home Runs").sum()),
+            "Top Player": str(top.iloc[0].get("Player") or "—") if not top.empty else "—",
+            "Top Pick": str(top.iloc[0].get("Pick") or top.iloc[0].get("Best Pick") or "—") if not top.empty else "—",
+            "Top Win/Hit %": round(float(win.max()), 1) if not win.dropna().empty else "—",
+            "Top HR %": round(float(hrp.max()), 1) if not hrp.dropna().empty else "—",
+            "Avg Expected Runs": round(float(team_runs.mean()), 2) if not team_runs.dropna().empty else "—",
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values(["Total Lines", "Top Win/Hit %"], ascending=[False, False], na_position="last")
+
+
+def render_v3_all_batter_lines_tracker_v26():
+    st.markdown('<div class="section-title-pro">📋 All Batter Lines — Full Slate Tracker</div>', unsafe_allow_html=True)
+    st.caption("Shows every active H+R+RBI and Home Run line that reaches the projection engine, grouped by game. Strong-play filters and V19 gates do not hide rows here.")
+    hrr_df, hrr_meta = pd.DataFrame(), {}
+    hr_df, hr_meta = pd.DataFrame(), {}
+    try:
+        hrr_df, hrr_meta = build_v3_batter_research_table("HRR")
+    except Exception as exc:
+        hrr_meta = {"status": "ERROR", "error": str(exc)[:300]}
+    try:
+        hr_df, hr_meta = build_v3_home_run_table()
+    except Exception as exc:
+        hr_meta = {"status": "ERROR", "error": str(exc)[:300]}
+
+    frames = [
+        _ow_v26_prepare_all_line_frame(hrr_df, "H+R+RBI"),
+        _ow_v26_prepare_all_line_frame(hr_df, "Home Runs"),
+    ]
+    frames = [x for x in frames if isinstance(x, pd.DataFrame) and not x.empty]
+    if not frames:
+        meta = {
+            "status": "NO_ALL_LINE_ROWS",
+            "hrr": hrr_meta,
+            "hr": hr_meta,
+            "version": OW_ALL_BATTER_LINES_TRACKER_VERSION_V26,
+        }
+        _ow_render_batter_line_feed_empty_v21("full batter line tracker", meta, "hrr_ud_debug")
+        return
+
+    df = _ow_v26_all_lines_sort(pd.concat(frames, ignore_index=True, sort=False))
+    provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24", {})
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("All Lines", len(df))
+    c2.metric("Games", df["Game"].nunique())
+    c3.metric("H+R+RBI", int(df["Market View"].astype(str).eq("H+R+RBI").sum()))
+    c4.metric("Home Runs", int(df["Market View"].astype(str).eq("Home Runs").sum()))
+
+    with st.expander("Game line coverage", expanded=True):
+        summary = _ow_v26_all_lines_summary(df)
+        if isinstance(summary, pd.DataFrame) and not summary.empty:
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    f1, f2, f3 = st.columns([1.2, 1.0, 1.0])
+    game_opts = ["ALL"] + sorted([x for x in df["Game"].dropna().astype(str).unique().tolist() if x])
+    game_choice = f1.selectbox("Game", game_opts, key=_v3_unique_widget_key("ow_all_lines_game_v26"))
+    market_choice = f2.radio("Market", ["ALL", "H+R+RBI", "Home Runs"], horizontal=True, key=_v3_unique_widget_key("ow_all_lines_market_v26"))
+    show_only_over = f3.checkbox("Overs only", value=False, key=_v3_unique_widget_key("ow_all_lines_overs_v26"))
+
+    view = df.copy()
+    if game_choice != "ALL":
+        view = view[view["Game"].astype(str).eq(game_choice)].copy()
+    if market_choice != "ALL":
+        view = view[view["Market View"].astype(str).eq(market_choice)].copy()
+    if show_only_over and "Pick" in view.columns:
+        view = view[view["Pick"].astype(str).str.upper().eq("OVER")].copy()
+
+    cols = [c for c in [
+        "Game", "Player", "Team", "Opponent", "Market View", "Pick", "Line", "Projection", "HR Projection",
+        "Edge", "Best Win/Hit %", "Win Probability %", "HR Probability %", "Confidence", "HR Grade",
+        "V19 Win-Rate Gate", "Opportunity Tier", "Official Play Filter", "Projected PA", "Lineup Slot", "Lineup Status",
+        "Last 5", "Last 10", "Last 5 Avg", "Last 10 Avg", "Same-Line", "H2H", "H2H Games", "H2H Avg",
+        "Last 5 HR", "Last 10 HR", "Last 5 HR Rate %", "Last 10 HR Rate %",
+        "Split vs Hand", "Split AVG", "Split OPS", "Split HR", "Batter HardHit%", "Batter Barrel%", "Batter xwOBA",
+        "Opp Pitcher", "Pitcher Hand", "Pitcher Confirmed", "Pitcher BAA", "Pitcher H/9", "Pitcher HR9", "Pitcher K%",
+        "Pitcher Split vs Batter Hand", "Pitcher Split BAA", "Pitcher Split SLG", "Pitcher Split HR%",
+        "Pitcher Contact/Leash Label", "Team Implied Runs", "Expected Runs V20", "Projected Game Total",
+        "Blowout Stack Signal", "Suppression Risk %", "Team Explosion %", "HRR Lineup Chain %", "HR Environment %",
+        "No-Bet Risk Flags", "Line Source", "Evidence", "Matchup Summary",
+    ] if c in view.columns]
+    st.caption(f"Showing {len(view)} rows after filters.")
+    st.dataframe(view[cols] if cols else view, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download all batter lines CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name="all_batter_lines_full_slate_tracker.csv",
+        mime="text/csv",
+        key=_v3_unique_widget_key("ow_all_lines_download_v26"),
+        use_container_width=True,
+    )
+
+    names = view.get("Player", pd.Series(dtype=str)).dropna().astype(str).tolist()
+    if names:
+        selected = st.selectbox("Open matchup detail", names, key=_v3_unique_widget_key("ow_all_lines_detail_v26"))
+        rr = view[view["Player"].astype(str).eq(selected)].iloc[0].to_dict()
+        with st.expander(f"{selected} — matchup detail", expanded=False):
+            st.write({
+                "Game": rr.get("Game"),
+                "Market": rr.get("Market View"),
+                "Pick": rr.get("Pick"),
+                "Line": rr.get("Line"),
+                "Projection": rr.get("Projection") if rr.get("Projection") not in (None, "") else rr.get("HR Projection"),
+                "Win/Hit %": rr.get("Best Win/Hit %") or rr.get("Win Probability %") or rr.get("HR Probability %"),
+                "L5": rr.get("Last 5"),
+                "L10": rr.get("Last 10"),
+                "L5 Avg": rr.get("Last 5 Avg"),
+                "L10 Avg": rr.get("Last 10 Avg"),
+                "L5 HR": rr.get("Last 5 HR"),
+                "L10 HR": rr.get("Last 10 HR"),
+                "Pitcher": rr.get("Opp Pitcher"),
+                "Pitcher Hand": rr.get("Pitcher Hand"),
+                "Pitcher Split": rr.get("Pitcher Split Note"),
+                "Pitcher Contact/Leash": rr.get("Pitcher Contact/Leash Note"),
+                "Why": rr.get("Matchup Summary"),
+            })
+    with st.expander("Line-feed scan details", expanded=False):
+        st.json({
+            "version": OW_ALL_BATTER_LINES_TRACKER_VERSION_V26,
+            "hrr_meta": hrr_meta,
+            "hr_meta": hr_meta,
+            "provider_scan": provider_debug if isinstance(provider_debug, dict) else {},
+            "projection_cap": OW_FINAL_MAX_PROJECTED_LINES,
+            "visible_target": OW_MAIN_VISIBLE_TARGET_V10,
+        })
+
+
+# -------------------------
+# V27 MATCHUP OPPORTUNITY + OFFICIAL SLATE COVERAGE
+# -------------------------
+OW_MATCHUP_OPPORTUNITY_VERSION_V27 = "OW_MATCHUP_OPPORTUNITY_LAYER_V27_2026_09_10"
+OW_OFFICIAL_SLATE_COVERAGE_VERSION_V27 = "OW_OFFICIAL_SLATE_COVERAGE_V27_2026_09_10"
+OW_SEP9_BOX_SCORE_LESSON_VERSION_V27 = "OW_SEP9_BOX_SCORE_LESSONS_V27_2026_09_10"
+OW_SEP9_HR_OUTCOME_AUDIT_VERSION_V28 = "OW_SEP9_HR_OUTCOME_AUDIT_V28_2026_09_10"
+OW_OUTCOME_PATTERN_VERSION_V28 = "OW_OUTCOME_PATTERN_SCORER_V28_2026_09_10"
+
+
+OW_SEP9_HR_OUTCOME_AUDIT_V28 = [
+    {"Game": "CIN @ LAD", "Final": "LAD 14-1", "Hitter": "Mookie Betts", "Team": "LAD", "Inning": "Bot 3", "Pitcher": "Rhett Lowder", "Pitcher Team": "CIN", "Path": "starter-collapse HR", "Formula Signal": "Power bat + vulnerable starter + early team chain"},
+    {"Game": "CIN @ LAD", "Final": "LAD 14-1", "Hitter": "Elly De La Cruz", "Team": "CIN", "Inning": "Top 4", "Pitcher": "Yoshinobu Yamamoto", "Pitcher Team": "LAD", "Path": "elite recent-power override", "Formula Signal": "Hot HR streak can beat strong/low-ERA pitcher"},
+    {"Game": "CIN @ LAD", "Final": "LAD 14-1", "Hitter": "Max Muncy", "Team": "LAD", "Inning": "Bot 6", "Pitcher": "Pierce Johnson", "Pitcher Team": "CIN", "Path": "bullpen HR", "Formula Signal": "Starter collapse creates later bullpen HR chances"},
+    {"Game": "CIN @ LAD", "Final": "LAD 14-1", "Hitter": "Enrique Hernandez", "Team": "LAD", "Inning": "Bot 7", "Pitcher": "Tony Santillan", "Pitcher Team": "CIN", "Path": "lower-lineup bullpen HR", "Formula Signal": "Lower lineup can pop when team chain keeps PA alive"},
+    {"Game": "CIN @ LAD", "Final": "LAD 14-1", "Hitter": "Kyle Tucker", "Team": "LAD", "Inning": "Bot 8", "Pitcher": "Jose Trevino", "Pitcher Team": "CIN", "Path": "blowout/position-player HR", "Formula Signal": "Track live only; do not overfit pregame"},
+    {"Game": "MIN @ DET", "Final": "DET 7-2", "Hitter": "Colt Keith", "Team": "DET", "Inning": "Bot 1", "Pitcher": "Zebby Matthews", "Pitcher Team": "MIN", "Path": "first-inning starter HR", "Formula Signal": "Early starter vulnerability + lineup attack"},
+    {"Game": "MIN @ DET", "Final": "DET 7-2", "Hitter": "Kody Clemens", "Team": "MIN", "Inning": "Top 4", "Pitcher": "Keider Montero", "Pitcher Team": "DET", "Path": "isolated power in losing side", "Formula Signal": "Bad team environment should not erase true HR power"},
+    {"Game": "MIN @ DET", "Final": "DET 7-2", "Hitter": "Josh Bell", "Team": "MIN", "Inning": "Top 4", "Pitcher": "Keider Montero", "Pitcher Team": "DET", "Path": "isolated power in losing side", "Formula Signal": "HR path separate from team-win path"},
+    {"Game": "TOR @ ATH", "Final": "ATH 2-0", "Hitter": "Henry Bolte", "Team": "ATH", "Inning": "Bot 3", "Pitcher": "Michael Lorenzen", "Pitcher Team": "TOR", "Path": "low-total recent-power HR", "Formula Signal": "Recent HR surge matters even in suppression game"},
+    {"Game": "STL @ SF", "Final": "SF 7-6", "Hitter": "Leo Bernal", "Team": "STL", "Inning": "Top 3", "Pitcher": "Blade Tidwell", "Pitcher Team": "SF", "Path": "young/lower-lineup HRR power", "Formula Signal": "Rookie/lower slot can matter with traffic pitcher"},
+    {"Game": "WSH @ SD", "Final": "SD 9-2", "Hitter": "Keibert Ruiz", "Team": "WSH", "Inning": "Top 3", "Pitcher": "Walker Buehler", "Pitcher Team": "SD", "Path": "suppressed-team isolated HR", "Formula Signal": "Low team runs can still allow one HR winner"},
+    {"Game": "WSH @ SD", "Final": "SD 9-2", "Hitter": "Jackson Merrill", "Team": "SD", "Inning": "Bot 5", "Pitcher": "Brad Lord", "Pitcher Team": "WSH", "Path": "multi-PA power chain", "Formula Signal": "Starter damage opens multiple reliever matchups"},
+    {"Game": "WSH @ SD", "Final": "SD 9-2", "Hitter": "Jackson Merrill", "Team": "SD", "Inning": "Bot 7", "Pitcher": "Luis Perales", "Pitcher Team": "WSH", "Path": "multi-pitcher repeat HR", "Formula Signal": "Same hitter can win again after bullpen turns over"},
+    {"Game": "TEX @ SEA", "Final": "SEA 3-2", "Hitter": "Jake Burger", "Team": "TEX", "Inning": "Top 2", "Pitcher": "Kade Anderson", "Pitcher Team": "SEA", "Path": "low-total starter HR", "Formula Signal": "HR Finder must survive low game total"},
+    {"Game": "TEX @ SEA", "Final": "SEA 3-2", "Hitter": "Corey Seager", "Team": "TEX", "Inning": "Top 8", "Pitcher": "Gabe Speier", "Pitcher Team": "SEA", "Path": "low-total bullpen HR", "Formula Signal": "Recent HR streak + bullpen hand matters"},
+    {"Game": "CLE @ BAL", "Final": "BAL 9-5", "Hitter": "Chase DeLauter", "Team": "CLE", "Inning": "Top 1", "Pitcher": "Shane Baz", "Pitcher Team": "BAL", "Path": "starter HR", "Formula Signal": "Early power before winner is settled"},
+    {"Game": "CLE @ BAL", "Final": "BAL 9-5", "Hitter": "Nathaniel Lowe", "Team": "CLE", "Inning": "Top 6", "Pitcher": "Shane Baz", "Pitcher Team": "BAL", "Path": "starter fatigue HR", "Formula Signal": "Third-time-through/fatigue can matter"},
+    {"Game": "CLE @ BAL", "Final": "BAL 9-5", "Hitter": "Coby Mayo", "Team": "BAL", "Inning": "Bot 6", "Pitcher": "Franco Aleman", "Pitcher Team": "CLE", "Path": "bullpen HR after chain inning", "Formula Signal": "HR and HRR both benefit from one-side burst"},
+    {"Game": "HOU @ PHI", "Final": "PHI 11-7", "Hitter": "Isaac Paredes", "Team": "HOU", "Inning": "Top 3", "Pitcher": "Cristopher Sanchez", "Pitcher Team": "PHI", "Path": "elite-bat starter HR", "Formula Signal": "Good starter can still give HR to pull/power bats"},
+    {"Game": "HOU @ PHI", "Final": "PHI 11-7", "Hitter": "Cam Smith", "Team": "HOU", "Inning": "Top 4", "Pitcher": "Cristopher Sanchez", "Pitcher Team": "PHI", "Path": "second starter HR", "Formula Signal": "Do not assume one HR ends pitcher vulnerability"},
+    {"Game": "HOU @ PHI", "Final": "PHI 11-7", "Hitter": "Trea Turner", "Team": "PHI", "Inning": "Bot 5", "Pitcher": "Hunter Brown", "Pitcher Team": "HOU", "Path": "starter counterpunch HR", "Formula Signal": "Two-sided shootout can emerge after early deficit"},
+    {"Game": "HOU @ PHI", "Final": "PHI 11-7", "Hitter": "Kyle Schwarber", "Team": "PHI", "Inning": "Bot 6", "Pitcher": "AJ Blubaugh", "Pitcher Team": "HOU", "Path": "bullpen leverage grand slam", "Formula Signal": "Bullpen cascade + runners ahead drives HRR/HR"},
+    {"Game": "NYM @ MIA", "Final": "NYM 15-14", "Hitter": "Christopher Morel", "Team": "NYM", "Inning": "Top 3", "Pitcher": "Janson Junk", "Pitcher Team": "MIA", "Path": "starter-collapse HR", "Formula Signal": "Spot-start/weak starter creates early stack"},
+    {"Game": "NYM @ MIA", "Final": "NYM 15-14", "Hitter": "Owen Caissie", "Team": "MIA", "Inning": "Bot 6", "Pitcher": "Chris Devenski", "Pitcher Team": "NYM", "Path": "comeback bullpen HR", "Formula Signal": "Losing team can become HRR target after bullpen enters"},
+    {"Game": "NYM @ MIA", "Final": "NYM 15-14", "Hitter": "Francisco Lindor", "Team": "NYM", "Inning": "Top 7", "Pitcher": "Tyler Zuber", "Pitcher Team": "MIA", "Path": "late bullpen HR", "Formula Signal": "Shootout keeps elite bats with extra PA/runners"},
+    {"Game": "NYM @ MIA", "Final": "NYM 15-14", "Hitter": "Joe Mack", "Team": "MIA", "Inning": "Bot 7", "Pitcher": "Daniel Duarte", "Pitcher Team": "NYM", "Path": "late bullpen HR", "Formula Signal": "Catcher/lower-order power needs bullpen path"},
+    {"Game": "LAA @ BOS", "Final": "LAA 6-4", "Hitter": "Zach Neto", "Team": "LAA", "Inning": "Top 3", "Pitcher": "Jake Bennett", "Pitcher Team": "BOS", "Path": "starter HR cluster", "Formula Signal": "One vulnerable starter can create several HR winners"},
+    {"Game": "LAA @ BOS", "Final": "LAA 6-4", "Hitter": "Jose Siri", "Team": "LAA", "Inning": "Top 3", "Pitcher": "Jake Bennett", "Pitcher Team": "BOS", "Path": "starter HR cluster", "Formula Signal": "Same-inning power cluster matters"},
+    {"Game": "LAA @ BOS", "Final": "LAA 6-4", "Hitter": "Denzer Guzman", "Team": "LAA", "Inning": "Top 4", "Pitcher": "Jake Bennett", "Pitcher Team": "BOS", "Path": "starter HR cluster", "Formula Signal": "Keep pressure after first HR cluster"},
+    {"Game": "LAA @ BOS", "Final": "LAA 6-4", "Hitter": "Roman Anthony", "Team": "BOS", "Inning": "Bot 5", "Pitcher": "Ryan Johnson", "Pitcher Team": "LAA", "Path": "opponent comeback HR", "Formula Signal": "Suppressed side can still provide HR value"},
+    {"Game": "LAA @ BOS", "Final": "LAA 6-4", "Hitter": "Wilyer Abreu", "Team": "BOS", "Inning": "Bot 6", "Pitcher": "Ryan Johnson", "Pitcher Team": "LAA", "Path": "opponent comeback HR", "Formula Signal": "Second-side HR path separate from ML winner"},
+    {"Game": "COL @ NYY", "Final": "NYY 6-1", "Hitter": "Luis Garcia Jr.", "Team": "NYY", "Inning": "Bot 2", "Pitcher": "Tomoyuki Sugano", "Pitcher Team": "COL", "Path": "starter HR", "Formula Signal": "Power vs HR-prone/traffic starter"},
+    {"Game": "COL @ NYY", "Final": "NYY 6-1", "Hitter": "George Lombard Jr.", "Team": "NYY", "Inning": "Bot 3", "Pitcher": "Tomoyuki Sugano", "Pitcher Team": "COL", "Path": "grand-slam chain HR", "Formula Signal": "Lineup traffic before batter creates HRR/HR leverage"},
+    {"Game": "COL @ NYY", "Final": "NYY 6-1", "Hitter": "Connor Norby", "Team": "COL", "Inning": "Top 5", "Pitcher": "Will Warren", "Pitcher Team": "NYY", "Path": "isolated HR vs winning pitcher", "Formula Signal": "Suppressed team still needs HR-only route"},
+    {"Game": "COL @ NYY", "Final": "NYY 6-1", "Hitter": "Cody Bellinger", "Team": "NYY", "Inning": "Bot 8", "Pitcher": "Juan Mejia", "Pitcher Team": "COL", "Path": "late bullpen HR", "Formula Signal": "One-sided wins keep late power live"},
+    {"Game": "TB @ ATL", "Final": "TB 7-2", "Hitter": "Victor Mesa Jr.", "Team": "TB", "Inning": "Top 2", "Pitcher": "Reynaldo Lopez", "Pitcher Team": "ATL", "Path": "starter HR", "Formula Signal": "Non-obvious bat plus recent multihit form"},
+    {"Game": "TB @ ATL", "Final": "TB 7-2", "Hitter": "Drake Baldwin", "Team": "ATL", "Inning": "Bot 4", "Pitcher": "Griffin Jax", "Pitcher Team": "TB", "Path": "suppressed-team catcher HR", "Formula Signal": "Catcher power can survive poor team context"},
+    {"Game": "AZ @ KC", "Final": "KC 5-2", "Hitter": "Carter Jensen", "Team": "KC", "Inning": "Bot 3", "Pitcher": "Zac Gallen", "Pitcher Team": "AZ", "Path": "rookie power vs returning starter", "Formula Signal": "Rust/return tag plus power profile"},
+    {"Game": "AZ @ KC", "Final": "KC 5-2", "Hitter": "Nolan Arenado", "Team": "AZ", "Inning": "Top 4", "Pitcher": "Daniel Lynch IV", "Pitcher Team": "KC", "Path": "road recent-form HR", "Formula Signal": "Recent road power matters"},
+    {"Game": "AZ @ KC", "Final": "KC 5-2", "Hitter": "Bobby Witt Jr.", "Team": "KC", "Inning": "Bot 5", "Pitcher": "Mike Soroka", "Pitcher Team": "AZ", "Path": "winner leverage HR", "Formula Signal": "Hit+walk ahead of elite bat creates three-run swing"},
+    {"Game": "PIT @ CWS", "Final": "PIT 4-2", "Hitter": "Esmerlyn Valdez", "Team": "PIT", "Inning": "Top 5", "Pitcher": "Davis Martin", "Pitcher Team": "CWS", "Path": "low-total isolated HR", "Formula Signal": "HR-only path in suppressed game"},
+    {"Game": "PIT @ CWS", "Final": "PIT 4-2", "Hitter": "Munetaka Murakami", "Team": "CWS", "Inning": "Bot 8", "Pitcher": "Luke Weaver", "Pitcher Team": "PIT", "Path": "late bullpen HR", "Formula Signal": "Power bat can win after low early scoring"},
+    {"Game": "CHC @ MIL", "Final": "MIL 8-6", "Hitter": "Christian Yelich", "Team": "MIL", "Inning": "Bot 1", "Pitcher": "Kevin Gausman", "Pitcher Team": "CHC", "Path": "early starter-collapse HR", "Formula Signal": "Immediate traffic plus HR-prone starter cluster"},
+    {"Game": "CHC @ MIL", "Final": "MIL 8-6", "Hitter": "Jackson Chourio", "Team": "MIL", "Inning": "Bot 2", "Pitcher": "Kevin Gausman", "Pitcher Team": "CHC", "Path": "recent hot-bat starter HR", "Formula Signal": "Recent hit/HR form plus same starter leak"},
+    {"Game": "CHC @ MIL", "Final": "MIL 8-6", "Hitter": "William Contreras", "Team": "MIL", "Inning": "Bot 2", "Pitcher": "Kevin Gausman", "Pitcher Team": "CHC", "Path": "starter HR cluster", "Formula Signal": "Multiple HRs off same starter should be a pregame cluster alert"},
+]
+
+
+OW_SEP9_FORMULA_LESSONS_V28 = [
+    {"Formula Need": "Official slate first", "Reason": "Provider lines can miss games or show stale pairs; official MLB schedule must be the base board.", "Where Used": "Official Slate Coverage"},
+    {"Formula Need": "Separate HR from high-score", "Reason": "TEX @ SEA, TOR @ ATH, PIT @ CWS produced HR winners inside low totals.", "Where Used": "Home Run Finder"},
+    {"Formula Need": "Starter HR cluster alert", "Reason": "Lowder, Gausman, Jake Bennett, Foster Griffin, Janson Junk and Sugano created stacked damage windows.", "Where Used": "Home Run Finder + Batter Upside"},
+    {"Formula Need": "Bullpen cascade path", "Reason": "Muncy, Enrique, Schwarber, Lindor, Coby Mayo, Seager, Murakami and Joe Mack hit after the starter context changed.", "Where Used": "HRR + Home Run Finder"},
+    {"Formula Need": "Recent power override", "Reason": "Elly, Bolte, Seager, Chourio and Arenado had recent power clues that should survive neutral totals.", "Where Used": "Home Run Finder"},
+    {"Formula Need": "Lower-lineup opportunity", "Reason": "Enrique, Bernal, Morel, Mack, Lombard and Valdez show lower-slot bats can win when chain/PA context is right.", "Where Used": "Batter Upside + HRR"},
+    {"Formula Need": "Suppressed-team isolated HR route", "Reason": "Keibert Ruiz, Connor Norby, Drake Baldwin and Boston HRs showed a losing team can still provide one HR winner.", "Where Used": "Home Run Finder"},
+    {"Formula Need": "Do not overfit blowout pitcher HRs", "Reason": "Kyle Tucker off Jose Trevino is a live/blowout clue, not a pure pregame model edge.", "Where Used": "Live tracking only"},
+]
+
+
+def _ow_v27_clamp(value, lo=0.0, hi=100.0):
+    try:
+        x = float(value)
+    except Exception:
+        x = float(lo)
+    return max(float(lo), min(float(hi), x))
+
+
+def _ow_v27_num(row, keys, default=None, pct=False):
+    try:
+        val = _ow_num_v19(row, keys, default, pct=pct)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    r = row if isinstance(row, dict) else {}
+    if not isinstance(keys, (list, tuple)):
+        keys = [keys]
+    for key in keys:
+        try:
+            val = r.get(key)
+        except Exception:
+            val = None
+        if val in (None, "", "N/A", "NA", "nan", "None"):
+            continue
+        try:
+            if isinstance(val, str):
+                txt = val.strip().replace("%", "")
+                if "/" in txt and re.fullmatch(r"\s*\d+(\.\d+)?\s*/\s*\d+(\.\d+)?\s*", txt):
+                    a, b = [float(x.strip()) for x in txt.split("/", 1)]
+                    if b:
+                        out = a / b * 100.0
+                        return out if pct else out
+                val = txt
+            out = float(val)
+            if pct and out <= 1.0:
+                out *= 100.0
+            return out
+        except Exception:
+            continue
+    return default
+
+
+def _ow_v27_text(row, keys, default=""):
+    r = row if isinstance(row, dict) else {}
+    if not isinstance(keys, (list, tuple)):
+        keys = [keys]
+    for key in keys:
+        try:
+            val = r.get(key)
+        except Exception:
+            val = None
+        if val not in (None, "", "N/A", "NA", "nan", "None"):
+            return str(val)
+    return default
+
+
+def _ow_v27_ratio_pct(value):
+    if value in (None, "", "N/A", "NA"):
+        return None
+    s = str(value).strip()
+    try:
+        if s.endswith("%"):
+            return float(s[:-1].strip())
+        m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", s)
+        if m:
+            den = float(m.group(2))
+            return None if den == 0 else float(m.group(1)) / den * 100.0
+    except Exception:
+        return None
+    return None
+
+
+def _ow_v27_market(row, fallback="HRR"):
+    text = str(
+        (row or {}).get("Market View")
+        or (row or {}).get("Market")
+        or (row or {}).get("Best Market")
+        or fallback
+    ).upper()
+    if "HOME RUN" in text or text == "HR":
+        return "Home Runs"
+    return "HRR"
+
+
+def _ow_v27_pick(row):
+    return str(
+        (row or {}).get("Pick")
+        or (row or {}).get("Best Pick")
+        or (row or {}).get("Pick Side")
+        or "OVER"
+    ).upper()
+
+
+def _ow_v27_pitcher_vulnerability(row, market="HRR"):
+    r = dict(row or {})
+    score = 50.0
+    notes = []
+
+    def add_metric(label, keys, center, scale, weight, higher=True, pct=False, note_fmt="{:.2f}"):
+        nonlocal score
+        val = _ow_v27_num(r, keys, None, pct=pct)
+        if val is None or not scale:
+            return
+        try:
+            z = (float(val) - float(center)) / float(scale)
+            if not higher:
+                z = -z
+            piece = _ow_v27_clamp(z * float(weight), -18, 24)
+            score += piece
+            if abs(piece) >= 3:
+                notes.append(f"{label} {note_fmt.format(float(val))}")
+        except Exception:
+            return
+
+    is_hr = str(market) == "Home Runs"
+    add_metric("ERA", ["Pitcher ERA", "Pitcher Recent ERA", "Opp Pitcher ERA"], 4.20, 1.10, 8)
+    add_metric("WHIP", ["Pitcher WHIP", "Pitcher Recent WHIP", "Opp Pitcher WHIP"], 1.28, 0.22, 11)
+    add_metric("BAA", ["Pitcher Split BAA", "Pitcher BAA", "Opp Pitcher BAA"], 0.245, 0.045, 11, note_fmt="{:.3f}")
+    add_metric("H/9", ["Pitcher H/9", "Pitcher Recent H/9", "Opp Pitcher H/9"], 8.50, 1.50, 8)
+    add_metric("HR/9", ["Pitcher Recent HR/9", "Pitcher HR9", "Pitcher HR/9"], 1.15, 0.55, 16 if is_hr else 8)
+    add_metric("K%", ["Pitcher Split K%", "Pitcher K%", "Pitcher Recent K%"], 23.0, 7.0, 9, higher=False, pct=True, note_fmt="{:.1f}%")
+    add_metric("split SLG", ["Pitcher Split SLG", "Pitcher Allowed xSLG"], 0.420, 0.085, 10 if is_hr else 6)
+    add_metric("hard-hit", ["Pitcher Allowed HardHit%", "Pitcher HardHit%"], 39.0, 9.0, 7, pct=True, note_fmt="{:.1f}%")
+    add_metric("barrel", ["Pitcher Allowed Barrel%", "Pitcher Barrel%"], 8.5, 5.5, 8 if is_hr else 4, pct=True, note_fmt="{:.1f}%")
+
+    label_blob = " ".join([
+        _ow_v27_text(r, ["Pitcher Contact/Leash Label"], ""),
+        _ow_v27_text(r, ["Starter Leash Label"], ""),
+        _ow_v27_text(r, ["Pitcher HR Profile V3"], ""),
+        _ow_v27_text(r, ["Pitcher Contact/Leash Note"], ""),
+    ]).upper()
+    if any(x in label_blob for x in ["HR PRONE", "POWER-VULNERABLE", "POWER VULNERABLE"]):
+        score += 8 if is_hr else 4
+        notes.append("power-vulnerable tag")
+    if any(x in label_blob for x in ["CONTACTABLE", "TRAFFIC", "SHORT LEASH", "EARLY EXIT"]):
+        score += 6
+        notes.append("traffic/leash tag")
+    if any(x in label_blob for x in ["SUPPRESSOR", "ACE", "DEEP START", "STRIKEOUT RISK"]):
+        score -= 7
+        notes.append("suppression tag")
+
+    confirmed = str(r.get("Pitcher Confirmed") or "").upper()
+    if confirmed in {"FALSE", "NO", "0"}:
+        score -= 4
+        notes.append("pitcher unconfirmed")
+    return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:6]) or "neutral pitcher profile"
+
+
+def _ow_v27_lineup_edge(row, market="HRR"):
+    r = dict(row or {})
+    score = 50.0
+    notes = []
+    slot = _ow_v27_num(r, ["Lineup Slot", "Projected Lineup Slot", "Batting Order"], None)
+    pa = _ow_v27_num(r, ["Projected PA", "PA Projection", "Expected PA", "PA"], None)
+    is_hr = str(market) == "Home Runs"
+    try:
+        if slot is not None:
+            slot_i = int(round(float(slot)))
+            if is_hr:
+                if 2 <= slot_i <= 5:
+                    score += 17
+                    notes.append(f"power slot {slot_i}")
+                elif slot_i in {1, 6}:
+                    score += 9
+                    notes.append(f"playable slot {slot_i}")
+                elif slot_i >= 8:
+                    score -= 8
+                    notes.append(f"low-PA slot {slot_i}")
+            else:
+                if 1 <= slot_i <= 3:
+                    score += 18
+                    notes.append(f"top-third slot {slot_i}")
+                elif 4 <= slot_i <= 6:
+                    score += 11
+                    notes.append(f"top-six chain slot {slot_i}")
+                elif slot_i >= 8:
+                    score -= 8
+                    notes.append(f"low-chain slot {slot_i}")
+        else:
+            score -= 5
+            notes.append("lineup slot missing")
+    except Exception:
+        pass
+    if pa is not None:
+        piece = _ow_v27_clamp((float(pa) - 4.15) * 18.0, -12, 18)
+        score += piece
+        if abs(piece) >= 3:
+            notes.append(f"PA {float(pa):.1f}")
+    status = _ow_v27_text(r, ["Lineup Status", "Lineup Source", "Pitcher Matchup Verified"], "").upper()
+    if "CONFIRMED" in status:
+        score += 4
+        notes.append("confirmed lineup")
+    elif "PROJECTED" in status or "EXPECTED" in status:
+        notes.append("projected lineup")
+    return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:5]) or "neutral lineup/PA"
+
+
+def _ow_v27_recent_form_edge(row, market="HRR"):
+    r = dict(row or {})
+    score = 50.0
+    notes = []
+    line = _ow_v27_num(r, ["Line", "Best Line", "Current Line"], None)
+    is_hr = str(market) == "Home Runs"
+    if is_hr:
+        l5_hr = _ow_v27_num(r, ["Last 5 HR Rate %", "L5 HR Rate %"], None, pct=True)
+        l10_hr = _ow_v27_num(r, ["Last 10 HR Rate %", "L10 HR Rate %"], None, pct=True)
+        l5_count = _ow_v27_num(r, ["Last 5 HR", "L5 HR"], None)
+        l10_count = _ow_v27_num(r, ["Last 10 HR", "L10 HR"], None)
+        if l5_hr is None:
+            l5_hr = _ow_v27_ratio_pct(r.get("Last 5 HR"))
+        if l10_hr is None:
+            l10_hr = _ow_v27_ratio_pct(r.get("Last 10 HR"))
+        if l5_hr is not None:
+            score += _ow_v27_clamp((float(l5_hr) - 10.0) * 0.55, -8, 18)
+            notes.append(f"L5 HR {float(l5_hr):.0f}%")
+        elif l5_count is not None and float(l5_count) >= 1:
+            score += min(12, float(l5_count) * 5)
+            notes.append(f"L5 HR count {float(l5_count):g}")
+        if l10_hr is not None:
+            score += _ow_v27_clamp((float(l10_hr) - 8.0) * 0.35, -7, 14)
+            notes.append(f"L10 HR {float(l10_hr):.0f}%")
+        elif l10_count is not None and float(l10_count) >= 2:
+            score += min(10, float(l10_count) * 3)
+            notes.append(f"L10 HR count {float(l10_count):g}")
+    else:
+        l5_avg = _ow_v27_num(r, ["Last 5 Avg", "L5 Avg", "Recent 5 Avg"], None)
+        l10_avg = _ow_v27_num(r, ["Last 10 Avg", "L10 Avg", "Recent 10 Avg"], None)
+        l5_pct = _ow_v27_num(r, ["Last 5 %", "L5 Hit Rate", "L5 Clear %"], None, pct=True)
+        l10_pct = _ow_v27_num(r, ["Last 10 %", "L10 Hit Rate", "L10 Clear %"], None, pct=True)
+        if l5_avg is not None and line is not None:
+            score += _ow_v27_clamp((float(l5_avg) - float(line)) * 8.0, -10, 22)
+            notes.append(f"L5 avg {float(l5_avg):.2f}")
+        if l10_avg is not None and line is not None:
+            score += _ow_v27_clamp((float(l10_avg) - float(line)) * 5.0, -8, 16)
+            notes.append(f"L10 avg {float(l10_avg):.2f}")
+        if l5_pct is not None:
+            score += _ow_v27_clamp((float(l5_pct) - 55.0) * 0.22, -7, 10)
+            notes.append(f"L5 clear {float(l5_pct):.0f}%")
+        if l10_pct is not None:
+            score += _ow_v27_clamp((float(l10_pct) - 55.0) * 0.16, -6, 9)
+            notes.append(f"L10 clear {float(l10_pct):.0f}%")
+    same_line = _ow_v27_ratio_pct(r.get("Same-Line"))
+    if same_line is not None:
+        score += _ow_v27_clamp((float(same_line) - 55.0) * 0.16, -5, 8)
+        notes.append(f"same-line {float(same_line):.0f}%")
+    return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:5]) or "recent form neutral/missing"
+
+
+def _ow_v27_team_environment(row, market="HRR"):
+    r = dict(row or {})
+    score = 50.0
+    notes = []
+    team_runs = _ow_v27_num(r, ["Expected Runs V20", "Team Runs V3", "Team Implied Runs", "Projected Team Runs"], None)
+    game_total = _ow_v27_num(r, ["Game Total V3", "Projected Game Total", "Projected Total"], None)
+    team_exp = _ow_v27_num(r, ["Team Explosion %"], None, pct=True)
+    hrr_chain = _ow_v27_num(r, ["HRR Lineup Chain %"], None, pct=True)
+    hr_env = _ow_v27_num(r, ["HR Environment %"], None, pct=True)
+    collapse = _ow_v27_num(r, ["Starter Collapse %"], None, pct=True)
+    cascade = _ow_v27_num(r, ["Bullpen Cascade %"], None, pct=True)
+    suppression = _ow_v27_num(r, ["Suppression Risk %"], None, pct=True)
+    is_hr = str(market) == "Home Runs"
+    if team_runs is not None:
+        score += _ow_v27_clamp((float(team_runs) - 4.45) * 9.0, -14, 20)
+        notes.append(f"team runs {float(team_runs):.2f}")
+    if game_total is not None:
+        score += _ow_v27_clamp((float(game_total) - 8.7) * 4.2, -12, 17)
+        notes.append(f"game total {float(game_total):.2f}")
+    if team_exp is not None:
+        score += (float(team_exp) - 50.0) * 0.18
+    if hrr_chain is not None and not is_hr:
+        score += (float(hrr_chain) - 50.0) * 0.22
+        if hrr_chain >= 65:
+            notes.append("HRR chain strong")
+    if hr_env is not None and is_hr:
+        score += (float(hr_env) - 50.0) * 0.24
+        if hr_env >= 65:
+            notes.append("HR environment strong")
+    if collapse is not None:
+        score += (float(collapse) - 50.0) * 0.12
+        if collapse >= 62:
+            notes.append("starter-collapse watch")
+    if cascade is not None:
+        score += (float(cascade) - 50.0) * 0.08
+        if cascade >= 64:
+            notes.append("bullpen-cascade watch")
+    if suppression is not None and suppression >= 62:
+        score -= (float(suppression) - 60.0) * 0.18
+        notes.append("suppression risk")
+    return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:6]) or "neutral team/game environment"
+
+
+def _ow_v27_market_path(row, market="HRR"):
+    r = dict(row or {})
+    is_hr = str(market) == "Home Runs"
+    if is_hr:
+        score = 50.0
+        notes = []
+        hr_prob = _ow_v27_num(r, ["HR Probability %", "PA Sim HR Over %"], None, pct=True)
+        hr_proj = _ow_v27_num(r, ["HR Projection", "Projection", "PA Sim HR Mean"], None)
+        power = _ow_v27_num(r, ["HR Power Score V2", "HR Composite Score V3", "HR Shape Score V3"], None)
+        barrel = _ow_v27_num(r, ["Batter Barrel%", "Recent 15d Barrel%"], None, pct=True)
+        hard = _ow_v27_num(r, ["Batter HardHit%", "Recent 15d HardHit%"], None, pct=True)
+        if hr_prob is not None:
+            score += _ow_v27_clamp((float(hr_prob) - 16.0) * 0.65, -10, 24)
+            notes.append(f"HR prob {float(hr_prob):.1f}%")
+        if hr_proj is not None:
+            score += _ow_v27_clamp((float(hr_proj) - 0.18) * 45.0, -9, 20)
+            notes.append(f"HR proj {float(hr_proj):.2f}")
+        if power is not None:
+            score += (float(power) - 50.0) * 0.18
+        if barrel is not None:
+            score += _ow_v27_clamp((float(barrel) - 8.0) * 0.40, -5, 10)
+        if hard is not None:
+            score += _ow_v27_clamp((float(hard) - 39.0) * 0.18, -5, 9)
+        return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:5]) or "HR path neutral/missing"
+    score = 50.0
+    notes = []
+    win = _ow_v27_num(r, ["Best Win/Hit %", "Win Probability %", "Over Probability %", "PA Sim HRR Over %"], None, pct=True)
+    proj = _ow_v27_num(r, ["Projection", "Best Projection", "HRR Projection", "PA Sim H+R+RBI Mean"], None)
+    line = _ow_v27_num(r, ["Line", "Best Line", "Current Line"], None)
+    hit = _ow_v27_num(r, ["Projected Hits", "PA Sim Hit/G"], None)
+    runs = _ow_v27_num(r, ["Projected Runs"], None)
+    rbi = _ow_v27_num(r, ["Projected RBI"], None)
+    if win is not None:
+        score += _ow_v27_clamp((float(win) - 55.0) * 0.45, -12, 18)
+        notes.append(f"win/hit {float(win):.1f}%")
+    if proj is not None and line is not None:
+        score += _ow_v27_clamp((float(proj) - float(line)) * 8.0, -12, 22)
+        notes.append(f"edge {float(proj) - float(line):+.2f}")
+    if line is not None and float(line) <= 0.5:
+        score += 6
+        notes.append("low line")
+    comp = sum(float(x or 0) for x in [hit, runs, rbi] if x is not None)
+    if comp > 0:
+        score += _ow_v27_clamp((comp - 2.0) * 4.0, -5, 10)
+    return round(_ow_v27_clamp(score, 5, 98), 1), "; ".join(notes[:5]) or "HRR path neutral/missing"
+
+
+def _ow_v27_label(score):
+    try:
+        score = float(score)
+    except Exception:
+        score = 0.0
+    if score >= 84:
+        return "A+ BOX-SCORE PATTERN"
+    if score >= 76:
+        return "A STRONG PATTERN"
+    if score >= 68:
+        return "B VIABLE MATCHUP"
+    if score >= 58:
+        return "WATCH / NEED CONFIRM"
+    if score <= 43:
+        return "SUPPRESSION / PASS"
+    return "NEUTRAL"
+
+
+def _ow_v28_outcome_label(score):
+    try:
+        score = float(score)
+    except Exception:
+        score = 0.0
+    if score >= 84:
+        return "A+ SEPT9 PATTERN MATCH"
+    if score >= 76:
+        return "A OUTCOME PATH"
+    if score >= 68:
+        return "B VIABLE OUTCOME PATH"
+    if score >= 58:
+        return "WATCH OUTCOME PATH"
+    if score <= 42:
+        return "SUPPRESSION / LOW PATH"
+    return "NEUTRAL OUTCOME PATH"
+
+
+def _ow_v28_blob(row):
+    if not isinstance(row, dict):
+        return ""
+    vals = []
+    for k, v in row.items():
+        if v in (None, "", "N/A", "NA"):
+            continue
+        if any(token in str(k).lower() for token in ["note", "label", "tag", "flag", "profile", "summary", "status"]):
+            vals.append(str(v))
+    return " ".join(vals).upper()
+
+
+def _ow_v28_outcome_pattern_score(row, market, pitcher_score, lineup_score, form_score, env_score, path_score):
+    r = dict(row or {})
+    is_hr = str(market) == "Home Runs"
+    score = 50.0
+    paths = []
+    notes = []
+    blob = _ow_v28_blob(r)
+    slot = _ow_v27_num(r, ["Lineup Slot", "Projected Lineup Slot", "Batting Order"], None)
+    team_runs = _ow_v27_num(r, ["Expected Runs V20", "Team Runs V3", "Team Implied Runs", "Projected Team Runs"], None)
+    game_total = _ow_v27_num(r, ["Game Total V3", "Projected Game Total", "Projected Total"], None)
+    collapse = _ow_v27_num(r, ["Starter Collapse %"], None, pct=True)
+    cascade = _ow_v27_num(r, ["Bullpen Cascade %", "Bullpen Weakness Score", "Bullpen V3 Score"], None, pct=True)
+    suppression = _ow_v27_num(r, ["Suppression Risk %"], None, pct=True)
+    hr9 = _ow_v27_num(r, ["Pitcher Recent HR/9", "Pitcher HR9", "Pitcher HR/9"], None)
+    whip = _ow_v27_num(r, ["Pitcher WHIP", "Pitcher Recent WHIP", "Opp Pitcher WHIP"], None)
+    baa = _ow_v27_num(r, ["Pitcher Split BAA", "Pitcher BAA", "Opp Pitcher BAA"], None)
+    line = _ow_v27_num(r, ["Line", "Best Line", "Current Line"], None)
+    pa = _ow_v27_num(r, ["Projected PA", "PA Projection", "Expected PA", "PA"], None)
+    recent_hr = _ow_v27_num(r, ["Last 5 HR Rate %", "L5 HR Rate %", "Last 10 HR Rate %", "L10 HR Rate %"], None, pct=True)
+    if recent_hr is None:
+        recent_hr = _ow_v27_ratio_pct(r.get("Last 5 HR")) or _ow_v27_ratio_pct(r.get("Last 10 HR"))
+
+    if is_hr:
+        if pitcher_score >= 68 and path_score >= 62:
+            score += 12
+            paths.append("starter HR fit")
+            notes.append("pitcher vulnerability + power path")
+        if (collapse is not None and float(collapse) >= 62) or any(x in blob for x in ["STARTER-COLLAPSE", "STARTER COLLAPSE", "EARLY EXIT", "SHORT LEASH"]):
+            score += 8
+            paths.append("starter-collapse cluster")
+            notes.append("starter can create stacked HR chances")
+        if (cascade is not None and float(cascade) >= 62) or any(x in blob for x in ["BULLPEN", "RELIEF", "LEASH"]):
+            score += 8
+            paths.append("bullpen HR path")
+            notes.append("late pitcher-change path")
+        if (game_total is not None and float(game_total) <= 8.4 and path_score >= 66) or (env_score <= 58 and path_score >= 70):
+            score += 9
+            paths.append("low-total HR override")
+            notes.append("HR can win inside low-scoring game")
+        if form_score >= 64 or (recent_hr is not None and float(recent_hr) >= 20) or any(x in blob for x in ["HR STREAK", "RECENT HR", "HOT BAT", "POWER SURGE"]):
+            score += 9
+            paths.append("recent-power override")
+            notes.append("recent HR form survives neutral total")
+        try:
+            slot_i = int(round(float(slot))) if slot is not None else None
+        except Exception:
+            slot_i = None
+        if slot_i is not None and slot_i >= 6 and (pitcher_score >= 66 or path_score >= 68 or form_score >= 64):
+            score += 7
+            paths.append("lower-lineup value")
+            notes.append(f"slot {slot_i} still has HR path")
+        if pitcher_score <= 46 and path_score >= 72 and form_score >= 64:
+            score += 7
+            paths.append("elite-vs-good-pitcher override")
+            notes.append("power can beat strong starter")
+        if line is not None and float(line) <= 0.5 and path_score >= 60:
+            score += 4
+            paths.append("0.5 HR line value")
+        if suppression is not None and float(suppression) >= 68 and path_score < 66 and form_score < 64:
+            score -= 12
+            paths.append("suppression warning")
+            notes.append("no HR override against suppression")
+    else:
+        try:
+            slot_i = int(round(float(slot))) if slot is not None else None
+        except Exception:
+            slot_i = None
+        if slot_i is not None and slot_i <= 6 and (team_runs is None or float(team_runs) >= 4.65) and pitcher_score >= 60:
+            score += 12
+            paths.append("top-six HRR chain")
+            notes.append("lineup slot + team runs + pitcher traffic")
+        if pa is not None and float(pa) >= 4.45:
+            score += 6
+            paths.append("extra-PA route")
+            notes.append(f"PA {float(pa):.1f}")
+        if any(x is not None for x in [whip, baa]) and ((whip is not None and float(whip) >= 1.35) or (baa is not None and float(baa) >= 0.265)):
+            score += 8
+            paths.append("traffic pitcher")
+            notes.append("WHIP/BAA creates hits+RBI paths")
+        if (collapse is not None and float(collapse) >= 62) or any(x in blob for x in ["STARTER-COLLAPSE", "STARTER COLLAPSE", "EARLY EXIT", "SHORT LEASH"]):
+            score += 7
+            paths.append("starter-collapse HRR")
+            notes.append("early chain can create run/RBI volume")
+        if (cascade is not None and float(cascade) >= 62) or any(x in blob for x in ["BULLPEN", "RELIEF", "LEASH"]):
+            score += 7
+            paths.append("bullpen-cascade HRR")
+            notes.append("late innings keep HRR live")
+        if team_runs is not None and float(team_runs) >= 5.05:
+            score += 6
+            paths.append("team-run support")
+        if game_total is not None and float(game_total) >= 9.4:
+            score += 4
+            paths.append("high-total support")
+        if suppression is not None and float(suppression) >= 66 and (team_runs is None or float(team_runs) < 4.6):
+            score -= 11
+            paths.append("suppression warning")
+            notes.append("thin HRR environment")
+    if hr9 is not None and float(hr9) >= 1.45 and is_hr:
+        score += 5
+        paths.append("HR9 danger")
+    if not paths:
+        paths.append("normal outcome path")
+    return (
+        round(_ow_v27_clamp(score, 5, 98), 1),
+        _ow_v28_outcome_label(score),
+        "; ".join(dict.fromkeys(paths))[:180],
+        "; ".join(notes[:6]) or "No Sept. 9 archetype override found.",
+    )
+
+
+def _ow_v27_pattern_flags(row, market, pitcher_score, lineup_score, env_score, path_score):
+    r = dict(row or {})
+    flags = []
+    slot = _ow_v27_num(r, ["Lineup Slot"], None)
+    team_runs = _ow_v27_num(r, ["Expected Runs V20", "Team Runs V3", "Team Implied Runs"], None)
+    suppression = _ow_v27_num(r, ["Suppression Risk %"], None, pct=True)
+    hr9 = _ow_v27_num(r, ["Pitcher Recent HR/9", "Pitcher HR9"], None)
+    baa = _ow_v27_num(r, ["Pitcher Split BAA", "Pitcher BAA"], None)
+    whip = _ow_v27_num(r, ["Pitcher WHIP", "Pitcher Recent WHIP"], None)
+    pick = _ow_v27_pick(r)
+    if str(market) == "Home Runs":
+        if pitcher_score >= 70 or (hr9 is not None and float(hr9) >= 1.35):
+            flags.append("HR pitcher-vulnerable")
+        if path_score >= 70:
+            flags.append("power-path")
+    else:
+        try:
+            if slot is not None and int(round(float(slot))) <= 6 and (team_runs is None or float(team_runs) >= 4.65):
+                flags.append("top-six HRR chain")
+        except Exception:
+            pass
+        if pitcher_score >= 70 or (baa is not None and float(baa) >= 0.265) or (whip is not None and float(whip) >= 1.35):
+            flags.append("traffic pitcher")
+    if env_score >= 72:
+        flags.append("team run environment")
+    if suppression is not None and float(suppression) >= 65:
+        flags.append("suppression downgrade")
+    if pick.startswith("UNDER"):
+        flags.append("under row - verify conflict")
+    if not flags:
+        flags.append("normal matchup")
+    return "; ".join(flags[:5])
+
+
+def _ow_matchup_opportunity_row_v27(row, board_name=""):
+    r = dict(row or {})
+    market = _ow_v27_market(r, board_name)
+    pitcher_score, pitcher_note = _ow_v27_pitcher_vulnerability(r, market)
+    lineup_score, lineup_note = _ow_v27_lineup_edge(r, market)
+    form_score, form_note = _ow_v27_recent_form_edge(r, market)
+    env_score, env_note = _ow_v27_team_environment(r, market)
+    path_score, path_note = _ow_v27_market_path(r, market)
+    is_hr = market == "Home Runs"
+    if is_hr:
+        base_score = (
+            pitcher_score * 0.30
+            + path_score * 0.26
+            + env_score * 0.18
+            + lineup_score * 0.14
+            + form_score * 0.12
+        )
+    else:
+        base_score = (
+            pitcher_score * 0.25
+            + lineup_score * 0.23
+            + env_score * 0.22
+            + path_score * 0.18
+            + form_score * 0.12
+        )
+    outcome_score, outcome_label, outcome_path, outcome_note = _ow_v28_outcome_pattern_score(
+        r, market, pitcher_score, lineup_score, form_score, env_score, path_score
+    )
+    outcome_weight = 0.18 if is_hr else 0.14
+    score = base_score * (1.0 - outcome_weight) + outcome_score * outcome_weight
+    gate = str(r.get("V19 Win-Rate Gate") or "").upper()
+    if any(x in gate for x in ["PASS", "RESEARCH ONLY"]):
+        score -= 5
+    if _ow_v27_pick(r).startswith("UNDER"):
+        score -= 6
+    score = round(_ow_v27_clamp(score, 5, 98), 1)
+    flags = _ow_v27_pattern_flags(r, market, pitcher_score, lineup_score, env_score, path_score)
+    if outcome_path and outcome_path != "normal outcome path":
+        flags = "; ".join([flags, outcome_path])[:260]
+    why_parts = [
+        pitcher_note,
+        lineup_note,
+        form_note,
+        env_note,
+        path_note,
+        outcome_note,
+    ]
+    why = " | ".join([x for x in why_parts if x])[:620]
+    r["V27 Base Pattern Score"] = round(_ow_v27_clamp(base_score, 5, 98), 1)
+    r["V27 Matchup Pattern Score"] = score
+    r["V27 Matchup Pattern Label"] = _ow_v27_label(score)
+    r["V27 Pattern Flags"] = flags
+    r["V28 Final Pattern Score"] = score
+    r["V28 Outcome Pattern Score"] = outcome_score
+    r["V28 Outcome Pattern Label"] = outcome_label
+    r["V28 Outcome Path"] = outcome_path
+    r["V28 Outcome Why"] = outcome_note
+    r["V27 Pitcher Vulnerability"] = pitcher_score
+    r["V27 Pitcher Why"] = pitcher_note
+    r["V27 Lineup Edge"] = lineup_score
+    r["V27 Lineup Why"] = lineup_note
+    r["V27 Recent Form Edge"] = form_score
+    r["V27 Recent Form Why"] = form_note
+    r["V27 Team Environment"] = env_score
+    r["V27 Team Environment Why"] = env_note
+    r["V27 HR Path"] = path_score if is_hr else ""
+    r["V27 HRR Path"] = path_score if not is_hr else ""
+    r["V27 Pattern Why"] = why
+    r["V27 Projection Impact"] = "NONE"
+    r["V27 Version"] = OW_MATCHUP_OPPORTUNITY_VERSION_V27
+    r["V28 Projection Impact"] = "NONE"
+    r["V28 Version"] = OW_OUTCOME_PATTERN_VERSION_V28
+    return r
+
+
+def _ow_apply_matchup_opportunity_v27(df, board_name=""):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, row in df.iterrows():
+        try:
+            rows.append(_ow_matchup_opportunity_row_v27(row.to_dict(), board_name=board_name))
+        except Exception:
+            rows.append(row.to_dict())
+    return pd.DataFrame(rows)
+
+
+def _ow_v27_today_date_text():
+    try:
+        return california_now().strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def _ow_v27_schedule_team_abbr(team_obj):
+    if not isinstance(team_obj, dict):
+        return ""
+    raw = (
+        team_obj.get("abbreviation")
+        or team_obj.get("teamCode")
+        or team_obj.get("fileCode")
+        or team_obj.get("name")
+        or team_obj.get("clubName")
+        or ""
+    )
+    return _ow_team_abbr(raw)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _ow_fetch_official_mlb_schedule_v27(date_text):
+    date_text = str(date_text or _ow_v27_today_date_text())[:10]
+    debug = {
+        "version": OW_OFFICIAL_SLATE_COVERAGE_VERSION_V27,
+        "date": date_text,
+        "endpoint": f"{MLB_BASE}/schedule",
+        "status": "NO_RESPONSE",
+        "games": 0,
+    }
+    rows = []
+    try:
+        payload = safe_get_json(
+            f"{MLB_BASE}/schedule",
+            params={"sportId": 1, "date": date_text, "hydrate": "probablePitcher"},
+            timeout=16,
+        )
+    except Exception as exc:
+        debug["error"] = str(exc)[:220]
+        return rows, debug
+    if not isinstance(payload, dict):
+        debug["status"] = "BAD_PAYLOAD"
+        return rows, debug
+    for day in payload.get("dates", []) or []:
+        for game in day.get("games", []) or []:
+            try:
+                teams = game.get("teams") if isinstance(game.get("teams"), dict) else {}
+                away_side = teams.get("away") if isinstance(teams.get("away"), dict) else {}
+                home_side = teams.get("home") if isinstance(teams.get("home"), dict) else {}
+                away_team = away_side.get("team") if isinstance(away_side.get("team"), dict) else {}
+                home_team = home_side.get("team") if isinstance(home_side.get("team"), dict) else {}
+                away = _ow_v27_schedule_team_abbr(away_team)
+                home = _ow_v27_schedule_team_abbr(home_team)
+                away_pitcher = away_side.get("probablePitcher") if isinstance(away_side.get("probablePitcher"), dict) else {}
+                home_pitcher = home_side.get("probablePitcher") if isinstance(home_side.get("probablePitcher"), dict) else {}
+                status = game.get("status") if isinstance(game.get("status"), dict) else {}
+                rows.append({
+                    "Official Date": game.get("officialDate") or day.get("date") or date_text,
+                    "Game PK": game.get("gamePk"),
+                    "Official Game": f"{away} @ {home}" if away and home else str(game.get("gamePk") or ""),
+                    "Away": away,
+                    "Home": home,
+                    "Away Team": away_team.get("name") or away,
+                    "Home Team": home_team.get("name") or home,
+                    "Away Score": away_side.get("score"),
+                    "Home Score": home_side.get("score"),
+                    "Away Probable Pitcher": away_pitcher.get("fullName") or "",
+                    "Home Probable Pitcher": home_pitcher.get("fullName") or "",
+                    "Status": status.get("detailedState") or status.get("abstractGameState") or "",
+                    "Abstract Status": status.get("abstractGameState") or "",
+                    "Game Time": game.get("gameDate") or "",
+                    "Official Slate Version": OW_OFFICIAL_SLATE_COVERAGE_VERSION_V27,
+                })
+            except Exception:
+                continue
+    debug["games"] = len(rows)
+    debug["status"] = "OK" if rows else "EMPTY"
+    return rows, debug
+
+
+def _ow_v27_pair_key(team, opp):
+    a = _ow_team_abbr(team)
+    b = _ow_team_abbr(opp)
+    if not a or not b or a == "—" or b == "—":
+        return ""
+    return "|".join(sorted([str(a).upper(), str(b).upper()]))
+
+
+def _ow_v27_line_pair_key(row):
+    r = dict(row or {})
+    team = _ow_team_abbr(r.get("Team") or r.get("Raw Log Team"))
+    opp = _ow_team_abbr(r.get("Opponent") or r.get("Today Opponent"))
+    if team and opp and team != "—" and opp != "—":
+        return _ow_v27_pair_key(team, opp)
+    home = _ow_team_abbr(r.get("Provider Home Team"))
+    away = _ow_team_abbr(r.get("Provider Away Team"))
+    if home and away and home != "—" and away != "—":
+        return _ow_v27_pair_key(home, away)
+    return ""
+
+
+def _ow_v27_collect_current_batter_lines():
+    frames = []
+    hrr_meta, hr_meta = {}, {}
+    try:
+        hrr_df, hrr_meta = build_v3_batter_research_table("HRR")
+        hrr_view = _ow_v26_prepare_all_line_frame(hrr_df, "H+R+RBI")
+        if isinstance(hrr_view, pd.DataFrame) and not hrr_view.empty:
+            frames.append(hrr_view)
+    except Exception as exc:
+        hrr_meta = {"status": "ERROR", "error": str(exc)[:300]}
+    try:
+        hr_df, hr_meta = build_v3_home_run_table()
+        hr_view = _ow_v26_prepare_all_line_frame(hr_df, "Home Runs")
+        if isinstance(hr_view, pd.DataFrame) and not hr_view.empty:
+            frames.append(hr_view)
+    except Exception as exc:
+        hr_meta = {"status": "ERROR", "error": str(exc)[:300]}
+    if not frames:
+        return pd.DataFrame(), {"hrr_meta": hrr_meta, "hr_meta": hr_meta}
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    if "V27 Matchup Pattern Score" not in df.columns:
+        df = _ow_apply_matchup_opportunity_v27(df, board_name="ALL_LINES")
+    df["_V27 Pair Key"] = df.apply(lambda x: _ow_v27_line_pair_key(x.to_dict()), axis=1)
+    return df, {"hrr_meta": hrr_meta, "hr_meta": hr_meta}
+
+
+def _ow_v27_shadow_team_profiles():
+    try:
+        game_df, team_df, _hrr, _hr, _meta = _ow_build_pregame_shadow_finder_v15()
+    except Exception:
+        return {}, pd.DataFrame()
+    profiles = {}
+    if isinstance(team_df, pd.DataFrame) and not team_df.empty:
+        for _, row in team_df.iterrows():
+            r = row.to_dict()
+            key = (_ow_team_abbr(r.get("Team")), _ow_team_abbr(r.get("Opponent")))
+            if key[0] and key[1]:
+                profiles[key] = r
+    return profiles, team_df if isinstance(team_df, pd.DataFrame) else pd.DataFrame()
+
+
+def _ow_v27_official_slate_coverage_table(date_text=None):
+    sched_rows, sched_debug = _ow_fetch_official_mlb_schedule_v27(date_text or _ow_v27_today_date_text())
+    schedule = pd.DataFrame(sched_rows)
+    lines, line_meta = _ow_v27_collect_current_batter_lines()
+    team_profiles, _team_df = _ow_v27_shadow_team_profiles()
+    if schedule.empty:
+        return pd.DataFrame(), {"schedule": sched_debug, "line_meta": line_meta}
+    rows = []
+    official_pairs = set()
+    line_pairs = set(lines["_V27 Pair Key"].dropna().astype(str).tolist()) if isinstance(lines, pd.DataFrame) and "_V27 Pair Key" in lines.columns else set()
+    line_pairs = {x for x in line_pairs if x}
+    for _, row in schedule.iterrows():
+        r = row.to_dict()
+        away = _ow_team_abbr(r.get("Away"))
+        home = _ow_team_abbr(r.get("Home"))
+        pair = _ow_v27_pair_key(away, home)
+        if pair:
+            official_pairs.add(pair)
+        subset = lines[lines["_V27 Pair Key"].astype(str).eq(pair)].copy() if isinstance(lines, pd.DataFrame) and not lines.empty and pair else pd.DataFrame()
+        hrr_count = int(subset.get("Market View", pd.Series(dtype=str)).astype(str).eq("H+R+RBI").sum()) if not subset.empty else 0
+        hr_count = int(subset.get("Market View", pd.Series(dtype=str)).astype(str).eq("Home Runs").sum()) if not subset.empty else 0
+        score_col = "V27 Matchup Pattern Score"
+        top = subset.sort_values(score_col, ascending=False, na_position="last").head(3) if score_col in subset.columns else subset.head(3)
+        top_players = ", ".join([str(x) for x in top.get("Player", pd.Series(dtype=str)).dropna().astype(str).head(3).tolist()])
+        top_score = pd.to_numeric(subset.get(score_col, pd.Series(dtype=float)), errors="coerce").max() if not subset.empty else np.nan
+        away_prof = team_profiles.get((away, home), {})
+        home_prof = team_profiles.get((home, away), {})
+        away_exp = _ow_v27_num(away_prof, ["Team Explosion %"], None, pct=True)
+        home_exp = _ow_v27_num(home_prof, ["Team Explosion %"], None, pct=True)
+        away_runs = _ow_v27_num(away_prof, ["Team Runs"], None)
+        home_runs = _ow_v27_num(home_prof, ["Team Runs"], None)
+        best_attack = ""
+        if away_exp is not None or home_exp is not None:
+            best_attack = away if float(away_exp or 0) >= float(home_exp or 0) else home
+        if subset.empty:
+            coverage = "NO LINE ROWS - MISSED OPPORTUNITY WATCH"
+        elif len(subset) < 8:
+            coverage = "LOW LINE COVERAGE"
+        else:
+            coverage = "LINE COVERED"
+        official_total = None
+        ar = _ow_v27_num(r, ["Away Score", "Away Runs"], None)
+        hruns = _ow_v27_num(r, ["Home Score", "Home Runs"], None)
+        if ar is not None and hruns is not None:
+            official_total = float(ar) + float(hruns)
+        rows.append({
+            "Official Game": r.get("Official Game"),
+            "Status": r.get("Status"),
+            "Score": f"{away} {'' if ar is None else int(ar)} - {home} {'' if hruns is None else int(hruns)}" if ar is not None or hruns is not None else "",
+            "Official Total Runs": official_total,
+            "Line Coverage": coverage,
+            "Line Rows": len(subset),
+            "H+R+RBI Rows": hrr_count,
+            "HR Rows": hr_count,
+            "Best Attack": best_attack,
+            "Away Explosion %": away_exp,
+            "Home Explosion %": home_exp,
+            "Away Expected Runs": away_runs,
+            "Home Expected Runs": home_runs,
+            "Top V27 Score": round(float(top_score), 1) if pd.notna(top_score) else "",
+            "Top Line Players": top_players,
+            "Away Probable Pitcher": r.get("Away Probable Pitcher"),
+            "Home Probable Pitcher": r.get("Home Probable Pitcher"),
+            "Game PK": r.get("Game PK"),
+            "Coverage Version": OW_OFFICIAL_SLATE_COVERAGE_VERSION_V27,
+        })
+    stale_pairs = sorted([p for p in line_pairs if p and p not in official_pairs])
+    meta = {
+        "schedule": sched_debug,
+        "line_meta": line_meta,
+        "official_games": len(schedule),
+        "line_pairs": len(line_pairs),
+        "stale_or_other_date_pairs": stale_pairs[:30],
+        "version": OW_OFFICIAL_SLATE_COVERAGE_VERSION_V27,
+    }
+    out = pd.DataFrame(rows)
+    if "Line Coverage" in out.columns:
+        out["_coverage_sort"] = out["Line Coverage"].astype(str).map({
+            "NO LINE ROWS - MISSED OPPORTUNITY WATCH": 0,
+            "LOW LINE COVERAGE": 1,
+            "LINE COVERED": 2,
+        }).fillna(9)
+        out = out.sort_values(["_coverage_sort", "Official Total Runs", "Top V27 Score"], ascending=[True, False, False], na_position="last").drop(columns=["_coverage_sort"], errors="ignore")
+    return out, meta
+
+
+def _ow_render_official_slate_coverage_v27(location="all_lines"):
+    st.markdown("### Official Slate Coverage V27")
+    st.caption("Official MLB schedule first, then line rows overlay. Games without lines stay visible as missed-opportunity watches.")
+    try:
+        default_date = datetime.strptime(_ow_v27_today_date_text(), "%Y-%m-%d").date()
+    except Exception:
+        default_date = datetime.now().date()
+    date_choice = st.date_input(
+        "Official MLB date",
+        value=default_date,
+        key=_v3_unique_widget_key(f"ow_v27_official_date_{location}"),
+    )
+    coverage, meta = _ow_v27_official_slate_coverage_table(str(date_choice))
+    if isinstance(coverage, pd.DataFrame) and not coverage.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Official Games", len(coverage))
+        c2.metric("No-Line Games", int(coverage["Line Coverage"].astype(str).str.contains("NO LINE", na=False).sum()))
+        c3.metric("Low Coverage", int(coverage["Line Coverage"].astype(str).str.contains("LOW LINE", na=False).sum()))
+        c4.metric("Covered", int(coverage["Line Coverage"].astype(str).eq("LINE COVERED").sum()))
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+        stale = (meta or {}).get("stale_or_other_date_pairs") or []
+        if stale:
+            st.warning(
+                "Some provider/app line pairs do not match the selected official slate: "
+                + ", ".join(stale[:12])
+                + ". Treat those as stale or different-date rows until the board refreshes."
+            )
+        try:
+            st.download_button(
+                "Download official slate coverage CSV",
+                data=coverage.to_csv(index=False).encode("utf-8"),
+                file_name=f"official_slate_coverage_v27_{str(date_choice)}.csv",
+                mime="text/csv",
+                key=_v3_unique_widget_key(f"ow_v27_coverage_download_{location}"),
+                use_container_width=True,
+            )
+        except Exception:
+            pass
+    else:
+        st.info("Official MLB schedule could not be loaded for this date yet.")
+    with st.expander("Official slate coverage debug", expanded=False):
+        st.json(meta if isinstance(meta, dict) else {})
+
+
+def _ow_render_matchup_opportunity_lab_v27(location="all_lines", max_rows=80):
+    st.markdown("### V27 Matchup Opportunity Lab")
+    st.caption("Box-score lesson overlay: pitcher traffic/power weakness + top-six lineup role + recent form + run environment. Projection impact is NONE.")
+    df, meta = _ow_v27_collect_current_batter_lines()
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        d = df.copy()
+        sort_col = "V28 Final Pattern Score" if "V28 Final Pattern Score" in d.columns else "V27 Matchup Pattern Score"
+        if sort_col in d.columns:
+            d["_v27_sort"] = pd.to_numeric(d[sort_col], errors="coerce").fillna(0)
+            d = d.sort_values("_v27_sort", ascending=False).drop(columns=["_v27_sort"], errors="ignore")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows Scored", len(d))
+        c2.metric("Strong Patterns", int(pd.to_numeric(d.get(sort_col, pd.Series(dtype=float)), errors="coerce").ge(76).sum()))
+        c3.metric("HR Rows", int(d.get("Market View", pd.Series(dtype=str)).astype(str).eq("Home Runs").sum()))
+        c4.metric("HRR Rows", int(d.get("Market View", pd.Series(dtype=str)).astype(str).eq("H+R+RBI").sum()))
+        cols = [c for c in [
+            "Game", "Player", "Team", "Opponent", "Market View", "Pick", "Line", "Projection", "HR Projection",
+            "V28 Final Pattern Score", "V28 Outcome Pattern Score", "V28 Outcome Pattern Label", "V28 Outcome Path",
+            "V27 Base Pattern Score", "V27 Matchup Pattern Score", "V27 Matchup Pattern Label", "V27 Pattern Flags",
+            "V27 Pitcher Vulnerability", "V27 Lineup Edge", "V27 Recent Form Edge", "V27 Team Environment",
+            "V27 HRR Path", "V27 HR Path", "V28 Outcome Why", "V27 Pattern Why",
+            "V19 Win-Rate Gate", "Official Play Filter", "Projected PA", "Lineup Slot",
+            "Expected Runs V20", "Team Explosion %", "Suppression Risk %",
+            "Opp Pitcher", "Pitcher Hand", "Pitcher ERA", "Pitcher WHIP", "Pitcher BAA", "Pitcher HR9", "Pitcher K%",
+            "Last 5", "Last 10", "Last 5 Avg", "Last 10 Avg", "Last 5 HR Rate %", "Last 10 HR Rate %",
+            "Line Source",
+        ] if c in d.columns]
+        st.dataframe(d[cols].head(max_rows) if cols else d.head(max_rows), use_container_width=True, hide_index=True)
+        try:
+            st.download_button(
+                "Download V27 matchup opportunity CSV",
+                data=d.to_csv(index=False).encode("utf-8"),
+                file_name="v27_matchup_opportunity_board.csv",
+                mime="text/csv",
+                key=_v3_unique_widget_key(f"ow_v27_matchup_download_{location}"),
+                use_container_width=True,
+            )
+        except Exception:
+            pass
+    else:
+        st.info("No batter line rows are available to score right now. Use the official slate table below to see which games are missing lines.")
+    _ow_render_official_slate_coverage_v27(location=location)
+    with st.expander("V27 matchup layer debug", expanded=False):
+        st.json({
+            "version": OW_MATCHUP_OPPORTUNITY_VERSION_V27,
+            "outcome_pattern_version": OW_OUTCOME_PATTERN_VERSION_V28,
+            "projection_impact": "NONE",
+            "line_meta": meta if isinstance(meta, dict) else {},
+            "notes": [
+                "HRR favors top-six PA chain, traffic pitchers, BAA/WHIP/H9, and team expected runs.",
+                "Home Runs favors HR/9, pitcher power tags, HR environment, batter power path, and park/weather when present.",
+                "Official schedule coverage prevents hidden games from disappearing when a line provider misses a slate.",
+                "V28 outcome paths are learned from Sept. 9 box scores and are bounded shadow sort fields only.",
+            ],
+        })
+
+
+OW_SEP9_BOX_SCORE_LESSONS_V27 = [
+    {
+        "Game": "WSH @ SD",
+        "Final/Pattern": "SD 9-2 one-sided attack",
+        "App Lesson": "Good high-score/team read, but HR allocation needed Jackson Merrill-type lower-row power/xBH escalation.",
+        "V27 Add": "Keep SD/WSH high, add HR path + lineup/pitcher vulnerability why fields.",
+    },
+    {
+        "Game": "SEA @ TEX",
+        "Final/Pattern": "SEA 3-2 low total, TEX HRs still hit",
+        "App Lesson": "High-score miss can still contain correct HR pitcher-vulnerability plays.",
+        "V27 Add": "Separate Home Run path from HRR/game-total path.",
+    },
+    {
+        "Game": "CLE @ BAL",
+        "Final/Pattern": "BAL 9-5 single-inning starter collapse",
+        "App Lesson": "Neutral game total missed one-side burst risk.",
+        "V27 Add": "Traffic pitcher + lineup density + collapse watch visible before filters.",
+    },
+    {
+        "Game": "MIN @ DET",
+        "Final/Pattern": "DET 7-2 one-sided win; early starter damage",
+        "App Lesson": "Team explosion worked; HR allocation needed pitcher HR/9 and lineup slot power support.",
+        "V27 Add": "Add pitcher power/traffic vulnerability to HR and HRR rows separately.",
+    },
+    {
+        "Game": "TOR @ ATH",
+        "Final/Pattern": "ATH 2-0 suppression",
+        "App Lesson": "TOR cluster needed stronger suppression downgrade.",
+        "V27 Add": "Suppression risk and official slate sanity stay visible in the row.",
+    },
+    {
+        "Game": "STL @ SF",
+        "Final/Pattern": "SF 7-6 late bullpen cascade",
+        "App Lesson": "Late scoring can flip without being a clean pregame starter explosion.",
+        "V27 Add": "Bullpen-cascade watch remains separate from starter-collapse path.",
+    },
+    {
+        "Game": "NYM @ MIA / HOU @ PHI / CHC @ MIL",
+        "Final/Pattern": "Hidden no-line or low-coverage explosions",
+        "App Lesson": "Official games must stay visible even if provider rows are absent.",
+        "V27 Add": "Official slate coverage flags no-line missed-opportunity games.",
+    },
+]
+
+
+def _ow_render_sep9_box_score_lessons_v27():
+    st.markdown("### September 9 Box-Score Lessons V27")
+    st.caption("These are model-development notes from the checked box scores. They do not change protected projections.")
+    df = pd.DataFrame(OW_SEP9_BOX_SCORE_LESSONS_V27)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.markdown("#### September 9 HR Outcome Audit V28")
+    st.caption("Every confirmed HR path captured from the Sept. 9 slate audit: hitter, inning, pitcher faced, and formula signal.")
+    hr_audit = pd.DataFrame(OW_SEP9_HR_OUTCOME_AUDIT_V28)
+    if not hr_audit.empty:
+        st.dataframe(hr_audit, use_container_width=True, hide_index=True)
+        try:
+            st.download_button(
+                "Download Sept. 9 HR outcome audit CSV",
+                data=hr_audit.to_csv(index=False).encode("utf-8"),
+                file_name="sept9_hr_outcome_audit_v28.csv",
+                mime="text/csv",
+                key=_v3_unique_widget_key("ow_sep9_hr_outcome_audit_v28_download"),
+                use_container_width=True,
+            )
+        except Exception:
+            pass
+    st.markdown("#### Formula Adds From Sept. 9 V28")
+    lessons = pd.DataFrame(OW_SEP9_FORMULA_LESSONS_V28)
+    st.dataframe(lessons, use_container_width=True, hide_index=True)
+    st.info(
+        "V28 target: catch missed official games, keep HR separate from high-score HRR, upgrade top-six traffic spots, "
+        "add recent-power and bullpen paths, and downgrade clusters in true suppression environments."
+    )
+
+
+_ow_build_research_before_matchup_v27 = build_v3_batter_research_table
+_ow_build_home_run_before_matchup_v27 = build_v3_home_run_table
+_ow_build_upside_before_matchup_v27 = build_v3_batter_upside_board_final
+
+
+def build_v3_batter_research_table(market="HRR"):
+    got = _ow_build_research_before_matchup_v27(market)
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_matchup_opportunity_v27(df, board_name=str(market or "HRR"))
+        meta["matchup_opportunity_v27"] = OW_MATCHUP_OPPORTUNITY_VERSION_V27
+        meta["outcome_pattern_v28"] = OW_OUTCOME_PATTERN_VERSION_V28
+        meta["projection_impact"] = "NONE"
+        return df, meta
+    return _ow_apply_matchup_opportunity_v27(got, board_name=str(market or "HRR"))
+
+
+def build_v3_home_run_table():
+    got = _ow_build_home_run_before_matchup_v27()
+    if isinstance(got, tuple) and len(got) >= 2:
+        df, meta = got[0], dict(got[1] or {})
+        df = _ow_apply_matchup_opportunity_v27(df, board_name="Home Runs")
+        meta["matchup_opportunity_v27"] = OW_MATCHUP_OPPORTUNITY_VERSION_V27
+        meta["outcome_pattern_v28"] = OW_OUTCOME_PATTERN_VERSION_V28
+        meta["projection_impact"] = "NONE"
+        return df, meta
+    return _ow_apply_matchup_opportunity_v27(got, board_name="Home Runs")
+
+
+def build_v3_batter_upside_board_final():
+    df = _ow_build_upside_before_matchup_v27()
+    return _ow_apply_matchup_opportunity_v27(df, board_name="Batter Upside")
+
+
+_ow_render_all_lines_before_matchup_v27 = render_v3_all_batter_lines_tracker_v26
+_ow_render_shadow_before_matchup_v27 = _ow_render_pregame_shadow_finder_v15
+_ow_render_learning_before_matchup_v27 = render_v3_batter_learning_lab_tab
+
+
+def render_v3_all_batter_lines_tracker_v26():
+    _ow_render_all_lines_before_matchup_v27()
+    st.divider()
+    _ow_render_matchup_opportunity_lab_v27(location="all_lines")
+
+
+def _ow_render_pregame_shadow_finder_v15():
+    _ow_render_shadow_before_matchup_v27()
+    st.divider()
+    _ow_render_matchup_opportunity_lab_v27(location="shadow", max_rows=60)
+
+
+def render_v3_batter_learning_lab_tab():
+    _ow_render_learning_before_matchup_v27()
+    st.divider()
+    _ow_render_sep9_box_score_lessons_v27()
+
+
 _ow_render_top_before_line_feed_empty_v21 = render_v3_top_batter_plays_board
 
 
@@ -49400,9 +50791,10 @@ _ow_bfs_restore_saved_board_to_session()
 # rendered tabs is client-side and does NOT dim/re-run the app. The heavy core builders
 # above stay frozen for the manual refresh generation. Games remains full-board on-demand
 # only after a matchup is opened and then remains frozen until the same manual button.
-tab_top, tab_games, tab_shadow, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
+tab_top, tab_games, tab_all_lines, tab_shadow, tab_hrr, tab_hr, tab_bfs, tab_learning, tab_official, tab_calibration, tab_settings = st.tabs([
     "🔥 BATTER UPSIDE",
     "⚾ GAMES",
+    "📋 ALL LINES",
     "🔭 SHADOW FINDER",
     "1️⃣ H+R+RBI",
     "2️⃣ HOME RUNS",
@@ -49418,6 +50810,9 @@ with tab_top:
 
 with tab_games:
     render_v3_games_tab()
+
+with tab_all_lines:
+    render_v3_all_batter_lines_tracker_v26()
 
 with tab_shadow:
     _ow_render_pregame_shadow_finder_v15()
