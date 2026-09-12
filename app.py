@@ -36602,13 +36602,38 @@ def _ow_render_batter_line_feed_empty_v21(title, meta=None, debug_key="final_ud_
         provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24") or {}
     except Exception:
         provider_debug = {}
+    provider_probe_rows = []
+    if (not isinstance(provider_debug, dict) or not int((provider_debug or {}).get("rows", 0) or 0)) and "_ow_auto_provider_batter_rows_v24" in globals():
+        try:
+            title_l = str(title or "").lower()
+            probe_market = "Home Runs" if "home run" in title_l else "HRR" if "h+r+rbi" in title_l else None
+            provider_probe_rows = _ow_auto_provider_batter_rows_v24(probe_market)
+            provider_debug = st.session_state.get("ow_auto_provider_batter_line_debug_v24") or provider_debug
+        except Exception as exc:
+            provider_debug = {
+                "version": OW_LINE_FEED_EMPTY_BRIDGE_VERSION_V33,
+                "status": "PROVIDER_PROBE_ERROR",
+                "error": str(exc)[:240],
+            }
+    if provider_probe_rows and not st.session_state.get("ow_line_feed_bridge_reran_v33"):
+        try:
+            st.session_state["ow_line_feed_bridge_reran_v33"] = True
+            st.session_state.pop("ow_core_board_cache_v7", None)
+            st.cache_data.clear()
+            st.rerun()
+        except Exception:
+            pass
     st.warning(f"No active {title} rows loaded.")
     if isinstance(http_err, dict) and http_err.get("status_code"):
         provider_status = ""
+        provider_rows = 0
         if isinstance(provider_debug, dict):
             provider_status = str(provider_debug.get("status") or "")
+            provider_rows = int(provider_debug.get("rows", 0) or 0)
         if provider_status == "DISABLED":
             provider_note = " No automatic backup provider key is configured yet."
+        elif provider_rows:
+            provider_note = f" Automatic backup provider found {provider_rows} rows; refresh/rebuild should load them into cards."
         elif provider_status:
             provider_note = f" Automatic backup provider status: {provider_status}."
         else:
@@ -36695,10 +36720,12 @@ def _ow_render_batter_line_feed_empty_v21(title, meta=None, debug_key="final_ud_
                     "build": meta,
                     "underdog_parser": debug if isinstance(debug, dict) else {"debug": str(debug)},
                     "last_http": http_err if isinstance(http_err, dict) else {"debug": str(http_err)},
-                    "version": "OW_BATTER_LINE_FEED_EMPTY_STATE_V21_2026_09_08",
+                    "provider_fallback": provider_debug if isinstance(provider_debug, dict) else {"debug": str(provider_debug)},
+                    "provider_probe_rows": len(provider_probe_rows or []),
+                    "version": OW_LINE_FEED_EMPTY_BRIDGE_VERSION_V33,
                 })
             except Exception:
-                st.write({"build": meta, "underdog_parser": debug, "last_http": http_err})
+                st.write({"build": meta, "underdog_parser": debug, "last_http": http_err, "provider_fallback": provider_debug})
 
 
 def render_v3_batter_research_tab(market="HRR"):
@@ -48946,6 +48973,7 @@ with st.sidebar:
 OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24 = "OW_AUTO_BATTER_LINE_PROVIDER_V24_2026_09_08"
 OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25 = "OW_PRIZEPICKS_BATTER_PUBLIC_FEED_V25_2026_09_09"
 OW_PROPLINE_FULL_LINE_PULL_VERSION_V26 = "OW_PROPLINE_FULL_LINE_PULL_V32_2026_09_12"
+OW_LINE_FEED_EMPTY_BRIDGE_VERSION_V33 = "OW_LINE_FEED_EMPTY_BRIDGE_V33_2026_09_12"
 PROPLINE_BASE = "https://api.prop-line.com/v1"
 PROPLINE_API_KEY = get_secret("PROPLINE_API_KEY", "")
 PROPLINE_BATTER_MARKETS_V24 = "batter_hits_runs_rbis,batter_home_runs"
