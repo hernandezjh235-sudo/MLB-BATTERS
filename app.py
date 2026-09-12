@@ -274,9 +274,12 @@ LEAGUE_AVG_WHIFF_BY_PITCH_TYPE = {
 
 def get_secret(key, default=""):
     try:
-        return st.secrets[key]
+        val = st.secrets[key]
     except Exception:
-        return os.getenv(key, default)
+        val = os.getenv(key, default)
+    if isinstance(val, str):
+        return val.strip().strip('"').strip("'")
+    return val
 
 # SharpAPI is optional and loaded from the deployment secret store only.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
@@ -48942,10 +48945,15 @@ with st.sidebar:
 # -------------------------
 OW_AUTO_BATTER_LINE_PROVIDER_VERSION_V24 = "OW_AUTO_BATTER_LINE_PROVIDER_V24_2026_09_08"
 OW_PRIZEPICKS_BATTER_PUBLIC_FEED_VERSION_V25 = "OW_PRIZEPICKS_BATTER_PUBLIC_FEED_V25_2026_09_09"
-OW_PROPLINE_FULL_LINE_PULL_VERSION_V26 = "OW_PROPLINE_FULL_LINE_PULL_V26_2026_09_10"
+OW_PROPLINE_FULL_LINE_PULL_VERSION_V26 = "OW_PROPLINE_FULL_LINE_PULL_V32_2026_09_12"
 PROPLINE_BASE = "https://api.prop-line.com/v1"
 PROPLINE_API_KEY = get_secret("PROPLINE_API_KEY", "")
 PROPLINE_BATTER_MARKETS_V24 = "batter_hits_runs_rbis,batter_home_runs"
+PROPLINE_BATTER_MARKET_REQUESTS_V32 = [
+    "batter_hits_runs_rbis,batter_home_runs",
+    "batter_hits_runs_rbis",
+    "batter_home_runs",
+]
 PROPLINE_BOOK_PRIORITY_V24 = {
     "underdog": 100,
     "prizepicks": 95,
@@ -48977,6 +48985,166 @@ def _ow_v26_int_env(name, default, lo=None, hi=None):
 # so this stays bounded while no longer depending on a sometimes-incomplete schedule map.
 PROPLINE_MAX_EVENTS_V26 = _ow_v26_int_env("PROPLINE_MAX_EVENTS", 120, lo=15, hi=120)
 PROPLINE_LINE_SCAN_NOTE_V26 = "ALL_MLB_EVENTS_NO_SCHEDULE_PAIR_BLOCK"
+
+
+def _ow_v32_propline_get_json(url, key, params=None, timeout=18):
+    base_params = dict(params or {})
+    attempts = [
+        ("query_apiKey", {**base_params, "apiKey": key}, {}),
+        ("header_X_API_Key", base_params, {"X-API-Key": key}),
+    ]
+    last_req = {
+        "endpoint": url,
+        "status": "NO_RESPONSE",
+    }
+    for auth_mode, qparams, extra_headers in attempts:
+        sanitized_params = {k: v for k, v in (qparams or {}).items() if k.lower() != "apikey"}
+        req = {
+            "endpoint": url,
+            "params": sanitized_params,
+            "auth": auth_mode,
+            "status": "NO_RESPONSE",
+        }
+        try:
+            headers = {
+                "Accept": "application/json,text/plain,*/*",
+                "User-Agent": "Mozilla/5.0 OneWayPickzBatterLines/1.0",
+            }
+            headers.update(extra_headers or {})
+            r = requests.get(url, params=qparams or None, timeout=timeout, headers=headers)
+            req["http_status"] = int(getattr(r, "status_code", 0) or 0)
+            if getattr(r, "status_code", 0) != 200:
+                req["body"] = str(getattr(r, "text", ""))[:260]
+                last_req = req
+                continue
+            try:
+                payload = r.json()
+            except Exception as exc:
+                req["status"] = "BAD_JSON"
+                req["json_error"] = str(exc)[:180]
+                req["body"] = str(getattr(r, "text", ""))[:260]
+                last_req = req
+                continue
+            req["status"] = "OK"
+            return payload, req
+        except Exception as exc:
+            req["error"] = str(exc)[:220]
+            last_req = req
+    return None, last_req
+
+
+def _ow_v32_normalize_event_obj(event):
+    if not isinstance(event, dict):
+        return {}
+    out = dict(event)
+    attrs = out.get("attributes")
+    if isinstance(attrs, dict):
+        for k, v in attrs.items():
+            if out.get(k) in (None, "", [], {}):
+                out[k] = v
+    for raw_key, norm_key in [
+        ("homeTeam", "home_team"),
+        ("awayTeam", "away_team"),
+        ("homeTeamName", "home_team"),
+        ("awayTeamName", "away_team"),
+        ("home_name", "home_team"),
+        ("away_name", "away_team"),
+        ("startTime", "commence_time"),
+        ("start_time", "commence_time"),
+        ("eventId", "event_id"),
+    ]:
+        if out.get(norm_key) in (None, "", [], {}) and out.get(raw_key) not in (None, "", [], {}):
+            out[norm_key] = out.get(raw_key)
+    for side in ["home_team", "away_team"]:
+        if isinstance(out.get(side), dict):
+            team_obj = out.get(side) or {}
+            out[side] = (
+                team_obj.get("name")
+                or team_obj.get("display_name")
+                or team_obj.get("fullName")
+                or team_obj.get("abbreviation")
+                or team_obj.get("key")
+                or ""
+            )
+    competitors = out.get("competitors") or out.get("participants") or []
+    if isinstance(competitors, list):
+        for item in competitors:
+            if not isinstance(item, dict):
+                continue
+            side = str(item.get("homeAway") or item.get("home_away") or item.get("side") or "").lower()
+            name = item.get("name") or item.get("display_name") or item.get("team") or item.get("abbreviation") or ""
+            if isinstance(name, dict):
+                name = name.get("name") or name.get("display_name") or name.get("abbreviation") or ""
+            if "home" in side and out.get("home_team") in (None, "", [], {}):
+                out["home_team"] = name
+            if "away" in side and out.get("away_team") in (None, "", [], {}):
+                out["away_team"] = name
+    return out
+
+
+def _ow_v32_event_id(event):
+    e = _ow_v32_normalize_event_obj(event)
+    val = _ow_v24_pick(e, "id", "event_id", "eventId", "game_id", "gameId", "key")
+    return "" if val in (None, "", "—") else str(val)
+
+
+def _ow_v32_looks_like_event(event):
+    if not isinstance(event, dict):
+        return False
+    e = _ow_v32_normalize_event_obj(event)
+    if e.get("bookmakers"):
+        return True
+    if _ow_v32_event_id(e) and (e.get("home_team") or e.get("away_team") or e.get("commence_time")):
+        return True
+    return False
+
+
+def _ow_v32_extract_event_list(payload, depth=0):
+    if depth > 4:
+        return []
+    if isinstance(payload, list):
+        return [_ow_v32_normalize_event_obj(x) for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    if _ow_v32_looks_like_event(payload):
+        return [_ow_v32_normalize_event_obj(payload)]
+    for key in ("events", "data", "results", "items", "games", "eventList", "records"):
+        child = payload.get(key)
+        got = _ow_v32_extract_event_list(child, depth + 1)
+        if got:
+            return got
+    for child in payload.values():
+        if isinstance(child, (dict, list)):
+            got = _ow_v32_extract_event_list(child, depth + 1)
+            if got:
+                return got
+    return []
+
+
+def _ow_v32_extract_odds_event(payload, seed_event=None, depth=0):
+    if depth > 4:
+        return {}
+    if isinstance(payload, list):
+        for item in payload:
+            got = _ow_v32_extract_odds_event(item, seed_event=seed_event, depth=depth + 1)
+            if got:
+                return got
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out = _ow_v32_normalize_event_obj(payload)
+    if isinstance(out.get("bookmakers"), list):
+        if isinstance(seed_event, dict):
+            seed = _ow_v32_normalize_event_obj(seed_event)
+            for key in ["id", "event_id", "home_team", "away_team", "commence_time", "start_time"]:
+                if out.get(key) in (None, "", [], {}) and seed.get(key) not in (None, "", [], {}):
+                    out[key] = seed.get(key)
+        return out
+    for key in ("event", "odds", "data", "result", "results", "items", "game"):
+        got = _ow_v32_extract_odds_event(payload.get(key), seed_event=seed_event, depth=depth + 1)
+        if got:
+            return got
+    return {}
 
 
 def _ow_v24_pick(obj, *keys):
@@ -49377,26 +49545,24 @@ def _ow_fetch_propline_batter_lines_v24():
     if not key:
         debug["note"] = "Set PROPLINE_API_KEY in secrets/env to pull automatic batter prop lines when Underdog is blocked."
         return [], debug
-    auth_params = {"apiKey": key}
-    events = safe_get_json(f"{PROPLINE_BASE}/sports/baseball_mlb/events", params=auth_params, timeout=18)
-    debug["requests"].append({"endpoint": f"{PROPLINE_BASE}/sports/baseball_mlb/events", "status": "OK" if events else "NO_RESPONSE"})
-    if isinstance(events, dict):
-        events = events.get("data") or events.get("events") or events.get("results") or []
-    if not isinstance(events, list):
-        debug["status"] = "BAD_EVENTS_PAYLOAD"
-        return [], debug
+    events_url = f"{PROPLINE_BASE}/sports/baseball_mlb/events"
+    events_payload, events_req = _ow_v32_propline_get_json(events_url, key, timeout=18)
+    events = _ow_v32_extract_event_list(events_payload)
+    events_req["rows"] = len(events)
+    debug["requests"].append(events_req)
     debug["events_available"] = len(events)
     rows = []
     current_pairs = _ow_v24_current_schedule_pairs()
     checked_events = 0
     for event in events:
+        event = _ow_v32_normalize_event_obj(event)
         if not isinstance(event, dict):
             continue
-        event_id = event.get("id") or event.get("event_id")
+        event_id = _ow_v32_event_id(event)
         if event_id in (None, ""):
             continue
-        home_abbr = _ow_v24_team_abbr_from_prop_line(event.get("home_team") or event.get("homeTeam") or "")
-        away_abbr = _ow_v24_team_abbr_from_prop_line(event.get("away_team") or event.get("awayTeam") or "")
+        home_abbr = _ow_v24_team_abbr_from_prop_line(event.get("home_team") or event.get("homeTeam") or event.get("home_team_key") or "")
+        away_abbr = _ow_v24_team_abbr_from_prop_line(event.get("away_team") or event.get("awayTeam") or event.get("away_team_key") or "")
         checked_events += 1
         if checked_events > PROPLINE_MAX_EVENTS_V26:
             break
@@ -49405,31 +49571,61 @@ def _ow_fetch_propline_batter_lines_v24():
             current_pairs
             and frozenset([str(home_abbr).upper(), str(away_abbr).upper()]) in current_pairs
         )
-        odds = safe_get_json(
-            f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds",
-            params={**auth_params, "markets": PROPLINE_BATTER_MARKETS_V24, "includeBookIds": "true"},
-            timeout=18,
-        )
-        debug["requests"].append({
-            "endpoint": f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds",
-            "status": "OK" if odds else "NO_RESPONSE",
-        })
-        if not isinstance(odds, dict):
-            continue
-        if not odds.get("home_team") and event.get("home_team"):
-            odds["home_team"] = event.get("home_team")
-        if not odds.get("away_team") and event.get("away_team"):
-            odds["away_team"] = event.get("away_team")
-        if not odds.get("commence_time") and event.get("commence_time"):
-            odds["commence_time"] = event.get("commence_time")
-        odds["ow_provider_event_scope_v26"] = PROPLINE_LINE_SCAN_NOTE_V26
-        odds["ow_provider_schedule_match_v26"] = "MATCHED_SELECTED_SCHEDULE" if schedule_match else "NOT_BLOCKED_BY_SCHEDULE"
-        event_rows = _ow_v24_prop_line_rows_from_event(odds)
-        debug["requests"][-1]["rows"] = len(event_rows)
-        debug["requests"][-1]["event"] = f"{away_abbr}@{home_abbr}" if away_abbr or home_abbr else str(event_id)
-        if event_rows:
-            debug["events_with_rows"] += 1
-            rows.extend(event_rows)
+        for markets in PROPLINE_BATTER_MARKET_REQUESTS_V32:
+            odds_url = f"{PROPLINE_BASE}/sports/baseball_mlb/events/{event_id}/odds"
+            odds_payload, odds_req = _ow_v32_propline_get_json(
+                odds_url,
+                key,
+                params={"markets": markets, "includeBookIds": "true"},
+                timeout=18,
+            )
+            odds = _ow_v32_extract_odds_event(odds_payload, seed_event=event)
+            odds_req["event"] = f"{away_abbr}@{home_abbr}" if away_abbr or home_abbr else str(event_id)
+            if not isinstance(odds, dict):
+                odds_req["rows"] = 0
+                debug["requests"].append(odds_req)
+                continue
+            if not odds.get("home_team") and event.get("home_team"):
+                odds["home_team"] = event.get("home_team")
+            if not odds.get("away_team") and event.get("away_team"):
+                odds["away_team"] = event.get("away_team")
+            if not odds.get("commence_time") and event.get("commence_time"):
+                odds["commence_time"] = event.get("commence_time")
+            odds["ow_provider_event_scope_v26"] = PROPLINE_LINE_SCAN_NOTE_V26
+            odds["ow_provider_schedule_match_v26"] = "MATCHED_SELECTED_SCHEDULE" if schedule_match else "NOT_BLOCKED_BY_SCHEDULE"
+            event_rows = _ow_v24_prop_line_rows_from_event(odds)
+            odds_req["rows"] = len(event_rows)
+            debug["requests"].append(odds_req)
+            if event_rows:
+                debug["events_with_rows"] += 1
+                rows.extend(event_rows)
+                break
+    if not rows:
+        for markets in PROPLINE_BATTER_MARKET_REQUESTS_V32:
+            bulk_url = f"{PROPLINE_BASE}/sports/baseball_mlb/odds"
+            bulk_payload, bulk_req = _ow_v32_propline_get_json(
+                bulk_url,
+                key,
+                params={"markets": markets, "includeBookIds": "true"},
+                timeout=18,
+            )
+            bulk_events = _ow_v32_extract_event_list(bulk_payload)
+            bulk_rows = []
+            for odds_event in bulk_events:
+                odds_event = _ow_v32_extract_odds_event(odds_event) or _ow_v32_normalize_event_obj(odds_event)
+                if not isinstance(odds_event, dict):
+                    continue
+                odds_event["ow_provider_event_scope_v26"] = "PROPLINE_BULK_ODDS_FALLBACK_V32"
+                odds_event["ow_provider_schedule_match_v26"] = "NOT_BLOCKED_BY_SCHEDULE"
+                bulk_rows.extend(_ow_v24_prop_line_rows_from_event(odds_event))
+            bulk_req["rows"] = len(bulk_rows)
+            bulk_req["events"] = len(bulk_events)
+            debug["requests"].append(bulk_req)
+            if bulk_rows:
+                rows.extend(bulk_rows)
+                debug["events"] = max(debug["events"], len(bulk_events))
+                debug["events_with_rows"] = max(debug["events_with_rows"], sum(1 for ev in bulk_events if _ow_v24_prop_line_rows_from_event(ev)))
+                break
     debug["rows_before_dedup"] = len(rows)
     rows = _ow_v24_dedup_provider_rows(rows)
     debug.update({
