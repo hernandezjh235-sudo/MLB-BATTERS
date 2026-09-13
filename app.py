@@ -11894,6 +11894,13 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
         is_fs = "FANTASY" in market_upper
         pick = poster_value(row, "Best Pick", "Model Direction Alt", "Model Direction", "Pick", default="—")
         line = poster_value(row, "Best Line", "Line", default="—")
+        market_family_v34 = _ow_v34_market_family(market) if "_ow_v34_market_family" in globals() else ""
+        if market_family_v34 in {"HR", "HRR"} and not _ow_v34_real_batter_line_ok(market, line):
+            row["Line Before V34 Guard"] = line
+            row["Line Guard V34 Note"] = _ow_v34_real_batter_line_note(market, line)
+            line = "NO REAL LINE"
+            if str(pick or "").upper().strip() in {"OVER", "UNDER", "HIGHER", "LOWER"}:
+                pick = "TRACK"
         proj = poster_value(row, "Best Projection", "Projection", "HR Projection", default="—")
         prob = poster_value(row, "Best Win/Hit %", "Model Win Probability %", "Win Probability %", "Over Probability %", "HR Probability %", default="—")
         likely = poster_value(row, "Likely Score", "Model Win Probability %", "Sync Score", "HR Score", default="—")
@@ -12094,7 +12101,7 @@ def _ow_render_player_card_rows(df, title_label="BATTER PLAYS", max_rows=30, key
             if conf is not None: footer_bits.append(f"CONF {conf:.0f}")
 
         market_short = "FS" if is_fs else "HR" if "HOME RUN" in market_upper else "HRR" if "H+R+RBI" in market_upper or "HRR" in market_upper else market_upper[:10]
-        line_txt = _ow_fmt_slate_num(line, 1)
+        line_txt = "NO REAL LINE" if line == "NO REAL LINE" else _ow_fmt_slate_num(line, 1)
         pick_txt = str(pick).replace("HIGHER", "OVER").replace("LOWER", "UNDER")
         proj_txt = _ow_fmt_slate_num(proj, 2 if not is_fs else 1)
         prob_txt = "—" if num(prob, None) is None else f"{num(prob):.1f}%"
@@ -48363,6 +48370,138 @@ def _ow_batter_projection_fallback_source_v21(label, fn, *args):
     return d
 
 
+# -------------------------
+# V34 REAL BATTER LINE GUARD
+# -------------------------
+OW_REAL_BATTER_LINE_GUARD_VERSION_V34 = "OW_REAL_BATTER_LINE_GUARD_V34_2026_09_13"
+OW_HR_REAL_LINE_MAX_V34 = 2.5
+OW_HRR_REAL_LINE_MAX_V34 = 3.5
+
+
+def _ow_v34_market_family(market):
+    text = str(market or "").upper().replace("_", " ")
+    compact = re.sub(r"[^A-Z0-9]+", "", text)
+    if (
+        "HOME RUN" in text
+        or compact in {"HR", "HOMERUN", "HOMERUNS"}
+        or "BATTERHOMERUN" in compact
+    ):
+        return "HR"
+    if (
+        "H+R+RBI" in text
+        or "HITS RUNS RBI" in text
+        or "HITS RUNS RBIS" in text
+        or "HITSRUNSRBI" in compact
+        or "HITSRUNSRBIS" in compact
+        or "HRR" in compact
+    ):
+        return "HRR"
+    return ""
+
+
+def _ow_v34_half_point_line_value(line):
+    val = safe_float(line, None)
+    if val is None:
+        return None
+    try:
+        val = float(val)
+        if not np.isfinite(val):
+            return None
+        if abs((val * 2.0) - round(val * 2.0)) > 1e-9:
+            return None
+        return val
+    except Exception:
+        return None
+
+
+def _ow_v34_real_batter_line_ok(market, line):
+    family = _ow_v34_market_family(market)
+    val = _ow_v34_half_point_line_value(line)
+    if val is None:
+        return False
+    if family == "HR":
+        return 0.5 <= val <= OW_HR_REAL_LINE_MAX_V34
+    if family == "HRR":
+        return 0.5 <= val <= OW_HRR_REAL_LINE_MAX_V34
+    return False
+
+
+def _ow_v34_real_batter_line_note(market, line):
+    family = _ow_v34_market_family(market) or "UNKNOWN"
+    val = _ow_v34_half_point_line_value(line)
+    if val is None:
+        return f"{family} line is missing, non-numeric, or not a half-point line."
+    if family == "HR" and not (0.5 <= val <= OW_HR_REAL_LINE_MAX_V34):
+        return f"Home Run line {val:g} outside guarded real-line range 0.5-{OW_HR_REAL_LINE_MAX_V34:g}."
+    if family == "HRR" and not (0.5 <= val <= OW_HRR_REAL_LINE_MAX_V34):
+        return f"HRR line {val:g} outside guarded real-line range 0.5-{OW_HRR_REAL_LINE_MAX_V34:g}."
+    if family == "UNKNOWN":
+        return "Unknown batter market; not accepted as HR/HRR."
+    return "Accepted real batter line."
+
+
+def _ow_v34_sanitize_batter_line_df(df, board_name=""):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    kept = []
+    rejected = []
+    changed = False
+    board_family = _ow_v34_market_family(board_name)
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        market = (
+            row.get("Best Market")
+            or row.get("Market")
+            or row.get("Market Label")
+            or row.get("Prop Market")
+            or board_name
+        )
+        family = _ow_v34_market_family(market) or board_family
+        if family in {"HR", "HRR"}:
+            raw_line = row.get("Best Line") if row.get("Best Line") not in (None, "", "—") else row.get("Line")
+            if not _ow_v34_real_batter_line_ok(family, raw_line):
+                changed = True
+                note = _ow_v34_real_batter_line_note(family, raw_line)
+                source_blob = " ".join(
+                    str(row.get(k) or "")
+                    for k in ["Best Market", "Market", "Sportsbook Market Status", "Source", "Provider", "Line Feed Backup", "Official Play Filter"]
+                ).upper()
+                projection_only = "PROJECTION" in source_blob or str(raw_line).upper() in {"NO REAL LINE", "TRACK", "TRACK ONLY"}
+                guarded = dict(row)
+                guarded["Line Before V34 Guard"] = raw_line
+                guarded["Best Line Before V34 Guard"] = row.get("Best Line")
+                guarded["Line Guard V34"] = OW_REAL_BATTER_LINE_GUARD_VERSION_V34
+                guarded["Line Guard V34 Note"] = note
+                guarded["Line"] = "NO REAL LINE"
+                guarded["Best Line"] = "NO REAL LINE"
+                guarded["Sportsbook Market Status"] = "NO_ACTIVE_LINE_PROJECTION_ONLY" if projection_only else "INVALID_REAL_BATTER_LINE_GUARDED_V34"
+                guarded["Official Play Filter"] = "TRACK ONLY - WAIT FOR REAL LINE" if projection_only else "REMOVED - INVALID REAL BATTER LINE"
+                if str(guarded.get("Best Pick") or guarded.get("Pick") or "").upper().strip() in {"OVER", "UNDER", "HIGHER", "LOWER"}:
+                    guarded["Best Pick"] = "TRACK ONLY" if projection_only else "REMOVED"
+                    guarded["Pick"] = "TRACK ONLY" if projection_only else "REMOVED"
+                rejected.append({
+                    "Player": row.get("Player") or row.get("UD Player"),
+                    "Market": market,
+                    "Line": raw_line,
+                    "Board": board_name,
+                    "Reason": note,
+                    "Source": row.get("Source") or row.get("Provider") or row.get("Line Feed Backup"),
+                })
+                if projection_only:
+                    kept.append(guarded)
+                continue
+        kept.append(row)
+    try:
+        prior = st.session_state.get("ow_v34_line_guard_last_rejected", [])
+        st.session_state["ow_v34_line_guard_last_rejected"] = (list(prior) + rejected)[-200:]
+        st.session_state["ow_v34_line_guard_version"] = OW_REAL_BATTER_LINE_GUARD_VERSION_V34
+    except Exception:
+        pass
+    if not changed:
+        return df
+    return pd.DataFrame(kept).reset_index(drop=True)
+
+
 def _ow_batter_upside_projection_only_fallback_v21():
     """Show projection cards only when the real-line board is empty.
 
@@ -48383,12 +48522,13 @@ def _ow_batter_upside_projection_only_fallback_v21():
         if not player:
             continue
         source = str(r.get("_Fallback Source") or "").upper()
-        line = r.get("Line") if _v3_is_live_ud_line(r.get("Line")) else "NO REAL LINE"
         if "HR_" in source or source.startswith("HR_"):
+            line = r.get("Line") if _ow_v34_real_batter_line_ok("Home Runs", r.get("Line")) else "NO REAL LINE"
             market = "Home Runs - Projection Only" if line == "NO REAL LINE" else "Home Runs"
             projection = r.get("HR Projection") if _ow_v19_present(r.get("HR Projection")) else r.get("Projection")
             win_hit = r.get("HR Probability %") if _ow_v19_present(r.get("HR Probability %")) else r.get("Win Probability %")
         else:
+            line = r.get("Line") if _ow_v34_real_batter_line_ok("H+R+RBI", r.get("Line")) else "NO REAL LINE"
             market = "H+R+RBI - Projection Only" if line == "NO REAL LINE" else "H+R+RBI"
             projection = r.get("Projection") if _ow_v19_present(r.get("Projection")) else r.get("HRR Projection")
             win_hit = r.get("Win Probability %") if _ow_v19_present(r.get("Win Probability %")) else r.get("Over Probability %")
@@ -48458,9 +48598,9 @@ def _ow_csv_market_kind_v22(row):
         return "HR"
     if "H+R+RBI" in blob or "HITS + RUNS" in blob or "HRR" in blob:
         return "HRR"
-    if _v3_is_live_ud_line(_ow_csv_pick_value_v22(row, "HR Line")):
+    if _ow_v34_real_batter_line_ok("Home Runs", _ow_csv_pick_value_v22(row, "HR Line")):
         return "HR"
-    if _v3_is_live_ud_line(_ow_csv_pick_value_v22(row, "HRR Line")):
+    if _ow_v34_real_batter_line_ok("H+R+RBI", _ow_csv_pick_value_v22(row, "HRR Line")):
         return "HRR"
     return ""
 
@@ -48488,7 +48628,7 @@ def _ow_normalize_uploaded_line_csv_v22(df, filename="projection.csv"):
             "Sportsbook Market Status": src.get("Sportsbook Market Status") or "CSV_BACKUP_ACTIVE_LINE",
         })
 
-        if kind == "HRR" or _v3_is_live_ud_line(_ow_csv_pick_value_v22(src, "HRR Line")):
+        if kind == "HRR" or _ow_v34_real_batter_line_ok("H+R+RBI", _ow_csv_pick_value_v22(src, "HRR Line")):
             if kind == "HRR":
                 line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HRR Line", "Prop Line")
                 projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HRR Projection", "Prior H+R+RBI Projection")
@@ -48519,11 +48659,11 @@ def _ow_normalize_uploaded_line_csv_v22(df, filename="projection.csv"):
                 "Best Win/Hit %": win,
                 "Official Play Filter": src.get("Official Play Filter") or "CSV BACKUP / VERIFY LINE",
             })
-            if _v3_is_live_ud_line(h.get("Line")):
+            if _ow_v34_real_batter_line_ok("H+R+RBI", h.get("Line")):
                 rows_hrr.append(h)
                 rows_upside.append(h)
 
-        if kind == "HR" or _v3_is_live_ud_line(_ow_csv_pick_value_v22(src, "HR Line")):
+        if kind == "HR" or _ow_v34_real_batter_line_ok("Home Runs", _ow_csv_pick_value_v22(src, "HR Line")):
             if kind == "HR":
                 line = _ow_csv_pick_value_v22(src, "Line", "Best Line", "HR Line", "Prop Line")
                 projection = _ow_csv_pick_value_v22(src, "Projection", "Best Projection", "HR Projection")
@@ -48554,7 +48694,7 @@ def _ow_normalize_uploaded_line_csv_v22(df, filename="projection.csv"):
                 "Best Win/Hit %": win,
                 "Official Play Filter": src.get("Official Play Filter") or "CSV BACKUP / VERIFY LINE",
             })
-            if _v3_is_live_ud_line(h.get("Line")):
+            if _ow_v34_real_batter_line_ok("Home Runs", h.get("Line")):
                 rows_hr.append(h)
                 rows_upside.append(h)
 
@@ -49260,14 +49400,7 @@ def _ow_v24_team_abbr_from_prop_line(name):
 
 
 def _ow_v24_provider_line_ok(market, line):
-    val = safe_float(line, None)
-    if val is None:
-        return False
-    if str(market) == "Home Runs":
-        return 0.5 <= float(val) <= 2.5
-    if str(market) == "HRR":
-        return 0.5 <= float(val) <= 6.5
-    return False
+    return _ow_v34_real_batter_line_ok(market, line)
 
 
 def _ow_v24_prop_line_rows_from_event(event):
@@ -51721,6 +51854,39 @@ if _ow_build_bfs_before_card_actual_v30 is not None:
 if _ow_games_fs_cards_before_card_actual_v30 is not None:
     def _ow_games_fs_cards_df(df):
         return _ow_card_v30_apply_actual_rows(_ow_games_fs_cards_before_card_actual_v30(df), "GAMES")
+
+
+_ow_build_research_before_real_line_guard_v34 = build_v3_batter_research_table
+_ow_build_home_run_before_real_line_guard_v34 = build_v3_home_run_table
+_ow_build_upside_before_real_line_guard_v34 = build_v3_batter_upside_board_final
+
+
+def _ow_v34_pack_builder_result(got, market_label):
+    if isinstance(got, tuple) and len(got) >= 2:
+        items = list(got)
+        before_n = len(items[0]) if isinstance(items[0], pd.DataFrame) else 0
+        items[0] = _ow_v34_sanitize_batter_line_df(items[0], market_label)
+        after_n = len(items[0]) if isinstance(items[0], pd.DataFrame) else 0
+        meta = dict(items[1] or {}) if isinstance(items[1], dict) else {}
+        meta["real_batter_line_guard_v34"] = OW_REAL_BATTER_LINE_GUARD_VERSION_V34
+        meta["hrr_real_line_max_v34"] = OW_HRR_REAL_LINE_MAX_V34
+        meta["hr_real_line_max_v34"] = OW_HR_REAL_LINE_MAX_V34
+        meta["line_guard_removed_v34"] = max(0, before_n - after_n)
+        items[1] = meta
+        return tuple(items)
+    return _ow_v34_sanitize_batter_line_df(got, market_label)
+
+
+def build_v3_batter_research_table(market="HRR"):
+    return _ow_v34_pack_builder_result(_ow_build_research_before_real_line_guard_v34(market), market)
+
+
+def build_v3_home_run_table():
+    return _ow_v34_pack_builder_result(_ow_build_home_run_before_real_line_guard_v34(), "HOME RUNS")
+
+
+def build_v3_batter_upside_board_final():
+    return _ow_v34_sanitize_batter_line_df(_ow_build_upside_before_real_line_guard_v34(), "BATTER UPSIDE")
 
 
 # Keep the repaired MLB-official grader active regardless of whether full-game
